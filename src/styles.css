@@ -1,0 +1,116 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Anthropic Claude in Chrome 风格的米白主题. 用 CSS variable 让浅/深主题
+   切换简单 (后续 V 想夜间模式只改 var). */
+:root {
+  --bbt-bg: #faf9f7;
+  --bbt-fg: #1c1c1c;
+  --bbt-muted: #6e6b66;
+  --bbt-subtle: #98948c;
+  --bbt-border: #ebe6dc;
+  --bbt-bubble: #f0ece4;
+  --bbt-bubble-user: #efeae0;
+  --bbt-input-bg: #ffffff;
+  --bbt-accent: #c66a4a; /* 暖橘色, 跟 babata main repo 视觉一致 */
+  --bbt-accent-fg: #ffffff;
+  --bbt-warn-bg: #fbf1d9;
+  --bbt-warn-fg: #6b5210;
+}
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  background: var(--bbt-bg);
+  color: var(--bbt-fg);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "Helvetica Neue", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+/* Markdown — assistant 直 flow 渲染, 没有 bubble. */
+.bbt-md p { margin: 0 0 0.7em 0; }
+.bbt-md p:last-child { margin-bottom: 0; }
+.bbt-md ul, .bbt-md ol { margin: 0.4em 0 0.7em 1.3em; padding: 0; }
+.bbt-md li { margin: 0.2em 0; }
+.bbt-md h1, .bbt-md h2, .bbt-md h3, .bbt-md h4 {
+  margin: 0.9em 0 0.35em;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.bbt-md h1 { font-size: 1.18em; }
+.bbt-md h2 { font-size: 1.1em; }
+.bbt-md h3 { font-size: 1.02em; color: #2d2d2d; }
+.bbt-md code {
+  background: rgba(0, 0, 0, 0.05);
+  padding: 0.08em 0.32em;
+  border-radius: 3px;
+  font-size: 0.9em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.bbt-md pre {
+  background: #f3efe6;
+  border: 1px solid var(--bbt-border);
+  padding: 0.7em 0.9em;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 0.85em;
+  margin: 0.6em 0;
+}
+.bbt-md pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 1em;
+}
+.bbt-md blockquote {
+  border-left: 3px solid #d8d2c5;
+  padding-left: 0.85em;
+  margin: 0.5em 0;
+  color: var(--bbt-muted);
+}
+.bbt-md a {
+  color: #b25433;
+  text-decoration: none;
+  border-bottom: 1px solid #e8c8b8;
+}
+.bbt-md a:hover { color: #8e3d20; border-bottom-color: #d39e84; }
+.bbt-md hr {
+  border: none;
+  border-top: 1px solid var(--bbt-border);
+  margin: 0.9em 0;
+}
+.bbt-md table {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+  font-size: 0.9em;
+}
+.bbt-md th, .bbt-md td {
+  border: 1px solid var(--bbt-border);
+  padding: 0.35em 0.7em;
+}
+.bbt-md th { background: rgba(0,0,0,0.04); font-weight: 600; }
+.bbt-md img { max-width: 100%; height: auto; border-radius: 4px; }
+
+/* Scrollbar — 跟 Anthropic 一样几乎隐形. */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.25); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* Tailwind utility extension — color shortcuts 走 var. */
+.bg-bbt { background: var(--bbt-bg); }
+.text-bbt { color: var(--bbt-fg); }
+.text-bbt-muted { color: var(--bbt-muted); }
+.text-bbt-subtle { color: var(--bbt-subtle); }
+.border-bbt { border-color: var(--bbt-border); }
+.bg-bbt-bubble { background: var(--bbt-bubble); }
+.bg-bbt-user { background: var(--bbt-bubble-user); }
+.bg-bbt-input { background: var(--bbt-input-bg); }
+.bg-bbt-warn { background: var(--bbt-warn-bg); }
+.text-bbt-warn { color: var(--bbt-warn-fg); }
+.text-bbt-accent { color: var(--bbt-accent); }
+.bg-bbt-accent { background: var(--bbt-accent); color: var(--bbt-accent-fg); }
+.btn-icon { color: var(--bbt-muted); transition: color .12s, background .12s; }
+.btn-icon:hover { color: var(--bbt-fg); background: rgba(0,0,0,0.05); }

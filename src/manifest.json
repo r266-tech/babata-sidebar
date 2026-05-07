@@ -1,0 +1,70 @@
+{
+  "manifest_version": 3,
+  "name": "babata",
+  "short_name": "babata",
+  "version": "0.0.1",
+  "description": "babata 浏览器侧边栏 — chat / 整页双语 / 划词 / page agent / 浏览器管家",
+  "minimum_chrome_version": "120",
+  "side_panel": {
+    "default_path": "src/sidepanel.html"
+  },
+  "action": {
+    "default_title": "打开 babata"
+  },
+  "background": {
+    "service_worker": "src/service-worker.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/babata-widget.ts"],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/babata-translate.ts"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "src/offscreen.html",
+        "src/sidepanel.html",
+        "assets/*"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "tabs",
+    "tabGroups",
+    "bookmarks",
+    "history",
+    "downloads",
+    "scripting",
+    "debugger",
+    "alarms",
+    "notifications",
+    "offscreen",
+    "webNavigation",
+    "activeTab",
+    "unlimitedStorage",
+    "contextMenus"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' http://127.0.0.1:18791 ws://127.0.0.1:18791;"
+  },
+  "commands": {
+    "open-sidebar": {
+      "suggested_key": { "default": "Alt+S", "mac": "Alt+S" },
+      "description": "打开 babata 侧边栏"
+    }
+  }
+}
