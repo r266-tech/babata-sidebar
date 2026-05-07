@@ -1,0 +1,22 @@
+# Build artifacts
+dist/
+build/
+*.zip
+*.crx
+
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local development
+.local/
+*.log
