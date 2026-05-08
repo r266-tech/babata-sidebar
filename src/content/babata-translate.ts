@@ -120,12 +120,21 @@ function setupAttentionWatchers() {
 // ── universal leaf-text walk (V 反 site-specific: 通用, 翻肉眼可见所有) ─
 
 // 段内 inline 标签 (沉浸式 generalRule.inlineTags 同源 + babata 补).
-// 出现在父 block 子里时允许; 父 block 是 multi-inline-segment 时它们各自独立翻.
+// fast path: 99% 命中 (DIV/SPAN/A/P 这种常见 tag). 不命中走 CSS fallback (Q1).
 const INLINE_TAGS = new Set([
   "A", "ABBR", "B", "BDO", "BIG", "CITE", "CODE", "DEL", "DFN", "EM",
   "FONT", "I", "IMG", "INS", "KBD", "LABEL", "MARK", "Q", "RB", "RP",
   "RT", "RUBY", "S", "SAMP", "SMALL", "SPAN", "STRONG", "SUB", "SUP",
   "TIME", "TT", "U", "VAR", "WBR", "BR",
+]);
+
+// 一定是 block 的 HTML spec tag — fast path 拒 inline 判断, 不走 getComputedStyle.
+const FORCE_BLOCK_TAGS = new Set([
+  "P", "DIV", "SECTION", "ARTICLE", "ASIDE", "HEADER", "FOOTER",
+  "MAIN", "NAV", "UL", "OL", "LI", "TABLE", "TR", "TD", "TH",
+  "THEAD", "TBODY", "TFOOT", "FIGURE", "FIGCAPTION", "BLOCKQUOTE",
+  "DL", "DT", "DD", "HR", "FORM", "FIELDSET", "DETAILS", "SUMMARY",
+  "H1", "H2", "H3", "H4", "H5", "H6",
 ]);
 
 // 子树根本不该进 (REJECT — TreeWalker 不再深入). 含已注入译文.
@@ -140,6 +149,52 @@ const EXCLUDE_SELECTOR = [
 // claimed = 已被 walker ACCEPT 的 leaf, 子树整个 skip 防重复. WeakSet 不 leak DOM ref.
 const claimed = new WeakSet<HTMLElement>();
 const multiCache = new WeakMap<HTMLElement, boolean>();
+// inline 判断缓存 — getComputedStyle 同步 reflow, 同元素重复调贵.
+const inlineCache = new WeakMap<HTMLElement, boolean>();
+const hiddenCache = new WeakMap<HTMLElement, boolean>();
+
+// CSS display 是 inline-like (read-frog isInlineDisplay filter.ts:41-63).
+// "contents" = 元素自身不渲染, 子直挂父 — 行为接 inline.
+// "ruby*" = 东亚字符注音流, 跟 inline 同段.
+function isInlineDisplay(display: string): boolean {
+  const d = display.trim().toLowerCase();
+  if (!d) return false;
+  if (d === "contents") return true;
+  if (d.startsWith("inline")) return true;
+  return d === "ruby" || d.startsWith("ruby-");
+}
+
+// inline 判断: fast path → CSS fallback (Q1: cover custom element / display:contents / ruby).
+function isInlineElement(el: HTMLElement): boolean {
+  if (INLINE_TAGS.has(el.tagName)) return true;
+  if (FORCE_BLOCK_TAGS.has(el.tagName)) return false;
+  let cached = inlineCache.get(el);
+  if (cached === undefined) {
+    try {
+      cached = isInlineDisplay(window.getComputedStyle(el).display);
+    } catch {
+      cached = false;
+    }
+    inlineCache.set(el, cached);
+  }
+  return cached;
+}
+
+// 元素自身/视觉隐藏 — 跳整子树 (V "肉眼可见全翻" 反义).
+// display:none 子无 layout, visibility:hidden 子有占位但用户看不到.
+function isHidden(el: HTMLElement): boolean {
+  let cached = hiddenCache.get(el);
+  if (cached === undefined) {
+    try {
+      const cs = window.getComputedStyle(el);
+      cached = cs.display === "none" || cs.visibility === "hidden";
+    } catch {
+      cached = false;
+    }
+    hiddenCache.set(el, cached);
+  }
+  return cached;
+}
 
 function hasClaimedAncestor(el: HTMLElement): boolean {
   let p = el.parentElement;
@@ -151,14 +206,13 @@ function hasClaimedAncestor(el: HTMLElement): boolean {
 }
 
 function isLeafTextElement(el: HTMLElement): boolean {
-  // 直接子节点必须全是 text 或 inline 标签 + 含可视 text.
+  // 直接子节点必须全是 text 或 inline 元素 + 含可视 text.
   let hasMeaningfulText = false;
   for (const child of Array.from(el.childNodes)) {
     if (child.nodeType === Node.TEXT_NODE) {
       if ((child.textContent || "").trim()) hasMeaningfulText = true;
     } else if (child.nodeType === Node.ELEMENT_NODE) {
-      const tag = (child as Element).tagName;
-      if (!INLINE_TAGS.has(tag)) return false;
+      if (!isInlineElement(child as HTMLElement)) return false;
       if ((child.textContent || "").trim()) hasMeaningfulText = true;
     }
   }
@@ -181,8 +235,7 @@ function computeMultiSegmentInline(el: HTMLElement): boolean {
       }
       lastWasInlineElement = false;
     } else if (c.nodeType === Node.ELEMENT_NODE) {
-      const tag = (c as Element).tagName;
-      if (!INLINE_TAGS.has(tag)) return false;
+      if (!isInlineElement(c as HTMLElement)) return false;
       inlineCount++;
       lastWasInlineElement = true;
     }
@@ -206,8 +259,9 @@ function collectTranslatable(root: ParentNode): HTMLElement[] {
   function visit(el: HTMLElement) {
     if (el.matches(EXCLUDE_SELECTOR)) return;
     if (hasClaimedAncestor(el)) return;
+    if (isHidden(el)) return;
 
-    const isInline = INLINE_TAGS.has(el.tagName);
+    const isInline = isInlineElement(el);
 
     if (isInline) {
       // INLINE 标签自身仅在 leaf 时 ACCEPT (X 推 span / X article sibling 内容).
