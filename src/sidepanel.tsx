@@ -529,13 +529,13 @@ function App() {
             );
           }
           return (
-            <div key={i} class="flex flex-col items-start">
+            <div key={i} class="flex flex-col items-start group">
               <MarkdownView
                 text={m.text}
                 placeholder={streaming && i === msgs.length - 1 ? "…" : ""}
               />
               {m.text && (!streaming || i !== msgs.length - 1) && (
-                <div class="flex gap-1 mt-1.5 -ml-1">
+                <div class="flex gap-1 mt-1.5 -ml-1 opacity-0 group-hover:opacity-100 transition-opacity">
                   <button
                     class="btn-icon w-6 h-6 rounded-md flex items-center justify-center"
                     title="复制"
@@ -544,22 +544,6 @@ function App() {
                     <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
                       <rect x="3.5" y="3.5" width="7" height="8" rx="1.2" stroke="currentColor" stroke-width="1.2" />
                       <path d="M5.5 3.5V2.7c0-.4.3-.7.7-.7H10c.4 0 .7.3.7.7V8" stroke="currentColor" stroke-width="1.2" />
-                    </svg>
-                  </button>
-                  <button
-                    class="btn-icon w-6 h-6 rounded-md flex items-center justify-center"
-                    title="赞"
-                  >
-                    <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
-                      <path d="M3 7.5h2.2L7 3a1.2 1.2 0 0 1 2.2 1l-.5 2.2H11a1 1 0 0 1 1 1.2l-.7 3.4a1 1 0 0 1-1 .7H5.2c-.5 0-.9-.3-1-.7L3 7.5z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
-                    </svg>
-                  </button>
-                  <button
-                    class="btn-icon w-6 h-6 rounded-md flex items-center justify-center"
-                    title="踩"
-                  >
-                    <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
-                      <path d="M11 6.5H8.8L7 11a1.2 1.2 0 0 1-2.2-1l.5-2.2H3a1 1 0 0 1-1-1.2l.7-3.4a1 1 0 0 1 1-.7h5.1c.5 0 .9.3 1 .7L11 6.5z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
                     </svg>
                   </button>
                 </div>

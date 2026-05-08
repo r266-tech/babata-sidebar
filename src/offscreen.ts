@@ -56,15 +56,24 @@ function connect() {
     /* close handler 触发 reconnect */
   });
   ws.addEventListener("message", (ev) => {
-    // forward 到 SW. SW 处理完通过 chrome.runtime.sendMessage 回我.
-    chrome.runtime
-      .sendMessage({
+    // forward 到 SW. SW cold-start 时 sendMessage reject (no receiver), 100ms
+    // 后重试一次 — 不重试就 server 等 30s timeout, request 白丢.
+    const payload = typeof ev.data === "string" ? ev.data : "";
+    const send = () =>
+      chrome.runtime.sendMessage({
         type: "babata.ws.inbound",
-        payload: typeof ev.data === "string" ? ev.data : "",
-      })
-      .catch(() => {
-        /* SW 可能在 cold-start, 一次失败 OK — server WS 会 timeout 处理 */
+        payload,
       });
+    send().catch(() => {
+      window.setTimeout(() => {
+        send().catch((e) => {
+          console.warn(
+            "[babata-offscreen] inbound dispatch failed twice:",
+            (e as Error)?.message ?? e,
+          );
+        });
+      }, 100);
+    });
   });
 }
 

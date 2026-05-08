@@ -32,10 +32,14 @@ const queue = new Map<string, HTMLElement>();
 let flushTimer: number | null = null;
 
 const TARGET_LANG = "zh";
-const BATCH_SIZE = 8;
+// 24/batch sonnet 一次接 ~5KB prompt 不慢, 减少 V 视口内段先后翻顺序差
+// (V 反馈"右侧名字先翻 / 正文后翻"). 进一步要降到 1 batch cover 视口内全部
+// 需要 IO viewport-priority + immediateBudget (deep agent Q5).
+const BATCH_SIZE = 24;
 const FLUSH_DEBOUNCE_MS = 300;
-// V 快速滚 feed 时 queue 不能无限长. 超 cap 时 evict 最老 (insertion order).
-const QUEUE_MAX = 60;
+// queue cap 兜底防 V 滚万段时内存爆 — 实际 V 滚 timeline 千段也到不了.
+// 不再按 viewport drop scroll-out: V 明确 "DOM 里能读到的尽量都翻".
+const QUEUE_MAX = 5000;
 
 // ── attention / viewport (page-side state push) ───────────────────────
 const visibleHashes = new Set<string>();
@@ -46,10 +50,30 @@ let idleTimer: number | null = null;
 const IDLE_THRESHOLD_MS = 30_000;
 const VIEWPORT_PUSH_DEBOUNCE_MS = 1000;
 
+// Extension reload 时, 老 content script 仍在 page 上, chrome.runtime API 同步抛
+// "Extension context invalidated" — `.catch()` 接不到 sync throw. 一次 set true
+// 后所有 chrome.* 调用 short-circuit, 静默直到 V 刷 page reload 我.
+let extInvalidated = false;
+function isInvalidatedError(e: unknown): boolean {
+  return /Extension context invalidated/.test((e as Error)?.message ?? String(e));
+}
+function safeChromeSend<T>(fn: () => Promise<T>): Promise<T | undefined> {
+  if (extInvalidated) return Promise.resolve(undefined);
+  try {
+    return fn().catch((e) => {
+      if (isInvalidatedError(e)) extInvalidated = true;
+      return undefined;
+    });
+  } catch (e) {
+    if (isInvalidatedError(e)) extInvalidated = true;
+    return Promise.resolve(undefined);
+  }
+}
+
 function pushAttention(payload: Record<string, unknown>) {
-  void chrome.runtime
-    .sendMessage({ type: "babata.attention", url: location.href, ...payload })
-    .catch(() => {});
+  void safeChromeSend(() =>
+    chrome.runtime.sendMessage({ type: "babata.attention", url: location.href, ...payload }),
+  );
 }
 
 function scheduleViewportPush() {
@@ -93,33 +117,133 @@ function setupAttentionWatchers() {
   onInteract();
 }
 
-// ── site-specific selector (V0 写死, 后续走 site profile JSON) ─────────
+// ── universal leaf-text walk (V 反 site-specific: 通用, 翻肉眼可见所有) ─
 
-function paragraphSelectors(): string[] {
-  const h = location.hostname;
-  if (h === "x.com" || h === "twitter.com" || h.endsWith(".x.com")) {
-    // :not(:has(...)) — 推特转推 quoted 块嵌套 tweetText 时, 只翻最 leaf 级别,
-    // 不让 outer (含 quoted 内容) 跟 inner 同时翻 (避免重复 + outer text 太长 fail).
-    return ['[data-testid="tweetText"]:not(:has([data-testid="tweetText"]))'];
+// 段内 inline 标签 (沉浸式 generalRule.inlineTags 同源 + babata 补).
+// 出现在父 block 子里时允许; 父 block 是 multi-inline-segment 时它们各自独立翻.
+const INLINE_TAGS = new Set([
+  "A", "ABBR", "B", "BDO", "BIG", "CITE", "CODE", "DEL", "DFN", "EM",
+  "FONT", "I", "IMG", "INS", "KBD", "LABEL", "MARK", "Q", "RB", "RP",
+  "RT", "RUBY", "S", "SAMP", "SMALL", "SPAN", "STRONG", "SUB", "SUP",
+  "TIME", "TT", "U", "VAR", "WBR", "BR",
+]);
+
+// 子树根本不该进 (REJECT — TreeWalker 不再深入). 含已注入译文.
+const EXCLUDE_SELECTOR = [
+  "pre", "code", "script", "style", "noscript", "template",
+  "svg", "math", "head", "title", "meta", "link",
+  "input", "textarea", "select", "button",
+  '[contenteditable="true"]', '[aria-hidden="true"]',
+  `.${TR_CLASS}`,
+].join(", ");
+
+// claimed = 已被 walker ACCEPT 的 leaf, 子树整个 skip 防重复. WeakSet 不 leak DOM ref.
+const claimed = new WeakSet<HTMLElement>();
+const multiCache = new WeakMap<HTMLElement, boolean>();
+
+function hasClaimedAncestor(el: HTMLElement): boolean {
+  let p = el.parentElement;
+  while (p) {
+    if (claimed.has(p)) return true;
+    p = p.parentElement;
   }
-  if (h === "github.com") {
-    return [".markdown-body p", ".markdown-body li", ".comment-body p", ".comment-body li"];
-  }
-  if (h.endsWith("youtube.com")) {
-    return ["#description-inner span.yt-core-attributed-string", "#title yt-formatted-string"];
-  }
-  if (h === "news.ycombinator.com") {
-    return [".commtext", ".titleline > a"];
-  }
-  if (h.endsWith("reddit.com")) {
-    return ['[slot="text-body"] p', "shreddit-post h1", ".md p", ".md li"];
-  }
-  return ["article p", "article li", "main p", "main li", "[role=main] p", "[role=article] p"];
+  return false;
 }
 
-// 注意: 不能写 `[${HASH_ATTR}] *` — 会让 nested 翻译目标 (推特 quoted 推) 被
-// outer 排除. 重复翻译靠 processCandidate 的 nextElementSibling 检查防止.
-const EXCLUDE_SELECTOR = `pre, code, script, style, [contenteditable="true"], .${TR_CLASS}`;
+function isLeafTextElement(el: HTMLElement): boolean {
+  // 直接子节点必须全是 text 或 inline 标签 + 含可视 text.
+  let hasMeaningfulText = false;
+  for (const child of Array.from(el.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      if ((child.textContent || "").trim()) hasMeaningfulText = true;
+    } else if (child.nodeType === Node.ELEMENT_NODE) {
+      const tag = (child as Element).tagName;
+      if (!INLINE_TAGS.has(tag)) return false;
+      if ((child.textContent || "").trim()) hasMeaningfulText = true;
+    }
+  }
+  if (!hasMeaningfulText) return false;
+  const text = (el.innerText || el.textContent || "").trim();
+  return shouldTranslate(text);
+}
+
+// "outer 含多个独立 inline 段 (子全 inline, inline 间无 text 桥接)"
+// 例: X 推 <div tweetText><span>段1</span><span>段2</span></div> → multi
+//     `<p>这段含 <a>链接</a> 文字</p>` → not multi (a 周围有 text 桥接)
+function computeMultiSegmentInline(el: HTMLElement): boolean {
+  let inlineCount = 0;
+  let interText = false;
+  let lastWasInlineElement = false;
+  for (const c of Array.from(el.childNodes)) {
+    if (c.nodeType === Node.TEXT_NODE) {
+      if ((c.textContent || "").trim()) {
+        if (lastWasInlineElement) interText = true;
+      }
+      lastWasInlineElement = false;
+    } else if (c.nodeType === Node.ELEMENT_NODE) {
+      const tag = (c as Element).tagName;
+      if (!INLINE_TAGS.has(tag)) return false;
+      inlineCount++;
+      lastWasInlineElement = true;
+    }
+  }
+  return inlineCount >= 2 && !interText;
+}
+
+function isMultiSegmentInline(el: HTMLElement): boolean {
+  let r = multiCache.get(el);
+  if (r === undefined) {
+    r = computeMultiSegmentInline(el);
+    multiCache.set(el, r);
+  }
+  return r;
+}
+
+function collectTranslatable(root: ParentNode): HTMLElement[] {
+  const result: HTMLElement[] = [];
+  const rootEl = root instanceof Element ? root : document.body;
+
+  function visit(el: HTMLElement) {
+    if (el.matches(EXCLUDE_SELECTOR)) return;
+    if (hasClaimedAncestor(el)) return;
+
+    const isInline = INLINE_TAGS.has(el.tagName);
+
+    if (isInline) {
+      // INLINE 标签自身仅在 leaf 时 ACCEPT (X 推 span / X article sibling 内容).
+      // 子树不深入 (inline 内含 nested block 罕见, 接受 trade-off).
+      if (isLeafTextElement(el)) {
+        claimed.add(el);
+        result.push(el);
+      }
+      return;
+    }
+
+    // block 候选: 多 inline 子且无 text 桥接 → 拆开各翻 (X 推/段落多段 case).
+    if (isMultiSegmentInline(el)) {
+      // outer SKIP, walker 进子让 inline 各 ACCEPT.
+      for (const child of Array.from(el.children)) {
+        if (child instanceof HTMLElement) visit(child);
+      }
+      return;
+    }
+
+    // block 是单段 leaf → 整段一坨翻.
+    if (isLeafTextElement(el)) {
+      claimed.add(el);
+      result.push(el);
+      return;
+    }
+
+    // block 但非 leaf (含 block 子) — 继续深入.
+    for (const child of Array.from(el.children)) {
+      if (child instanceof HTMLElement) visit(child);
+    }
+  }
+
+  visit(rootEl);
+  return result;
+}
 
 // ── language detection ────────────────────────────────────────────────
 
@@ -173,6 +297,10 @@ function clearTranslation(el: HTMLElement) {
 function injectTranslation(el: HTMLElement, raw: string) {
   clearTranslation(el);
   if (mode === "off" || !raw) return;
+  // 译文等于原文 (模型决定不翻 — 专有名词 / handle / 版本号等) → 不 inject sibling,
+  // 否则视觉上原文显示 2 遍 (V 截图 #8 user info 重复 3 次的 root cause).
+  const original = (el.innerText || el.textContent || "").trim();
+  if (raw.trim() === original) return;
   // server 返 plain text with \n\n 段分隔. 浏览器把 \n 当 whitespace 渲染,
   // 段间会粘连, 转 <br><br> 才有视觉换行 (DOMPurify allowlist 含 br).
   const withBreaks = raw
@@ -195,14 +323,22 @@ function injectTranslation(el: HTMLElement, raw: string) {
 
 function processCandidate(el: HTMLElement) {
   if (mode === "off") return;
-  const next = el.nextElementSibling;
-  if (next && next.classList.contains(TR_CLASS)) return;
 
   const text = (el.innerText || el.textContent || "").trim();
   if (!shouldTranslate(text)) return;
 
   const fresh = hashText(text, TARGET_LANG);
   const existing = el.getAttribute(HASH_ATTR);
+
+  // SPA 重 mount 时, 旧 .bbt-tr sibling 可能跟随 hash 节点带过来; 但 text 已变 →
+  // hash 不一致 → 旧译文跟新内容不对应, 必须清掉重翻.
+  const next = el.nextElementSibling;
+  const hasInjected = !!(next && next.classList.contains(TR_CLASS));
+  if (hasInjected && existing === fresh) return;
+  if (hasInjected && existing !== fresh) {
+    clearTranslation(el);
+  }
+
   if (existing !== fresh) {
     el.setAttribute(HASH_ATTR, fresh);
   }
@@ -231,21 +367,13 @@ async function flush() {
   flushTimer = null;
   if (queue.size === 0) return;
 
-  // 视口优先: 当前可见的段先翻; 已 scroll-out 的丢 (V 滚过去了, 浪费算力).
-  // 如果之后 V 滚回去, MutationObserver/IO 重 fire 会重入 queue.
+  // FIFO 取 BATCH_SIZE — 不再按 viewport drop, V 滚出去的也翻完
+  // ("能读取到的尽量都翻"). slice 暂不删, 等 round-trip 完按 network 状态决定.
   const slice: { hash: string; el: HTMLElement }[] = [];
-  const drop: string[] = [];
   for (const [h, el] of queue) {
-    if (visibleHashes.has(h)) {
-      slice.push({ hash: h, el });
-      if (slice.length >= BATCH_SIZE) break;
-    } else {
-      drop.push(h);
-    }
+    slice.push({ hash: h, el });
+    if (slice.length >= BATCH_SIZE) break;
   }
-  for (const h of drop) queue.delete(h);
-  for (const { hash } of slice) queue.delete(hash);
-  if (queue.size > 0) scheduleFlush();
   if (slice.length === 0) return;
 
   const batch = slice.map(({ hash, el }) => ({
@@ -254,21 +382,21 @@ async function flush() {
   }));
 
   let results: { hash: string; translated: string }[] = [];
-  try {
-    const resp = (await chrome.runtime.sendMessage({
+  let networkOk = false;
+  const resp = (await safeChromeSend(() =>
+    chrome.runtime.sendMessage({
       type: "babata.translate",
       site: location.hostname,
       url: location.href,
       target: TARGET_LANG,
       batch,
-    })) as { ok: boolean; results?: typeof results } | undefined;
-    if (resp?.ok && Array.isArray(resp.results)) {
-      results = resp.results;
-    }
-  } catch {
-    // SW / server 没 ready — 静默. 段落 hash 仍在 DOM, 下次 IO/MO 触发会重入 queue.
-    return;
+    }),
+  )) as { ok: boolean; results?: typeof results } | undefined;
+  if (resp?.ok && Array.isArray(resp.results)) {
+    results = resp.results;
+    networkOk = true;
   }
+  // SW / server 没 ready 或 extension reload → 整 slice 留 queue, scheduleFlush 下次重试.
 
   const byHash = new Map(slice.map(({ hash, el }) => [hash, el]));
   for (const r of results) {
@@ -277,6 +405,12 @@ async function flush() {
     cache.set(r.hash, r.translated);
     injectTranslation(el, r.translated);
   }
+
+  if (networkOk) {
+    // server 处理过 (即使部分 result 缺也算 LLM 已尝试), 删 slice 防 retry 浪费.
+    for (const { hash } of slice) queue.delete(hash);
+  }
+  if (queue.size > 0) scheduleFlush();
 }
 
 // ── observers ─────────────────────────────────────────────────────────
@@ -284,21 +418,22 @@ async function flush() {
 let io: IntersectionObserver | null = null;
 
 function makeIO() {
+  // IO 现在仅用来追踪 visibleHashes (events.jsonl 的 page_memory 事实层).
+  // 翻译触发已不再 gate 在 viewport — 全 schedule, IO 不再 trigger processCandidate.
   io = new IntersectionObserver(
     (entries) => {
       let viewportChanged = false;
       for (const e of entries) {
         const el = e.target as HTMLElement;
+        const h = el.getAttribute(HASH_ATTR);
+        if (!h) continue;
         if (e.isIntersecting) {
-          processCandidate(el);
-          const h = el.getAttribute(HASH_ATTR);
-          if (h && !visibleHashes.has(h)) {
+          if (!visibleHashes.has(h)) {
             visibleHashes.add(h);
             viewportChanged = true;
           }
         } else {
-          const h = el.getAttribute(HASH_ATTR);
-          if (h && visibleHashes.delete(h)) {
+          if (visibleHashes.delete(h)) {
             viewportChanged = true;
           }
         }
@@ -311,17 +446,11 @@ function makeIO() {
 
 function observeNew(root: ParentNode) {
   if (!io) return;
-  const sels = paragraphSelectors().join(", ");
-  let nodes: NodeListOf<Element>;
-  try {
-    nodes = root.querySelectorAll(sels);
-  } catch {
-    return;
-  }
-  for (const el of nodes) {
-    if (!(el instanceof HTMLElement)) continue;
-    if (el.closest(EXCLUDE_SELECTOR)) continue;
+  // 通用 leaf-text 收集 (不再走 site-specific selectors).
+  const elements = collectTranslatable(root);
+  for (const el of elements) {
     io.observe(el);
+    processCandidate(el);
   }
 }
 
@@ -382,12 +511,16 @@ function boot() {
     setupAttentionWatchers();
   });
 
-  chrome.storage.onChanged.addListener((changes) => {
-    if (changes["babata.translation_mode"]) {
-      mode = changes["babata.translation_mode"].newValue as Mode;
-      rerunAll();
-    }
-  });
+  try {
+    chrome.storage.onChanged.addListener((changes) => {
+      if (changes["babata.translation_mode"]) {
+        mode = changes["babata.translation_mode"].newValue as Mode;
+        rerunAll();
+      }
+    });
+  } catch {
+    /* extension context invalidated — 老 content script 不 re-bind, V 刷 page 后新 SC 接手 */
+  }
 }
 
 if (document.readyState === "loading") {

@@ -139,14 +139,21 @@ async function handleWsInbound(raw: string) {
       sendToWs({ kind: "response", id: inbound.id, ok: false, error: err });
     }
   } else if (inbound.kind === "notification") {
-    // server → SW notification → 转 sidepanel.
+    // server → SW notification → 转 sidepanel. sidepanel 没挂 / widget 没注册
+    // listener 时 reject (no receiver), V0 接受 lossy 但 debug log 留下来.
     chrome.runtime
       .sendMessage({
         type: "babata.notification",
         action: inbound.action,
         args: inbound.args ?? {},
       })
-      .catch(() => {});
+      .catch((e) => {
+        console.debug(
+          "[babata-sw] notification dropped (no receiver):",
+          inbound.action,
+          (e as Error)?.message ?? e,
+        );
+      });
   }
 }
 
