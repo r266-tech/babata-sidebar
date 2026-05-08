@@ -160,10 +160,11 @@ const inlineCache = new WeakMap<HTMLElement, boolean>();
 const hiddenCache = new WeakMap<HTMLElement, boolean>();
 // MO sentinel — 自己 inject 的 .bbt-tr font 加进, MO addedNodes 跳 (kiss translator.js:319,711).
 const skipMoNodes = new WeakSet<Node>();
-// X SPA reconcile race debounce — 同 hash inject 后 800ms 内 MO 触发 processCandidate skip,
-// 让 X reconcile 完成稳态 (主推 reconcile 周期 ~几百 ms; 不防的话 inject→reconcile→inject 闪烁).
+// X SPA reconcile race debounce — 同 hash inject 后 N ms 内 MO 触发 processCandidate skip,
+// 让 X reconcile 完成稳态. V 实测 800ms 仍闪 (events.jsonl 同 hash 1 秒 4 hit), codex F1
+// 警告"X 可能 900-1500ms 周期", 调 1500ms 给 X reconcile burst 留余地.
 const recentlyInjected = new Map<string, number>();
-const INJECT_DEBOUNCE_MS = 800;
+const INJECT_DEBOUNCE_MS = 1500;
 // X 干掉 .bbt-tr 但 source 仍在 DOM (主推漏翻 case): 200ms trailing 后再 inject.
 const REINJECT_DELAY_MS = 200;
 // periodic cleanup 防 Map leak (long timeline 累积). cleanupTimer 留 handle 给 lifecycle.
@@ -562,6 +563,14 @@ function observeMutations() {
   if (mo !== null) return;
   mo = new MutationObserver((records) => {
     for (const r of records) {
+      // F7 codex: kiss translator.js:711-714 完整 sentinel — 跳 mutation.target 是
+      // .bbt-tr font 自己 / 已 inside .bbt-tr 的 mutation. X reconcile burst 期间
+      // 我们 sibling .bbt-tr 内部也可能被 X 触发 mutation (即使我们没动它).
+      const target = r.target;
+      if (target instanceof HTMLElement) {
+        if (target.classList.contains(TR_CLASS)) continue;
+        if (target.closest && target.closest(`.${TR_CLASS}`)) continue;
+      }
       // F-V-display-more: X "显示更多" 点开后, X 用 React 替换 tweetText nodeValue
       // (characterData mutation 不是 childList). 抄 kiss translator.js:718-723 模式:
       // oldValue !== nodeValue 才触发 (filter noop), processCandidate parent 重 enqueue.
@@ -569,6 +578,8 @@ function observeMutations() {
         if (r.oldValue === r.target.nodeValue) continue;
         const parent = r.target.parentElement;
         if (parent && parent instanceof HTMLElement) {
+          // 父元素 inside .bbt-tr 跳 (我们译文 text node 改不算用户内容变化).
+          if (parent.closest && parent.closest(`.${TR_CLASS}`)) continue;
           processCandidate(parent);
         }
         continue;
@@ -576,6 +587,9 @@ function observeMutations() {
       for (const node of r.addedNodes) {
         // 自己 inject 的 .bbt-tr font 跳 (kiss translator.js:711 同模式) — 防自触发 loop.
         if (skipMoNodes.has(node)) continue;
+        // 结构性 sentinel: addedNode 自己是 .bbt-tr (即使 skipMoNodes WeakSet 没 cover —
+        // 比如 SPA clone / 第三方扩展插同 class 元素) 跳 (kiss translator.js:730-732).
+        if (node instanceof HTMLElement && node.classList.contains(TR_CLASS)) continue;
         if (!(node instanceof HTMLElement)) continue;
 
         // 重 mount 的原段落带 hash → 立即 L1 cache 命中 re-inject.
