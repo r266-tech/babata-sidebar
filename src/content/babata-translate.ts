@@ -562,6 +562,17 @@ function observeMutations() {
   if (mo !== null) return;
   mo = new MutationObserver((records) => {
     for (const r of records) {
+      // F-V-display-more: X "显示更多" 点开后, X 用 React 替换 tweetText nodeValue
+      // (characterData mutation 不是 childList). 抄 kiss translator.js:718-723 模式:
+      // oldValue !== nodeValue 才触发 (filter noop), processCandidate parent 重 enqueue.
+      if (r.type === "characterData") {
+        if (r.oldValue === r.target.nodeValue) continue;
+        const parent = r.target.parentElement;
+        if (parent && parent instanceof HTMLElement) {
+          processCandidate(parent);
+        }
+        continue;
+      }
       for (const node of r.addedNodes) {
         // 自己 inject 的 .bbt-tr font 跳 (kiss translator.js:711 同模式) — 防自触发 loop.
         if (skipMoNodes.has(node)) continue;
@@ -607,7 +618,12 @@ function observeMutations() {
       }
     }
   });
-  mo.observe(document.body, { childList: true, subtree: true });
+  mo.observe(document.body, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+    characterDataOldValue: true,
+  });
 }
 
 // ── boot ──────────────────────────────────────────────────────────────
