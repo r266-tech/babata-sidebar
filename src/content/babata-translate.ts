@@ -165,6 +165,13 @@ const skipMoNodes = new WeakSet<Node>();
 // 警告"X 可能 900-1500ms 周期", 调 1500ms 给 X reconcile burst 留余地.
 const recentlyInjected = new Map<string, number>();
 const INJECT_DEBOUNCE_MS = 1500;
+// V 实测 d3b224e 仍闪 + image #8/#9 同 timeline 译文不同 — 真 root cause: X reconcile
+// 反复修改 textContent, hash 跟着变 → hash debounce 不拦 (hash 真在变), 每次新 hash 都
+// 调 LLM 拿新译文 (events.jsonl 同 batch_size=21 重复 5 次印证). 加 per-element throttle:
+// 同 element 1.5s 内只 process 1 次, 不管 hash 怎么变. X reconcile 反复 reset textContent
+// 不再触发疯狂 LLM 调用. trade-off: 用户点"显示更多"展开后, 新内容延迟 1.5s 翻 (vs 闪烁不可接受).
+const elementProcessThrottle = new WeakMap<HTMLElement, number>();
+const ELEMENT_THROTTLE_MS = 1500;
 // X 干掉 .bbt-tr 但 source 仍在 DOM (主推漏翻 case): 200ms trailing 后再 inject.
 const REINJECT_DELAY_MS = 200;
 // periodic cleanup 防 Map leak (long timeline 累积). cleanupTimer 留 handle 给 lifecycle.
@@ -421,6 +428,12 @@ function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
 
 function processCandidate(el: HTMLElement) {
   if (mode === "off") return;
+
+  // Per-element throttle: X reconcile 反复改 textContent 触发 hash 反复变化, 同 element
+  // 1.5s 内不管多少次 mutation 都只 process 1 次. 解决"image #8/#9 译文不同"闪烁.
+  const lastTs = elementProcessThrottle.get(el);
+  if (lastTs !== undefined && Date.now() - lastTs < ELEMENT_THROTTLE_MS) return;
+  elementProcessThrottle.set(el, Date.now());
 
   const text = (el.innerText || el.textContent || "").trim();
   if (!shouldTranslate(text)) return;
