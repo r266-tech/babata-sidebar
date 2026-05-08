@@ -165,13 +165,18 @@ const skipMoNodes = new WeakSet<Node>();
 // 警告"X 可能 900-1500ms 周期", 调 1500ms 给 X reconcile burst 留余地.
 const recentlyInjected = new Map<string, number>();
 const INJECT_DEBOUNCE_MS = 1500;
-// V 实测 d3b224e 仍闪 + image #8/#9 同 timeline 译文不同 — 真 root cause: X reconcile
-// 反复修改 textContent, hash 跟着变 → hash debounce 不拦 (hash 真在变), 每次新 hash 都
-// 调 LLM 拿新译文 (events.jsonl 同 batch_size=21 重复 5 次印证). 加 per-element throttle:
-// 同 element 1.5s 内只 process 1 次, 不管 hash 怎么变. X reconcile 反复 reset textContent
-// 不再触发疯狂 LLM 调用. trade-off: 用户点"显示更多"展开后, 新内容延迟 1.5s 翻 (vs 闪烁不可接受).
-const elementProcessThrottle = new WeakMap<HTMLElement, number>();
-const ELEMENT_THROTTLE_MS = 1500;
+// 抄沉浸式 v1.28.5 `Js` Map (content_main_beauty.js:45580-45596) — TRAILING stable-window.
+// 之前用 leading throttle (first-wins) 错: X reconcile 第一次 mutation 拿 unstable text
+// 就 process, 后续 1.5s 内全拦, "显示更多" 展开后新内容 fall in throttle window 漏翻.
+// trailing 正解: 每次 mutation 更新 ts, 1100ms 静默无新 mutation 才真 process. 拿到的
+// 是 X reconcile 完成后的稳定 text, 1 次 process inject 不闪. tick interval 200ms 扫.
+const STABLE_WINDOW_MS = 1100;
+const stableWindowMap = new Map<HTMLElement, { ts: number; src: TraceSource }>();
+let stableWindowTimer: number | null = null;
+// 抄沉浸式 `a Set` (content_main_beauty.js:45373) — element in-flight 锁. 当 el 已 enqueue
+// 在 server LLM 调用中, 新 mutation 不重 enqueue (queue Map 是 hash-keyed, hash 变会重复
+// 进 queue 触发 server 多次调). flush results 完成后清, 允许下次 mutation 触发新翻.
+const inFlightElements = new WeakSet<HTMLElement>();
 // X 干掉 .bbt-tr 但 source 仍在 DOM (主推漏翻 case): 200ms trailing 后再 inject.
 const REINJECT_DELAY_MS = 200;
 
@@ -253,10 +258,34 @@ function startCleanupTimer() {
     }
   }, INJECT_DEBOUNCE_MS * 8);
 }
+
+// 抄沉浸式 v1.28.5 C() function (45578-45605) — trailing stable-window scanner.
+// 每 200ms 扫 stableWindowMap, 静默 1100ms+ 的 element 提升到 doProcessCandidate.
+function startStableWindowTimer() {
+  if (stableWindowTimer !== null) return;
+  stableWindowTimer = window.setInterval(() => {
+    if (stableWindowMap.size === 0) return;
+    const now = Date.now();
+    const ready: { el: HTMLElement; src: TraceSource }[] = [];
+    for (const [el, info] of stableWindowMap) {
+      if (now - info.ts > STABLE_WINDOW_MS) {
+        ready.push({ el, src: info.src });
+        stableWindowMap.delete(el);
+      }
+    }
+    for (const { el, src } of ready) {
+      if (el.isConnected) doProcessCandidate(el, src);
+    }
+  }, 200);
+}
 function teardownAll() {
   if (cleanupTimer !== null) {
     clearInterval(cleanupTimer);
     cleanupTimer = null;
+  }
+  if (stableWindowTimer !== null) {
+    clearInterval(stableWindowTimer);
+    stableWindowTimer = null;
   }
   if (mo !== null) {
     mo.disconnect();
@@ -501,15 +530,24 @@ function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
 function processCandidate(el: HTMLElement, src: TraceSource = "init") {
   if (mode === "off") return;
 
-  // Per-element throttle: X reconcile 反复改 textContent 触发 hash 反复变化, 同 element
-  // 1.5s 内不管多少次 mutation 都只 process 1 次. 解决"image #8/#9 译文不同"闪烁.
-  const lastTs = elementProcessThrottle.get(el);
-  if (lastTs !== undefined && Date.now() - lastTs < ELEMENT_THROTTLE_MS) {
-    trace(src, el, "", "throttle");
+  // user-initiated (rerun = mode toggle / init = boot) 立即处理, 不等 stable window.
+  // mutation-triggered (io / mo_add / mo_char) 走 trailing stable-window: 每次 mutation
+  // 更新 ts, 1100ms 静默后才真 process — 拿到 X reconcile 稳态 text 1 次翻不闪.
+  if (src === "rerun" || src === "init") {
+    doProcessCandidate(el, src);
     return;
   }
-  elementProcessThrottle.set(el, Date.now());
+  // 已在 in-flight 翻译中: 不重 enqueue, flush 完成后下次 mutation 再触发.
+  if (inFlightElements.has(el)) {
+    trace(src, el, "", "in_flight_defer");
+    return;
+  }
+  // 入 trailing stable-window — 每次 mutation 更新 ts. last-wins.
+  stableWindowMap.set(el, { ts: Date.now(), src });
+  trace(src, el, "", "stable_pending");
+}
 
+function doProcessCandidate(el: HTMLElement, src: TraceSource) {
   const text = (el.innerText || el.textContent || "").trim();
   if (!text) {
     trace(src, el, "", "skip_no_text");
@@ -535,8 +573,7 @@ function processCandidate(el: HTMLElement, src: TraceSource = "init") {
     clearTranslation(el);
   }
 
-  // X SPA reconcile race: X 干掉 .bbt-tr → MO addedNodes → processCandidate → cache hit
-  // → re-inject → X 干掉 → loop = 闪烁. 同 hash 800ms 内 1 次 inject (V 实测主推闪烁修复).
+  // 同 hash 全 page 共享 1500ms debounce — 防不同 element 同 text 短时间反复 inject.
   const recentTs = recentlyInjected.get(fresh);
   if (recentTs !== undefined && Date.now() - recentTs < INJECT_DEBOUNCE_MS) {
     trace(src, el, fresh, "debounce", text);
@@ -555,6 +592,7 @@ function processCandidate(el: HTMLElement, src: TraceSource = "init") {
   }
 
   trace(src, el, fresh, "enqueue", text);
+  inFlightElements.add(el);
   queue.set(fresh, el);
   // queue cap — V 快速滚时 evict 最老 (FIFO insertion order).
   if (queue.size > QUEUE_MAX) {
@@ -616,6 +654,8 @@ async function flush() {
     // server 处理过 (即使部分 result 缺也算 LLM 已尝试), 删 slice 防 retry 浪费.
     for (const { hash } of slice) queue.delete(hash);
   }
+  // 不管 networkOk 与否, slice 里 element 释放 in-flight 锁 (allow 下次 mutation 触发新翻).
+  for (const { el } of slice) inFlightElements.delete(el);
   if (queue.size > 0) scheduleFlush();
 }
 
@@ -777,6 +817,7 @@ function boot() {
     observeMutations();
     setupAttentionWatchers();
     startCleanupTimer();
+    startStableWindowTimer();
   });
 
   try {
