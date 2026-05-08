@@ -61,11 +61,17 @@ function safeChromeSend<T>(fn: () => Promise<T>): Promise<T | undefined> {
   if (extInvalidated) return Promise.resolve(undefined);
   try {
     return fn().catch((e) => {
-      if (isInvalidatedError(e)) extInvalidated = true;
+      if (isInvalidatedError(e)) {
+        extInvalidated = true;
+        teardownAll();
+      }
       return undefined;
     });
   } catch (e) {
-    if (isInvalidatedError(e)) extInvalidated = true;
+    if (isInvalidatedError(e)) {
+      extInvalidated = true;
+      teardownAll();
+    }
     return Promise.resolve(undefined);
   }
 }
@@ -152,6 +158,36 @@ const multiCache = new WeakMap<HTMLElement, boolean>();
 // inline 判断缓存 — getComputedStyle 同步 reflow, 同元素重复调贵.
 const inlineCache = new WeakMap<HTMLElement, boolean>();
 const hiddenCache = new WeakMap<HTMLElement, boolean>();
+// MO sentinel — 自己 inject 的 .bbt-tr font 加进, MO addedNodes 跳 (kiss translator.js:319,711).
+const skipMoNodes = new WeakSet<Node>();
+// X SPA reconcile race debounce — 同 hash inject 后 800ms 内 MO 触发 processCandidate skip,
+// 让 X reconcile 完成稳态 (主推 reconcile 周期 ~几百 ms; 不防的话 inject→reconcile→inject 闪烁).
+const recentlyInjected = new Map<string, number>();
+const INJECT_DEBOUNCE_MS = 800;
+// X 干掉 .bbt-tr 但 source 仍在 DOM (主推漏翻 case): 200ms trailing 后再 inject.
+const REINJECT_DELAY_MS = 200;
+// periodic cleanup 防 Map leak (long timeline 累积). cleanupTimer 留 handle 给 lifecycle.
+let cleanupTimer: number | null = null;
+let mo: MutationObserver | null = null;
+function startCleanupTimer() {
+  if (cleanupTimer !== null) return;
+  cleanupTimer = window.setInterval(() => {
+    const cutoff = Date.now() - INJECT_DEBOUNCE_MS * 4;
+    for (const [h, ts] of recentlyInjected) {
+      if (ts < cutoff) recentlyInjected.delete(h);
+    }
+  }, INJECT_DEBOUNCE_MS * 8);
+}
+function teardownAll() {
+  if (cleanupTimer !== null) {
+    clearInterval(cleanupTimer);
+    cleanupTimer = null;
+  }
+  if (mo !== null) {
+    mo.disconnect();
+    mo = null;
+  }
+}
 
 // CSS display 是 inline-like (read-frog isInlineDisplay filter.ts:41-63).
 // "contents" = 元素自身不渲染, 子直挂父 — 行为接 inline.
@@ -348,7 +384,7 @@ function clearTranslation(el: HTMLElement) {
   }
 }
 
-function injectTranslation(el: HTMLElement, raw: string) {
+function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
   clearTranslation(el);
   if (mode === "off" || !raw) return;
   // 译文等于原文 (模型决定不翻 — 专有名词 / handle / 版本号等) → 不 inject sibling,
@@ -364,13 +400,20 @@ function injectTranslation(el: HTMLElement, raw: string) {
   const safe = DOMPurify.sanitize(withBreaks, SAFE_HTML_OPTS);
   if (mode === "auto") {
     Reflect.set(el, "innerHTML", safe);
+    // F4: innerHTML 替换后子树都是我们的 sanitized 译文 (含允许的 span/mark/a 等),
+    // 不 mark 的话 MO addedNodes 看到这些 inline 子树会重新 collect → 假性"原文"翻译.
+    el.querySelectorAll("*").forEach((c) => skipMoNodes.add(c));
+    if (hash) recentlyInjected.set(hash, Date.now());
     return;
   }
   const font = document.createElement("font");
   font.className = TR_CLASS;
   font.setAttribute("style", TR_STYLE);
   Reflect.set(font, "innerHTML", safe);
+  // MO sentinel: 自己 inject 的 font 加进 skipMoNodes, MO addedNodes 看到跳 (防自触发).
+  skipMoNodes.add(font);
   el.insertAdjacentElement("afterend", font);
+  if (hash) recentlyInjected.set(hash, Date.now());
 }
 
 // ── candidate processing ──────────────────────────────────────────────
@@ -393,13 +436,20 @@ function processCandidate(el: HTMLElement) {
     clearTranslation(el);
   }
 
+  // X SPA reconcile race: X 干掉 .bbt-tr → MO addedNodes → processCandidate → cache hit
+  // → re-inject → X 干掉 → loop = 闪烁. 同 hash 800ms 内 1 次 inject (V 实测主推闪烁修复).
+  const recentTs = recentlyInjected.get(fresh);
+  if (recentTs !== undefined && Date.now() - recentTs < INJECT_DEBOUNCE_MS) {
+    return;
+  }
+
   if (existing !== fresh) {
     el.setAttribute(HASH_ATTR, fresh);
   }
 
   const cached = cache.get(fresh);
   if (cached !== undefined) {
-    injectTranslation(el, cached);
+    injectTranslation(el, cached, fresh);
     return;
   }
 
@@ -457,7 +507,7 @@ async function flush() {
     const el = byHash.get(r.hash);
     if (!el || !r.translated) continue;
     cache.set(r.hash, r.translated);
-    injectTranslation(el, r.translated);
+    injectTranslation(el, r.translated, r.hash);
   }
 
   if (networkOk) {
@@ -509,9 +559,12 @@ function observeNew(root: ParentNode) {
 }
 
 function observeMutations() {
-  const mo = new MutationObserver((records) => {
+  if (mo !== null) return;
+  mo = new MutationObserver((records) => {
     for (const r of records) {
       for (const node of r.addedNodes) {
+        // 自己 inject 的 .bbt-tr font 跳 (kiss translator.js:711 同模式) — 防自触发 loop.
+        if (skipMoNodes.has(node)) continue;
         if (!(node instanceof HTMLElement)) continue;
 
         // 重 mount 的原段落带 hash → 立即 L1 cache 命中 re-inject.
@@ -525,6 +578,32 @@ function observeMutations() {
 
         // 新加段落 → 加入 IO 观察 (viewport 入境再翻).
         observeNew(node);
+      }
+
+      // F6: X SPA 干掉 .bbt-tr 但 source 仍在 DOM (主推漏翻 case).
+      // previousSibling 是 hashed source 时, 200ms trailing 后 re-inject (cache 命中不调 server).
+      // 200ms 让 X 这一波 reconcile burst 走完, source 仍在则补译文; 不在则 noop.
+      for (const node of r.removedNodes) {
+        if (!(node instanceof HTMLElement)) continue;
+        if (!node.classList.contains(TR_CLASS)) continue;
+        const source = r.previousSibling;
+        if (!(source instanceof HTMLElement)) continue;
+        if (!source.hasAttribute(HASH_ATTR)) continue;
+        const hash = source.getAttribute(HASH_ATTR);
+        if (!hash) continue;
+        const cached = cache.get(hash);
+        if (cached === undefined) continue;
+        // 不 delete recentlyInjected — 删了会让 200ms 内 addedNodes 路径 processCandidate
+        // 跳过 800ms debounce 抢先 inject + setTimeout 200ms 后又 inject = double.
+        // 让 800ms debounce 自然挡 addedNodes; setTimeout 内 sibling check 兜底.
+        window.setTimeout(() => {
+          if (!source.isConnected) return;
+          if (source.nextElementSibling?.classList?.contains(TR_CLASS)) return;
+          // re-validate: text 仍是当时的 hash, 避免 X 重 mount 后 text 变了
+          const text = (source.innerText || source.textContent || "").trim();
+          if (hashText(text, TARGET_LANG) !== hash) return;
+          injectTranslation(source, cached, hash);
+        }, REINJECT_DELAY_MS);
       }
     }
   });
@@ -546,6 +625,8 @@ async function loadMode() {
 
 function rerunAll() {
   document.querySelectorAll(`.${TR_CLASS}`).forEach((e) => e.remove());
+  // F5: V 显式 toggle mode 是 user action, 清 debounce 让 processCandidate 立即 re-inject.
+  recentlyInjected.clear();
   if (mode === "off") return;
   document.querySelectorAll(`[${HASH_ATTR}]`).forEach((e) => {
     if (e instanceof HTMLElement) processCandidate(e);
@@ -563,6 +644,7 @@ function boot() {
     observeNew(document.body);
     observeMutations();
     setupAttentionWatchers();
+    startCleanupTimer();
   });
 
   try {
@@ -575,6 +657,9 @@ function boot() {
   } catch {
     /* extension context invalidated — 老 content script 不 re-bind, V 刷 page 后新 SC 接手 */
   }
+
+  // F8: page unload / extension reload 时清 timer + MO, 防老 content script leak.
+  window.addEventListener("pagehide", teardownAll, { once: true });
 }
 
 if (document.readyState === "loading") {
