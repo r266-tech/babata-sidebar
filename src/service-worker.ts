@@ -73,6 +73,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // page-side 翻译 trace instrumentation (V "开发要收集数据方便调试") →
+  // server /translate_trace 写 events.jsonl client_trace kind. fire-and-forget.
+  if (m.type === "babata.translate_trace") {
+    void (async () => {
+      try {
+        await fetch("http://127.0.0.1:18791/translate_trace", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            url: (m as { url?: string }).url ?? "",
+            traces: (m as { traces?: unknown }).traces ?? [],
+          }),
+        });
+        sendResponse?.({ ok: true });
+      } catch (e) {
+        sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
+      }
+    })();
+    return true;
+  }
+
   // page-side 翻译模块的 batch 翻译请求 → forward 到 server /translate.
   if (m.type === "babata.translate") {
     void (async () => {

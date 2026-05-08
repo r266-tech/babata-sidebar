@@ -174,6 +174,73 @@ const elementProcessThrottle = new WeakMap<HTMLElement, number>();
 const ELEMENT_THROTTLE_MS = 1500;
 // X 干掉 .bbt-tr 但 source 仍在 DOM (主推漏翻 case): 200ms trailing 后再 inject.
 const REINJECT_DELAY_MS = 200;
+
+// ── client trace instrumentation (V "开发要收集数据方便调试") ─
+// 每次 processCandidate 在每个 decision 点记一条 trace. batch flush 经 SW POST
+// /translate_trace, server 写 events.jsonl client_trace kind. V tail 直接看
+// 每个 decision 不再 hypothesize 闪烁/漏翻 root cause.
+type TraceSource = "io" | "mo_add" | "mo_char" | "rerun" | "init";
+type TraceDecision = "throttle" | "not_translatable" | "already" | "debounce"
+  | "cache_inject" | "enqueue" | "reinject_timer" | "skip_no_text";
+interface TraceRecord {
+  ts: number;
+  src: TraceSource;
+  dec: TraceDecision;
+  hash: string;
+  txt: string;
+  el: string;
+}
+const traces: TraceRecord[] = [];
+const TRACE_FLUSH_MS = 2000;
+const TRACE_BATCH_MAX = 50;
+let traceTimer: number | null = null;
+function pathOf(el: HTMLElement): string {
+  const tag = el.tagName.toLowerCase();
+  const testid = el.getAttribute("data-testid");
+  const role = el.getAttribute("role");
+  const cls = (el.className?.toString() || "").slice(0, 30);
+  return tag
+    + (testid ? `[testid=${testid}]` : "")
+    + (role ? `[role=${role}]` : "")
+    + (cls ? `.${cls.split(" ")[0]}` : "");
+}
+function trace(
+  src: TraceSource,
+  el: HTMLElement,
+  hash: string,
+  dec: TraceDecision,
+  text?: string,
+) {
+  traces.push({
+    ts: Date.now(),
+    src, dec, hash,
+    txt: (text ?? el.innerText ?? el.textContent ?? "").trim().slice(0, 40),
+    el: pathOf(el),
+  });
+  if (traces.length >= TRACE_BATCH_MAX) {
+    flushTraces();
+    return;
+  }
+  if (traceTimer === null) {
+    traceTimer = window.setTimeout(flushTraces, TRACE_FLUSH_MS);
+  }
+}
+function flushTraces() {
+  if (traceTimer !== null) {
+    clearTimeout(traceTimer);
+    traceTimer = null;
+  }
+  if (traces.length === 0) return;
+  const batch = traces.splice(0);
+  void safeChromeSend(() =>
+    chrome.runtime.sendMessage({
+      type: "babata.translate_trace",
+      url: location.href,
+      traces: batch,
+    }),
+  );
+}
+
 // periodic cleanup 防 Map leak (long timeline 累积). cleanupTimer 留 handle 给 lifecycle.
 let cleanupTimer: number | null = null;
 let mo: MutationObserver | null = null;
@@ -194,6 +261,11 @@ function teardownAll() {
   if (mo !== null) {
     mo.disconnect();
     mo = null;
+  }
+  flushTraces();  // 刷尾巴 trace 不丢 (extension reload / pagehide).
+  if (traceTimer !== null) {
+    clearTimeout(traceTimer);
+    traceTimer = null;
   }
 }
 
@@ -426,17 +498,27 @@ function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
 
 // ── candidate processing ──────────────────────────────────────────────
 
-function processCandidate(el: HTMLElement) {
+function processCandidate(el: HTMLElement, src: TraceSource = "init") {
   if (mode === "off") return;
 
   // Per-element throttle: X reconcile 反复改 textContent 触发 hash 反复变化, 同 element
   // 1.5s 内不管多少次 mutation 都只 process 1 次. 解决"image #8/#9 译文不同"闪烁.
   const lastTs = elementProcessThrottle.get(el);
-  if (lastTs !== undefined && Date.now() - lastTs < ELEMENT_THROTTLE_MS) return;
+  if (lastTs !== undefined && Date.now() - lastTs < ELEMENT_THROTTLE_MS) {
+    trace(src, el, "", "throttle");
+    return;
+  }
   elementProcessThrottle.set(el, Date.now());
 
   const text = (el.innerText || el.textContent || "").trim();
-  if (!shouldTranslate(text)) return;
+  if (!text) {
+    trace(src, el, "", "skip_no_text");
+    return;
+  }
+  if (!shouldTranslate(text)) {
+    trace(src, el, "", "not_translatable", text);
+    return;
+  }
 
   const fresh = hashText(text, TARGET_LANG);
   const existing = el.getAttribute(HASH_ATTR);
@@ -445,7 +527,10 @@ function processCandidate(el: HTMLElement) {
   // hash 不一致 → 旧译文跟新内容不对应, 必须清掉重翻.
   const next = el.nextElementSibling;
   const hasInjected = !!(next && next.classList.contains(TR_CLASS));
-  if (hasInjected && existing === fresh) return;
+  if (hasInjected && existing === fresh) {
+    trace(src, el, fresh, "already", text);
+    return;
+  }
   if (hasInjected && existing !== fresh) {
     clearTranslation(el);
   }
@@ -454,6 +539,7 @@ function processCandidate(el: HTMLElement) {
   // → re-inject → X 干掉 → loop = 闪烁. 同 hash 800ms 内 1 次 inject (V 实测主推闪烁修复).
   const recentTs = recentlyInjected.get(fresh);
   if (recentTs !== undefined && Date.now() - recentTs < INJECT_DEBOUNCE_MS) {
+    trace(src, el, fresh, "debounce", text);
     return;
   }
 
@@ -463,10 +549,12 @@ function processCandidate(el: HTMLElement) {
 
   const cached = cache.get(fresh);
   if (cached !== undefined) {
+    trace(src, el, fresh, "cache_inject", text);
     injectTranslation(el, cached, fresh);
     return;
   }
 
+  trace(src, el, fresh, "enqueue", text);
   queue.set(fresh, el);
   // queue cap — V 快速滚时 evict 最老 (FIFO insertion order).
   if (queue.size > QUEUE_MAX) {
@@ -562,13 +650,13 @@ function makeIO() {
   );
 }
 
-function observeNew(root: ParentNode) {
+function observeNew(root: ParentNode, src: TraceSource = "init") {
   if (!io) return;
   // 通用 leaf-text 收集 (不再走 site-specific selectors).
   const elements = collectTranslatable(root);
   for (const el of elements) {
     io.observe(el);
-    processCandidate(el);
+    processCandidate(el, src);
   }
 }
 
@@ -593,7 +681,7 @@ function observeMutations() {
         if (parent && parent instanceof HTMLElement) {
           // 父元素 inside .bbt-tr 跳 (我们译文 text node 改不算用户内容变化).
           if (parent.closest && parent.closest(`.${TR_CLASS}`)) continue;
-          processCandidate(parent);
+          processCandidate(parent, "mo_char");
         }
         continue;
       }
@@ -607,15 +695,15 @@ function observeMutations() {
 
         // 重 mount 的原段落带 hash → 立即 L1 cache 命中 re-inject.
         if (node.hasAttribute(HASH_ATTR)) {
-          processCandidate(node);
+          processCandidate(node, "mo_add");
         }
         const hashed = node.querySelectorAll(`[${HASH_ATTR}]`);
         for (const h of hashed) {
-          if (h instanceof HTMLElement) processCandidate(h);
+          if (h instanceof HTMLElement) processCandidate(h, "mo_add");
         }
 
         // 新加段落 → 加入 IO 观察 (viewport 入境再翻).
-        observeNew(node);
+        observeNew(node, "mo_add");
       }
 
       // F6: X SPA 干掉 .bbt-tr 但 source 仍在 DOM (主推漏翻 case).
@@ -640,6 +728,7 @@ function observeMutations() {
           // re-validate: text 仍是当时的 hash, 避免 X 重 mount 后 text 变了
           const text = (source.innerText || source.textContent || "").trim();
           if (hashText(text, TARGET_LANG) !== hash) return;
+          trace("mo_add", source, hash, "reinject_timer", text);
           injectTranslation(source, cached, hash);
         }, REINJECT_DELAY_MS);
       }
@@ -672,7 +761,7 @@ function rerunAll() {
   recentlyInjected.clear();
   if (mode === "off") return;
   document.querySelectorAll(`[${HASH_ATTR}]`).forEach((e) => {
-    if (e instanceof HTMLElement) processCandidate(e);
+    if (e instanceof HTMLElement) processCandidate(e, "rerun");
   });
 }
 
