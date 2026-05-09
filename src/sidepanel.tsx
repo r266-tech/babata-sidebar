@@ -24,11 +24,14 @@ type LightContext = {
   url: string;
   title: string;
   url_changed: boolean;
+  tab_id?: number;
+  window_id?: number;
 };
 
 type Suggestion = { id: string; text: string };
 
 const SERVER = "http://127.0.0.1:18791";
+const SIDEPANEL_PORT = "babata-sidepanel";
 
 type ServerEvent =
   | { type: "text_delta"; text: string }
@@ -88,7 +91,13 @@ async function captureLightContext(lastUrl: string): Promise<LightContext | null
     if (!tab) return null;
     const url = tab.url ?? "";
     const title = tab.title ?? "";
-    return { url, title, url_changed: !!url && url !== lastUrl };
+    return {
+      url,
+      title,
+      url_changed: !!url && url !== lastUrl,
+      tab_id: tab.id,
+      window_id: tab.windowId,
+    };
   } catch {
     return null;
   }
@@ -132,6 +141,65 @@ function App() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lastSentUrl = useRef<string>("");
+
+  useEffect(() => {
+    let port: chrome.runtime.Port | null = null;
+    let pingTimer: number | null = null;
+    let reconnectTimer: number | null = null;
+    let stopped = false;
+
+    const clearPing = () => {
+      if (pingTimer !== null) {
+        window.clearInterval(pingTimer);
+        pingTimer = null;
+      }
+    };
+
+    const connectPort = () => {
+      if (stopped) return;
+      clearPing();
+      try {
+        port = chrome.runtime.connect({ name: SIDEPANEL_PORT });
+      } catch {
+        reconnectTimer = window.setTimeout(() => {
+          reconnectTimer = null;
+          connectPort();
+        }, 1500);
+        return;
+      }
+      const ping = () => {
+        try {
+          port?.postMessage({ type: "babata.sidepanel_ping", ts: Date.now() });
+        } catch {
+          /* disconnected */
+        }
+      };
+      port.onDisconnect.addListener(() => {
+        port = null;
+        clearPing();
+        if (!stopped && reconnectTimer === null) {
+          reconnectTimer = window.setTimeout(() => {
+            reconnectTimer = null;
+            connectPort();
+          }, 1500);
+        }
+      });
+      ping();
+      pingTimer = window.setInterval(ping, 20_000);
+    };
+
+    connectPort();
+    return () => {
+      stopped = true;
+      clearPing();
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      try {
+        port?.disconnect();
+      } catch {
+        /* already disconnected */
+      }
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;

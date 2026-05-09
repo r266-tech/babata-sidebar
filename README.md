@@ -12,12 +12,20 @@ V 在立项 session 中沉积的三句陈述, 是整个 sidebar 的北极星:
 
 ## 当前阶段
 
-✅ **调研 + design 完成**, 等 V 审完拍板"干"进入 V0 实施.
+✅ **V0 已 ship**: 浏览器扩展源码在本 repo, server 端在 `~/code/babata/sidebar_*.py`.
+
+当前 live subset:
+- chat sidebar / page popup iframe / 文件与图片上传
+- sidepanel Port sentinel + offscreen WebSocket bridge + SW action dispatcher
+- 整页翻译 content script (sibling 注入, bilingual / replace / off)
+- proactive trigger / suggestion chips / tab-targeted mascot bubble
+- page_snapshot / page_click_ref 可见页面地图 (ref / selector / is_new diff)
+- bookmarks / tabs / history raw browser tools
 
 ```
-research/    6 份深度调研 (Anthropic 反编译 / 沉浸式 / MV3 / a11y tree / 翻译注入 / site profiles)
+research/    7 份深度调研 (Anthropic 反编译 / 沉浸式 / MV3 / a11y tree / 翻译注入 / site profiles / chat extensions)
 design/      4 份设计文档 (architecture / decisions 22 项 / roadmap V0/V1/V2 / risks 10 项)
-src/         扩展源码 (V0 实施时落)
+src/         扩展源码 (Preact + Vite + Tailwind + MV3)
 ```
 
 ## 参考来源
@@ -31,7 +39,7 @@ src/         扩展源码 (V0 实施时落)
 ## 项目结构
 
 ```
-research/    调研材料 — 6 份, code-grounded
+research/    调研材料 — 7 份, code-grounded
 design/      架构与决策文档 — 4 份
 src/         扩展源码 (V0 实施)
 ```
@@ -47,11 +55,16 @@ V 决:
 
 完整 22 项见 [design/decisions.md](design/decisions.md).
 
-## V0 起跑点
+## 本地运行
 
-V 拍板"干"后:
-- `~/code/babata-sidebar/` 写 TS 扩展 (Preact + Vite + Tailwind, chrome.debugger CDP, Shadow DOM visual indicator)
-- `~/code/babata` 加三件套: `sidebar_bot.py` / `sidebar_mcp.py` / `sidebar_bridge.py`, `cc.py` 加 channel #3
-- launchd `com.babata.sidebar-bot` 自启 + `auto-update.sh` 接入
+```bash
+npm install
+npm run typecheck
+npm run build
+```
 
-V0 验收: V 用 babata sidebar ≥ 5 天后主动卸载 openclaw-sidebar + 网页翻译场景下不切回沉浸式.
+Edge/Chrome 开发者模式加载 `dist/`. server 端由 babata main repo 的
+`sidebar_bot.py` 提供 `http://127.0.0.1:18791` + `/ws`.
+
+V0/V1 仍待补齐的核心能力: full a11y tree content script, trusted CDP click/type/screenshot,
+per-window session, 统一 tool registry.

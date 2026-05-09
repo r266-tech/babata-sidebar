@@ -89,10 +89,10 @@
 - 理由: 大规模翻译 Shadow DOM 撞 [Firefox bug 1841656](https://bugzilla.mozilla.org/show_bug.cgi?id=1841656); `<font>` 标签语义已弃用不撞站点 CSS; ⌘A 复制能拿到译文; 用户可关 (toggle `.bbt-off` class)
 - source: research/02 finding 1 + research/05 finding 1
 
-### D14 — 翻译 backend 全走 babata server SSE (one CPU 铁律)
+### D14 — 翻译 backend 全走 babata server HTTP (one CPU 铁律)
 - 备选: 直调 OpenRouter / Anthropic / OpenAI (快 / 便宜)
-- 选: **POST babata server `/sidebar/translate` SSE**
-- 理由: One CPU 铁律不破. 沉浸式 30+ provider 是 product mode, babata 单 V 用不需要
+- 选: **POST babata server `/translate` JSON batch**
+- 理由: One CPU 铁律不破. 沉浸式 30+ provider 是 product mode, babata 单 V 用不需要. 当前 server 直调 OpenRouter Anthropic-compatible HTTP, 消除 CLI cold start.
 
 ### D15 — 选区翻译 = Shadow DOM 浮层
 - 选: **`attachShadow({mode:"closed"})` + `:host{all:initial}`**

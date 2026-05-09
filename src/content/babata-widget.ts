@@ -10,9 +10,10 @@
 //   设置按钮 (翻译三档位)
 //   bubble (server 推 mascot_speak 时浮起来, 30s auto-dismiss, V 点 X 关掉)
 
-type TranslationMode = "off" | "auto" | "bilingual";
+type TranslationMode = "off" | "bilingual" | "replace";
 
 const HOST_ID = "__babata_widget_host__";
+const TEARDOWN_EVENT = "babata:widget-teardown";
 const STORAGE_POS = "babata.widget.pos";
 const STORAGE_MODE = "babata.translation_mode";
 const DEFAULT_MODE: TranslationMode = "bilingual";
@@ -22,32 +23,72 @@ interface WidgetPos {
   top: number;
 }
 
+type ChatPopupElement = HTMLDivElement & { cleanup?: () => void };
+
 const DEFAULT_POS: WidgetPos = { right: 18, top: 0.5 }; // top 比例 (0-1)
 
 let widgetState: {
   shadow: ShadowRoot;
   root: HTMLDivElement;
+  bubbleSlot: HTMLDivElement;
   bubble: HTMLDivElement | null;
   bubbleHideTimer: number | null;
   mode: TranslationMode;
   pos: WidgetPos;
 } | null = null;
+let cleanupCurrentWidget: (() => void) | null = null;
+let extInvalidated = false;
+
+function isInvalidatedError(e: unknown): boolean {
+  return /Extension context invalidated/.test((e as Error)?.message ?? String(e));
+}
+
+function handleInvalidatedContext() {
+  extInvalidated = true;
+  cleanupCurrentWidget?.();
+}
+
+function safeChromePromise<T>(fn: () => Promise<T>): Promise<T | undefined> {
+  if (extInvalidated) return Promise.resolve(undefined);
+  try {
+    return fn().catch((e) => {
+      if (isInvalidatedError(e)) handleInvalidatedContext();
+      return undefined;
+    });
+  } catch (e) {
+    if (isInvalidatedError(e)) handleInvalidatedContext();
+    return Promise.resolve(undefined);
+  }
+}
+
+function safeChromeCall<T>(fn: () => T): T | undefined {
+  if (extInvalidated) return undefined;
+  try {
+    return fn();
+  } catch (e) {
+    if (isInvalidatedError(e)) handleInvalidatedContext();
+    return undefined;
+  }
+}
 
 function applyPos(root: HTMLElement, pos: WidgetPos) {
   root.style.right = `${pos.right}px`;
   root.style.top = `${pos.top * window.innerHeight}px`;
 }
 
+function normalizeMode(v: unknown): TranslationMode {
+  if (v === "off") return "off";
+  if (v === "auto" || v === "replace") return "replace";
+  return "bilingual";
+}
+
 async function loadPersisted(): Promise<{ mode: TranslationMode; pos: WidgetPos }> {
-  try {
-    const got = await chrome.storage.local.get([STORAGE_MODE, STORAGE_POS]);
-    return {
-      mode: (got[STORAGE_MODE] as TranslationMode) || DEFAULT_MODE,
-      pos: (got[STORAGE_POS] as WidgetPos) || DEFAULT_POS,
-    };
-  } catch {
-    return { mode: DEFAULT_MODE, pos: DEFAULT_POS };
-  }
+  const got = await safeChromePromise(() => chrome.storage.local.get([STORAGE_MODE, STORAGE_POS]));
+  if (!got) return { mode: DEFAULT_MODE, pos: DEFAULT_POS };
+  return {
+    mode: normalizeMode(got[STORAGE_MODE]),
+    pos: (got[STORAGE_POS] as WidgetPos) || DEFAULT_POS,
+  };
 }
 
 function svg(d: string, opts: { size?: number; stroke?: number } = {}): SVGSVGElement {
@@ -69,11 +110,12 @@ function svg(d: string, opts: { size?: number; stroke?: number } = {}): SVGSVGEl
 }
 
 function createWidget() {
-  if (document.getElementById(HOST_ID)) return;
-  if (!document.documentElement) return;
-
   // 当前 frame 是顶 frame 才注入 (避免 iframe 内重复 widget).
   if (window.top !== window.self) return;
+  if (!document.documentElement) return;
+
+  document.dispatchEvent(new CustomEvent(TEARDOWN_EVENT));
+  document.getElementById(HOST_ID)?.remove();
 
   const host = document.createElement("div");
   host.id = HOST_ID;
@@ -267,6 +309,42 @@ function createWidget() {
   const root = document.createElement("div");
   root.className = "widget";
   shadow.appendChild(root);
+  const cleanupFns: Array<() => void> = [];
+  let chatPopup: ChatPopupElement | null = null;
+  let popover: HTMLDivElement | null = null;
+  let cleanedUp = false;
+
+  const cleanupWidget = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    if (chatPopup) {
+      chatPopup.cleanup?.();
+      chatPopup.remove();
+      chatPopup = null;
+    }
+    if (popover) {
+      popover.remove();
+      popover = null;
+    }
+    const bubbleTimer = widgetState?.bubbleHideTimer;
+    if (bubbleTimer !== null && bubbleTimer !== undefined) {
+      clearTimeout(bubbleTimer);
+    }
+    for (const fn of cleanupFns.splice(0)) {
+      try {
+        fn();
+      } catch {
+        /* ignore cleanup failure */
+      }
+    }
+    host.remove();
+    if (cleanupCurrentWidget === cleanupWidget) cleanupCurrentWidget = null;
+    widgetState = null;
+  };
+  cleanupCurrentWidget = cleanupWidget;
+  const onTeardown = () => cleanupWidget();
+  document.addEventListener(TEARDOWN_EVENT, onTeardown);
+  cleanupFns.push(() => document.removeEventListener(TEARDOWN_EVENT, onTeardown));
 
   // 隐藏 X — 在 widget 左上, hover 显示, 点击隐藏整个 widget (刷新页面恢复).
   const closeWidgetBtn = document.createElement("button");
@@ -275,21 +353,9 @@ function createWidget() {
   closeWidgetBtn.appendChild(svg("M3 3l8 8 M11 3l-8 8", { size: 9, stroke: 1.6 }));
   closeWidgetBtn.addEventListener("click", (e) => {
     e.stopPropagation();
-    host.remove();
-    widgetState = null;
+    cleanupWidget();
   });
   root.appendChild(closeWidgetBtn);
-
-  // 初始化 state — 先用 default, async load 后 apply.
-  widgetState = {
-    shadow,
-    root,
-    bubble: null,
-    bubbleHideTimer: null,
-    mode: DEFAULT_MODE,
-    pos: DEFAULT_POS,
-  };
-  applyPos(root, DEFAULT_POS);
 
   // bubble 容器 (上方)
   const bubbleSlot = document.createElement("div");
@@ -300,6 +366,43 @@ function createWidget() {
   const btnStack = document.createElement("div");
   btnStack.className = "stack";
   root.appendChild(btnStack);
+
+  // 初始化 state — 先用 default, async load 后 apply.
+  widgetState = {
+    shadow,
+    root,
+    bubbleSlot,
+    bubble: null,
+    bubbleHideTimer: null,
+    mode: DEFAULT_MODE,
+    pos: DEFAULT_POS,
+  };
+  applyPos(root, DEFAULT_POS);
+
+  const onRuntimeMessage = (
+    msg: unknown,
+    _sender: chrome.runtime.MessageSender,
+    sendResponse: (response?: unknown) => void,
+  ) => {
+    if (!msg || typeof msg !== "object") return false;
+    const m = msg as { type?: string; action?: string; args?: Record<string, unknown> };
+    if (m.type === "babata.notification" && m.action === "mascot_speak") {
+      const text = (m.args?.text as string | undefined) ?? "";
+      if (text) showBubble(text);
+      sendResponse?.({ ok: true });
+      return false;
+    }
+    if (m.type === "babata.translation_mode") {
+      // SW 询问当前 mode (proactive 触发时塞 payload).
+      sendResponse?.({ mode: widgetState?.mode ?? DEFAULT_MODE });
+      return false;
+    }
+    return false;
+  };
+  safeChromeCall(() => chrome.runtime.onMessage.addListener(onRuntimeMessage));
+  cleanupFns.push(() => {
+    safeChromeCall(() => chrome.runtime.onMessage.removeListener(onRuntimeMessage));
+  });
 
   // 主按钮 — 点击 toggle sidebar, drag 移动.
   const mainBtn = document.createElement("button");
@@ -356,10 +459,10 @@ function createWidget() {
   btnStack.appendChild(settingsBtn);
 
   // chat popup state — 同时只一个 popup, toggle 开关.
-  let chatPopup: HTMLDivElement | null = null;
   chatBtn.addEventListener("click", (e) => {
     e.stopPropagation();
     if (chatPopup) {
+      chatPopup.cleanup?.();
       chatPopup.remove();
       chatPopup = null;
       root.classList.remove("chat-open");
@@ -367,6 +470,7 @@ function createWidget() {
     }
     chatPopup = renderChatPopup(() => {
       if (chatPopup) {
+        chatPopup.cleanup?.();
         chatPopup.remove();
         chatPopup = null;
       }
@@ -397,7 +501,7 @@ function createWidget() {
     e.preventDefault();
   });
 
-  document.addEventListener("mousemove", (e) => {
+  const onDragMove = (e: MouseEvent) => {
     if (!dragOrigin || !widgetState) return;
     const dx = e.clientX - dragOrigin.x;
     const dy = e.clientY - dragOrigin.y;
@@ -407,16 +511,21 @@ function createWidget() {
     const top = Math.max(8, Math.min(window.innerHeight - 60, dragOrigin.startTop + dy));
     widgetState.pos = { right, top: top / window.innerHeight };
     applyPos(widgetState.root, widgetState.pos);
-  });
+  };
+  document.addEventListener("mousemove", onDragMove);
+  cleanupFns.push(() => document.removeEventListener("mousemove", onDragMove));
 
-  document.addEventListener("mouseup", () => {
+  const onDragEnd = () => {
     if (!dragOrigin) return;
     mainBtn.classList.remove("dragging");
     if (dragged && widgetState) {
-      void chrome.storage.local.set({ [STORAGE_POS]: widgetState.pos });
+      const { pos } = widgetState;
+      void safeChromePromise(() => chrome.storage.local.set({ [STORAGE_POS]: pos }));
     }
     dragOrigin = null;
-  });
+  };
+  document.addEventListener("mouseup", onDragEnd);
+  cleanupFns.push(() => document.removeEventListener("mouseup", onDragEnd));
 
   mainBtn.addEventListener("click", (e) => {
     if (dragged) {
@@ -425,11 +534,10 @@ function createWidget() {
       e.stopPropagation();
       return;
     }
-    void chrome.runtime.sendMessage({ type: "babata.toggle_sidebar" });
+    void safeChromePromise(() => chrome.runtime.sendMessage({ type: "babata.toggle_sidebar" }));
   });
 
   // settings popover toggle
-  let popover: HTMLDivElement | null = null;
   const closePopover = () => {
     if (!popover) return;
     popover.remove();
@@ -448,7 +556,7 @@ function createWidget() {
     root.classList.add("expanded");
   });
 
-  document.addEventListener("click", (e) => {
+  const onDocumentClick = (e: MouseEvent) => {
     if (!popover) return;
     // closed shadow root 的 composedPath 不暴露内部 nodes — 之前 path.includes(popover)
     // 永远 false, 导致 V 点 popover 内 radio 时 popover 被误关 (radio 切换看似失败).
@@ -456,7 +564,9 @@ function createWidget() {
     const path = e.composedPath();
     if (path.includes(host)) return;
     closePopover();
-  });
+  };
+  document.addEventListener("click", onDocumentClick);
+  cleanupFns.push(() => document.removeEventListener("click", onDocumentClick));
 
   // ── async load ─────────────────────────────────────────────────────
   void (async () => {
@@ -468,8 +578,8 @@ function createWidget() {
   })();
 }
 
-function renderChatPopup(onClose: () => void): HTMLDivElement {
-  const pop = document.createElement("div");
+function renderChatPopup(onClose: () => void): ChatPopupElement {
+  const pop = document.createElement("div") as ChatPopupElement;
   pop.className = "chat-popup";
   const rightOffset = 70;
   const bottomOffset = 24;
@@ -528,7 +638,8 @@ function renderChatPopup(onClose: () => void): HTMLDivElement {
   pop.appendChild(header);
 
   const iframe = document.createElement("iframe");
-  iframe.src = chrome.runtime.getURL("src/sidepanel.html");
+  const sidepanelUrl = safeChromeCall(() => chrome.runtime.getURL("src/sidepanel.html"));
+  if (sidepanelUrl) iframe.src = sidepanelUrl;
   iframe.title = "babata sidepanel";
   iframe.allow = "clipboard-read; clipboard-write";
   pop.appendChild(iframe);
@@ -546,17 +657,23 @@ function renderChatPopup(onClose: () => void): HTMLDivElement {
     header.classList.add("grabbing");
     e.preventDefault();
   });
-  document.addEventListener("mousemove", (e) => {
+  const onPopupDragMove = (e: MouseEvent) => {
     if (!drag) return;
     const right = Math.max(8, drag.right - (e.clientX - drag.x));
     const bottom = Math.max(8, drag.bottom - (e.clientY - drag.y));
     pop.style.right = `${right}px`;
     pop.style.bottom = `${bottom}px`;
-  });
-  document.addEventListener("mouseup", () => {
+  };
+  const onPopupDragEnd = () => {
     if (drag) header.classList.remove("grabbing");
     drag = null;
-  });
+  };
+  document.addEventListener("mousemove", onPopupDragMove);
+  document.addEventListener("mouseup", onPopupDragEnd);
+  pop.cleanup = () => {
+    document.removeEventListener("mousemove", onPopupDragMove);
+    document.removeEventListener("mouseup", onPopupDragEnd);
+  };
 
   return pop;
 }
@@ -572,9 +689,9 @@ function renderPopover(): HTMLDivElement {
   pop.appendChild(desc);
 
   const opts: { value: TranslationMode; label: string; desc: string }[] = [
-    { value: "off", label: "不翻译", desc: "你主动让 babata 翻才翻" },
-    { value: "auto", label: "自动翻译 (替换)", desc: "外语页 → 译文替换原文" },
-    { value: "bilingual", label: "双语 (默认)", desc: "原文 + 译文同时显示, 沉浸式" },
+    { value: "off", label: "不翻译", desc: "隐藏译文, 只看原文" },
+    { value: "bilingual", label: "双语", desc: "原文 + 译文同时显示" },
+    { value: "replace", label: "替换", desc: "隐藏原文, 只看译文 (CSS 切换不重翻)" },
   ];
 
   for (const o of opts) {
@@ -587,7 +704,7 @@ function renderPopover(): HTMLDivElement {
     radio.addEventListener("change", () => {
       if (!widgetState) return;
       widgetState.mode = o.value;
-      void chrome.storage.local.set({ [STORAGE_MODE]: o.value });
+      void safeChromePromise(() => chrome.storage.local.set({ [STORAGE_MODE]: o.value }));
     });
     lab.appendChild(radio);
     const labelBlock = document.createElement("div");
@@ -637,11 +754,10 @@ function showBubble(text: string, durationMs = 30_000) {
 
   // 点 bubble 本体 = 打开 sidebar.
   b.addEventListener("click", () => {
-    void chrome.runtime.sendMessage({ type: "babata.toggle_sidebar" });
+    void safeChromePromise(() => chrome.runtime.sendMessage({ type: "babata.toggle_sidebar" }));
   });
 
-  const slot = widgetState.root.firstElementChild as HTMLElement | null;
-  if (slot) slot.appendChild(b);
+  widgetState.bubbleSlot.appendChild(b);
   widgetState.bubble = b;
   widgetState.bubbleHideTimer = window.setTimeout(() => {
     if (widgetState?.bubble) {
@@ -650,25 +766,6 @@ function showBubble(text: string, durationMs = 30_000) {
     }
   }, durationMs);
 }
-
-// ── messages from SW ────────────────────────────────────────────────
-
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (!msg || typeof msg !== "object") return;
-  const m = msg as { type?: string; action?: string; args?: Record<string, unknown> };
-  if (m.type === "babata.notification" && m.action === "mascot_speak") {
-    const text = (m.args?.text as string | undefined) ?? "";
-    if (text) showBubble(text);
-    sendResponse?.({ ok: true });
-    return false;
-  }
-  if (m.type === "babata.translation_mode") {
-    // SW 询问当前 mode (proactive 触发时塞 payload).
-    sendResponse?.({ mode: widgetState?.mode ?? DEFAULT_MODE });
-    return false;
-  }
-  return false;
-});
 
 // ── boot ─────────────────────────────────────────────────────────────
 

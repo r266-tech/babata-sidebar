@@ -15,21 +15,40 @@ import DOMPurify from "dompurify";
 // 安全: 译文来自 LLM (untrusted), 走 DOMPurify 白名单 (inline format only).
 
 const HASH_ATTR = "data-bbt-hash";
+const LEAF_ATTR = "data-bbt-leaf";
 const TR_CLASS = "bbt-tr";
-const TR_STYLE =
-  "display:block;color:#5b5b5b;font-size:.95em;line-height:1.5;margin-top:3px;border-left:2px solid #d8d2c5;padding-left:8px;";
+const TEARDOWN_EVENT = "babata:translate-teardown";
+// inline-leaf (X span/a/strong) 跟 block-leaf (P/DIV/blockquote) 的 sibling 译文
+// 视觉应跟 leaf 一致 — block-leaf 后 block 占行, inline-leaf 后 inline 流畅. 用 marker
+// class 区分, 让 CSS rule (mode-aware) 控制装饰. inline TR_STYLE 的 border-left+block
+// 装饰在 replace 模式下 = 噪声 (V 实测 X 推文每段加左 border 大字号堆叠 broken).
+const TR_INLINE_CLASS = "bbt-tr-inline";
+const TR_BLOCK_CLASS = "bbt-tr-block";
+const TR_NATIVE_CLASS = "bbt-tr-native";
+const TR_INPLACE_CLASS = "bbt-tr-inplace";
+const SRC_CLASS = "bbt-src";
+const INPLACE_ATTR = "data-bbt-inplace";
 
 const SAFE_HTML_OPTS = {
   ALLOWED_TAGS: ["b", "i", "em", "strong", "a", "code", "br", "span", "mark"],
   ALLOWED_ATTR: ["href", "title", "class"],
 };
 
-type Mode = "off" | "auto" | "bilingual";
+// LLM 翻一次, 永远 sibling .bbt-tr 注入. "替换/双语/不翻" 纯 CSS 切换 0 LLM (V 设计).
+// 老 "auto" innerHTML 替换跟 React reconcile fundamentally 抢 DOM (X 实测同 leaf SPAN
+// 10s 被外部 reconcile 9 次), 5 源 (沉浸式 v1.28.5/read-frog/kiss/fluentread/old-immersive)
+// 全选 sibling 注入, 没人替换原文. 替换观感由 CSS hide leaf 元素实现, DOM 不抢.
+type Mode = "off" | "bilingual" | "replace";
 
 let mode: Mode = "bilingual";
 const cache = new Map<string, string>();
-const queue = new Map<string, HTMLElement>();
+interface QueueItem {
+  el: HTMLElement;
+  text: string;
+}
+const queue = new Map<string, QueueItem>();
 let flushTimer: number | null = null;
+let flushInProgress = false;
 
 const TARGET_LANG = "zh";
 // 24/batch sonnet 一次接 ~5KB prompt 不慢, 减少 V 视口内段先后翻顺序差
@@ -95,11 +114,17 @@ function scheduleViewportPush() {
 }
 
 function setupAttentionWatchers() {
-  document.addEventListener("visibilitychange", () => {
+  const onVisibilityChange = () => {
     pushAttention({ kind: "attention", visibility: document.visibilityState });
-  });
-  window.addEventListener("focus", () => pushAttention({ kind: "attention", focus: "yes" }));
-  window.addEventListener("blur", () => pushAttention({ kind: "attention", focus: "no" }));
+  };
+  const onFocus = () => pushAttention({ kind: "attention", focus: "yes" });
+  const onBlur = () => pushAttention({ kind: "attention", focus: "no" });
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  window.addEventListener("focus", onFocus);
+  window.addEventListener("blur", onBlur);
+  registerCleanup(() => document.removeEventListener("visibilitychange", onVisibilityChange));
+  registerCleanup(() => window.removeEventListener("focus", onFocus));
+  registerCleanup(() => window.removeEventListener("blur", onBlur));
 
   const onInteract = () => {
     lastInteractAt = Date.now();
@@ -117,9 +142,10 @@ function setupAttentionWatchers() {
       });
     }, IDLE_THRESHOLD_MS);
   };
-  ["mousemove", "keydown", "scroll", "click", "touchstart"].forEach((ev) =>
-    document.addEventListener(ev, onInteract, { passive: true }),
-  );
+  ["mousemove", "keydown", "scroll", "click", "touchstart"].forEach((ev) => {
+    document.addEventListener(ev, onInteract, { passive: true });
+    registerCleanup(() => document.removeEventListener(ev, onInteract));
+  });
   onInteract();
 }
 
@@ -152,8 +178,11 @@ const EXCLUDE_SELECTOR = [
   `.${TR_CLASS}`,
 ].join(", ");
 
-// claimed = 已被 walker ACCEPT 的 leaf, 子树整个 skip 防重复. WeakSet 不 leak DOM ref.
-const claimed = new WeakSet<HTMLElement>();
+// leaf 物理 mark — 写 DOM attr (data-bbt-leaf). page 删该元素 attr 跟随消失, 不像
+// WeakSet 永久 lock. 5 源 (kiss/read-frog/fluentread/old-immersive/沉浸式) 全选物理
+// 探测, 没人用逻辑 lock. babata 老的 claimed: WeakSet 是反模式 — 已 leaf 的子树新加
+// 节点 (展开更多场景) 走 collectTranslatable 被 hasClaimedAncestor 挡死, 漏翻;
+// 另已 inject 被外力清 .bbt-tr 后, claimed 仍 lock 永远不能 reinject.
 const multiCache = new WeakMap<HTMLElement, boolean>();
 // inline 判断缓存 — getComputedStyle 同步 reflow, 同元素重复调贵.
 const inlineCache = new WeakMap<HTMLElement, boolean>();
@@ -173,12 +202,14 @@ const INJECT_DEBOUNCE_MS = 1500;
 const STABLE_WINDOW_MS = 1100;
 const stableWindowMap = new Map<HTMLElement, { ts: number; src: TraceSource }>();
 let stableWindowTimer: number | null = null;
-// 抄沉浸式 `a Set` (content_main_beauty.js:45373) — element in-flight 锁. 当 el 已 enqueue
-// 在 server LLM 调用中, 新 mutation 不重 enqueue (queue Map 是 hash-keyed, hash 变会重复
-// 进 queue 触发 server 多次调). flush results 完成后清, 允许下次 mutation 触发新翻.
+// element in-flight 锁 — 同 element 已 enqueue 在 LLM 中, 新 mutation 不重 enqueue.
 const inFlightElements = new WeakSet<HTMLElement>();
-// X 干掉 .bbt-tr 但 source 仍在 DOM (主推漏翻 case): 200ms trailing 后再 inject.
-const REINJECT_DELAY_MS = 200;
+// hash in-flight 锁 — 跨 element instance 同 text. X swap SPAN 时新 instance 不在
+// inFlightElements (WeakSet 是 element 级), 重新走 doProcessCandidate, cache 还没 set
+// (flush async 在 server roundtrip 中), 又 enqueue 触发并发 flush. 两次 server 调用同
+// text 返不同 LLM 译文, cache.set 覆盖. V 实测 hash 535d6390 4 次 add 不同译文铁证.
+// hash 锁让同 text 跨 instance 串行: 第一次 enqueue 锁, flush 完返结果再解锁.
+const inFlightHashes = new Set<string>();
 
 // ── client trace instrumentation (V "开发要收集数据方便调试") ─
 // 每次 processCandidate 在每个 decision 点记一条 trace. batch flush 经 SW POST
@@ -186,13 +217,14 @@ const REINJECT_DELAY_MS = 200;
 // 每个 decision 不再 hypothesize 闪烁/漏翻 root cause.
 type TraceSource = "io" | "mo_add" | "mo_char" | "rerun" | "init";
 type TraceDecision = "throttle" | "not_translatable" | "already" | "debounce"
-  | "cache_inject" | "enqueue" | "reinject_timer" | "skip_no_text";
+  | "cache_inject" | "enqueue" | "in_flight_defer" | "stable_pending"
+  | "stale_result" | "skip_no_text";
 interface TraceRecord {
   ts: number;
   src: TraceSource;
   dec: TraceDecision;
   hash: string;
-  txt: string;
+  text_len: number;
   el: string;
 }
 const traces: TraceRecord[] = [];
@@ -216,10 +248,11 @@ function trace(
   dec: TraceDecision,
   text?: string,
 ) {
+  const source = text ?? sourceText(el);
   traces.push({
     ts: Date.now(),
     src, dec, hash,
-    txt: (text ?? el.innerText ?? el.textContent ?? "").trim().slice(0, 40),
+    text_len: source.trim().length,
     el: pathOf(el),
   });
   if (traces.length >= TRACE_BATCH_MAX) {
@@ -249,6 +282,12 @@ function flushTraces() {
 // periodic cleanup 防 Map leak (long timeline 累积). cleanupTimer 留 handle 给 lifecycle.
 let cleanupTimer: number | null = null;
 let mo: MutationObserver | null = null;
+const cleanupFns: Array<() => void> = [];
+
+function registerCleanup(fn: () => void) {
+  cleanupFns.push(fn);
+}
+
 function startCleanupTimer() {
   if (cleanupTimer !== null) return;
   cleanupTimer = window.setInterval(() => {
@@ -279,6 +318,8 @@ function startStableWindowTimer() {
   }, 200);
 }
 function teardownAll() {
+  const w = window as unknown as { __babataTranslateBooted?: boolean };
+  w.__babataTranslateBooted = false;
   if (cleanupTimer !== null) {
     clearInterval(cleanupTimer);
     cleanupTimer = null;
@@ -291,11 +332,42 @@ function teardownAll() {
     mo.disconnect();
     mo = null;
   }
+  if (io !== null) {
+    io.disconnect();
+    io = null;
+  }
+  if (viewportPushTimer !== null) {
+    clearTimeout(viewportPushTimer);
+    viewportPushTimer = null;
+  }
+  if (idleTimer !== null) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  queue.clear();
+  stableWindowMap.clear();
+  inFlightHashes.clear();
+  visibleHashes.clear();
+  for (const fn of cleanupFns.splice(0)) {
+    try {
+      fn();
+    } catch {
+      /* ignore cleanup failure */
+    }
+  }
   flushTraces();  // 刷尾巴 trace 不丢 (extension reload / pagehide).
   if (traceTimer !== null) {
     clearTimeout(traceTimer);
     traceTimer = null;
   }
+}
+
+function broadcastTeardown() {
+  document.dispatchEvent(new CustomEvent(TEARDOWN_EVENT));
 }
 
 // CSS display 是 inline-like (read-frog isInlineDisplay filter.ts:41-63).
@@ -341,13 +413,66 @@ function isHidden(el: HTMLElement): boolean {
   return cached;
 }
 
-function hasClaimedAncestor(el: HTMLElement): boolean {
-  let p = el.parentElement;
-  while (p) {
-    if (claimed.has(p)) return true;
-    p = p.parentElement;
+// el 的 *祖先* (不含 self) 已被标 leaf — 该 ancestor 已整段翻, 不该再切子树重复翻.
+// 用 closest 物理 DOM 遍历, 不用内存 WeakSet. el 被 page 删, 探测自动失效.
+function hasLeafAncestor(el: HTMLElement): boolean {
+  return !!el.parentElement?.closest(`[${LEAF_ATTR}]`);
+}
+
+function isTranslationElement(el: HTMLElement): boolean {
+  return el.classList.contains(TR_CLASS);
+}
+
+function hasTranslationChild(el: HTMLElement): boolean {
+  for (const child of Array.from(el.children)) {
+    if (!(child instanceof HTMLElement)) continue;
+    if (isTranslationElement(child) || child.querySelector(`.${TR_CLASS}`)) {
+      return true;
+    }
   }
   return false;
+}
+
+// Read only the page's source text, never our injected sibling/wrapper text.
+// This is the idempotency boundary: hash, language detection, trace text, and
+// outbound LLM payload must all agree on the same source-only string.
+function sourceText(el: HTMLElement): string {
+  const parts: string[] = [];
+
+  function pushBlockBreak() {
+    if (parts.length === 0) return;
+    const last = parts[parts.length - 1];
+    if (!last.endsWith("\n")) parts.push("\n");
+  }
+
+  function walk(node: Node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parts.push(node.textContent || "");
+      return;
+    }
+    if (!(node instanceof HTMLElement)) return;
+    if (isTranslationElement(node)) return;
+    if (node.tagName === "BR") {
+      parts.push("\n");
+      return;
+    }
+
+    const block = node !== el && FORCE_BLOCK_TAGS.has(node.tagName);
+    if (block) pushBlockBreak();
+    for (const child of Array.from(node.childNodes)) {
+      walk(child);
+    }
+    if (block) pushBlockBreak();
+  }
+
+  for (const child of Array.from(el.childNodes)) {
+    walk(child);
+  }
+  return parts.join("")
+    .replace(/[ \t\f\v\r]+/g, " ")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function isLeafTextElement(el: HTMLElement): boolean {
@@ -357,12 +482,16 @@ function isLeafTextElement(el: HTMLElement): boolean {
     if (child.nodeType === Node.TEXT_NODE) {
       if ((child.textContent || "").trim()) hasMeaningfulText = true;
     } else if (child.nodeType === Node.ELEMENT_NODE) {
-      if (!isInlineElement(child as HTMLElement)) return false;
-      if ((child.textContent || "").trim()) hasMeaningfulText = true;
+      const childEl = child as HTMLElement;
+      if (isTranslationElement(childEl) || childEl.querySelector(`.${TR_CLASS}`)) {
+        return false;
+      }
+      if (!isInlineElement(childEl)) return false;
+      if ((childEl.textContent || "").trim()) hasMeaningfulText = true;
     }
   }
   if (!hasMeaningfulText) return false;
-  const text = (el.innerText || el.textContent || "").trim();
+  const text = sourceText(el);
   return shouldTranslate(text);
 }
 
@@ -380,7 +509,9 @@ function computeMultiSegmentInline(el: HTMLElement): boolean {
       }
       lastWasInlineElement = false;
     } else if (c.nodeType === Node.ELEMENT_NODE) {
-      if (!isInlineElement(c as HTMLElement)) return false;
+      const childEl = c as HTMLElement;
+      if (isTranslationElement(childEl) || childEl.querySelector(`.${TR_CLASS}`)) return false;
+      if (!isInlineElement(childEl)) return false;
       inlineCount++;
       lastWasInlineElement = true;
     }
@@ -399,21 +530,30 @@ function isMultiSegmentInline(el: HTMLElement): boolean {
 
 function collectTranslatable(root: ParentNode): HTMLElement[] {
   const result: HTMLElement[] = [];
-  const rootEl = root instanceof Element ? root : document.body;
+  const rootEl = root instanceof HTMLElement ? root : document.body;
 
   function visit(el: HTMLElement) {
     if (el.matches(EXCLUDE_SELECTOR)) return;
-    if (hasClaimedAncestor(el)) return;
+    // 祖先已 leaf (整段已包翻) → 子树不切. 物理 closest 遍历, 不依赖内存 lock.
+    if (hasLeafAncestor(el)) return;
     if (isHidden(el)) return;
 
     const isInline = isInlineElement(el);
+    const containsTranslation = hasTranslationChild(el);
 
     if (isInline) {
       // INLINE 标签自身仅在 leaf 时 ACCEPT (X 推 span / X article sibling 内容).
       // 子树不深入 (inline 内含 nested block 罕见, 接受 trade-off).
-      if (isLeafTextElement(el)) {
-        claimed.add(el);
+      if (!containsTranslation && isLeafTextElement(el)) {
+        el.setAttribute(LEAF_ATTR, "1");
         result.push(el);
+      }
+      // 如果 inline parent 已含 babata 译文，不能把 parent 的原文+译文当
+      // 一个新 leaf；下钻回原 source child，避免 X 上译文污染 hash。
+      if (containsTranslation) {
+        for (const child of Array.from(el.children)) {
+          if (child instanceof HTMLElement) visit(child);
+        }
       }
       return;
     }
@@ -429,7 +569,7 @@ function collectTranslatable(root: ParentNode): HTMLElement[] {
 
     // block 是单段 leaf → 整段一坨翻.
     if (isLeafTextElement(el)) {
-      claimed.add(el);
+      el.setAttribute(LEAF_ATTR, "1");
       result.push(el);
       return;
     }
@@ -462,10 +602,31 @@ function detectLang(text: string): "zh" | "other" {
 function shouldTranslate(text: string): boolean {
   if (!text || text.length < 4) return false;
   if (text.length > 4000) return false;
+  // 输入框 placeholder / 示例文案常以 e.g. 开头。它们通常不是 DOM 正文文本,
+  // 被页面用 overlay 渲染时强行注入会和原 placeholder 叠字；后续应走 attr 专用链.
+  if (/^e\.g[.,]?\s+/i.test(text.trim())) return false;
+  // X 上计数/倒计时会秒级 mutation；这些不是自然语言，翻译只会制造 stale_result
+  // 和重复网络请求。保留含字母的混合文案，跳纯数字/时间/单位/handle/tag。
+  if (/^[@#][\p{L}\p{N}_-]+$/u.test(text)) return false;
+  if (!/[\p{L}]/u.test(text)) return false;
+  if (/^[\d\s:.,，.%％+\-–—/()（）[\]万亿千百十kKmMbB]+$/u.test(text)) return false;
   return detectLang(text) !== "zh";
 }
 
 // ── hash (FNV-1a-ish 64bit, 16 hex chars) ─────────────────────────────
+
+// X 反复 swap SPAN 时 textContent 含微妙空白差异 (trailing space / zero-width
+// space / nbsp / 双空格) → 每次新 hash → cache miss → 反复调 server 翻不同译文 →
+// V 视觉"反复变". 实测 "Hello..." 5 种空白形式 → 5 完全不同 hash. normalize:
+//   ZWSP (U+200B-200F) / BOM (U+FEFF) / nbsp (U+00A0) → ASCII space
+//   多空白 → 单 space, 头尾 strip.
+// 同英文 text 不同空白形式同 hash, cache 100% 命中.
+function normalizeForHash(text: string): string {
+  return text
+    .replace(/[​-‏﻿ ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 function hashText(text: string, target: string): string {
   let h1 = 0x811c9dc5;
@@ -487,10 +648,194 @@ function hashText(text: string, target: string): string {
 // ── inject ────────────────────────────────────────────────────────────
 
 function clearTranslation(el: HTMLElement) {
+  el.querySelectorAll(`:scope > .${TR_INPLACE_CLASS}`).forEach((node) => node.remove());
   const next = el.nextElementSibling;
   if (next && next.classList.contains(TR_CLASS)) {
     next.remove();
   }
+}
+
+function clearAllTranslations() {
+  document.querySelectorAll(`.${TR_CLASS}`).forEach((node) => node.remove());
+}
+
+function shouldCopyNativeAttr(el: HTMLElement, name: string): boolean {
+  const lower = name.toLowerCase();
+  if (lower === "id" || lower.startsWith("data-bbt-")) return false;
+  if (lower.startsWith("on")) return false;
+  if (lower === "class" || lower === "style" || lower === "dir" || lower === "title") {
+    return true;
+  }
+  if (lower === "role" || lower === "tabindex") return true;
+  if (lower.startsWith("data-")) return true;
+  if ([
+    "aria-current",
+    "aria-selected",
+    "aria-disabled",
+    "aria-expanded",
+    "aria-pressed",
+    "aria-checked",
+  ].includes(lower)) {
+    return true;
+  }
+  if (el.tagName === "A") {
+    return ["href", "target", "rel", "download", "referrerpolicy"].includes(lower);
+  }
+  return false;
+}
+
+const UNSAFE_NATIVE_REPLACE_TAGS = new Set([
+  "AUDIO", "BR", "BUTTON", "CANVAS", "IFRAME", "IMG", "INPUT", "MATH",
+  "OPTION", "PICTURE", "SCRIPT", "SELECT", "SOURCE", "STYLE", "SVG",
+  "TEMPLATE", "TEXTAREA", "VIDEO", "WBR",
+]);
+
+const INPLACE_UI_CONTEXT_SELECTOR = [
+  "a[href]",
+  "button",
+  "nav",
+  "aside",
+  "header",
+  "footer",
+  "form",
+  '[role="button"]',
+  '[role="checkbox"]',
+  '[role="dialog"]',
+  '[role="link"]',
+  '[role="listbox"]',
+  '[role="menu"]',
+  '[role="menuitem"]',
+  '[role="navigation"]',
+  '[role="option"]',
+  '[role="switch"]',
+  '[role="tab"]',
+  '[role="tablist"]',
+].join(", ");
+
+const INPLACE_TEXT_TAGS = new Set([
+  "H1", "H2", "H3", "H4", "H5", "H6", "LABEL", "LEGEND", "SUMMARY", "DT", "DD", "TH", "TD",
+]);
+
+const PRESERVED_MEDIA_SELECTOR = [
+  "svg", "img", "canvas", "video", "audio", "picture", "input", "textarea", "select", "button",
+].join(", ");
+
+function directInplaceTranslation(el: HTMLElement): Element | null {
+  return el.querySelector(`:scope > .${TR_INPLACE_CLASS}`);
+}
+
+function hasInjectedTranslation(el: HTMLElement): boolean {
+  const next = el.nextElementSibling;
+  return !!directInplaceTranslation(el) || !!(next && next.classList.contains(TR_CLASS));
+}
+
+function hasLayoutDisplay(el: HTMLElement): boolean {
+  try {
+    const display = window.getComputedStyle(el).display;
+    return display.includes("flex") || display.includes("grid");
+  } catch {
+    return false;
+  }
+}
+
+function shouldRenderInPlace(el: HTMLElement, text: string): boolean {
+  if (mode !== "replace") return false;
+  if (text.length > 180) return false;
+  // 文章正文/推文仍走 sibling, 避免 React 高频 reconcile 抢子树.
+  if (el.closest("article, [role='article']")) return false;
+  if (INPLACE_TEXT_TAGS.has(el.tagName)) return true;
+  if (el.closest(INPLACE_UI_CONTEXT_SELECTOR)) return true;
+  if (text.length > 120) return false;
+  if (hasLayoutDisplay(el)) return true;
+  if (el.parentElement && hasLayoutDisplay(el.parentElement)) return true;
+  return false;
+}
+
+function hasPreservedMedia(el: HTMLElement): boolean {
+  return !!el.querySelector(PRESERVED_MEDIA_SELECTOR);
+}
+
+function firstSourceTemplateClass(el: HTMLElement): HTMLElement | null {
+  for (const child of Array.from(el.children)) {
+    if (!(child instanceof HTMLElement)) continue;
+    if (isTranslationElement(child)) continue;
+    if (child.classList.contains(SRC_CLASS)) return child;
+  }
+  return null;
+}
+
+function markInPlaceSource(el: HTMLElement): HTMLElement | null {
+  let template: HTMLElement | null = firstSourceTemplateClass(el);
+  for (const child of Array.from(el.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      if (!(child.textContent || "").trim()) continue;
+      const wrapper = document.createElement("span");
+      wrapper.className = SRC_CLASS;
+      child.parentNode?.insertBefore(wrapper, child);
+      wrapper.appendChild(child);
+      skipMoNodes.add(wrapper);
+      if (!template) template = wrapper;
+      continue;
+    }
+    if (!(child instanceof HTMLElement)) continue;
+    if (isTranslationElement(child)) continue;
+    if (!sourceText(child)) continue;
+    if (hasPreservedMedia(child)) continue;
+    child.classList.add(SRC_CLASS);
+    if (!template) template = child;
+  }
+  return template;
+}
+
+function copyTextPresentation(src: HTMLElement | null, dst: HTMLElement) {
+  if (!src) return;
+  const classes = Array.from(src.classList)
+    .filter((name) => name !== SRC_CLASS && !name.startsWith("bbt-"));
+  if (classes.length) dst.className = classes.join(" ");
+  const style = src.getAttribute("style");
+  if (style) dst.setAttribute("style", style);
+  const dir = src.getAttribute("dir");
+  if (dir) dst.setAttribute("dir", dir);
+}
+
+function createNativeTranslationElement(el: HTMLElement, inlineLeaf: boolean): HTMLElement {
+  const tag = el.tagName;
+  const useNativeTag = !UNSAFE_NATIVE_REPLACE_TAGS.has(tag) && !tag.includes("-");
+  const node = document.createElement(
+    useNativeTag ? tag.toLowerCase() : inlineLeaf ? "span" : "div",
+  );
+  for (const attr of Array.from(el.attributes)) {
+    if (shouldCopyNativeAttr(el, attr.name)) {
+      node.setAttribute(attr.name, attr.value);
+    }
+  }
+  node.classList.add(TR_CLASS, inlineLeaf ? TR_INLINE_CLASS : TR_BLOCK_CLASS, TR_NATIVE_CLASS);
+  node.setAttribute("lang", TARGET_LANG);
+  return node;
+}
+
+function createInPlaceTranslationElement(template: HTMLElement | null, safe: string): HTMLElement {
+  const node = document.createElement("span");
+  copyTextPresentation(template, node);
+  node.classList.add(TR_CLASS, TR_INLINE_CLASS, TR_NATIVE_CLASS, TR_INPLACE_CLASS);
+  node.setAttribute("lang", TARGET_LANG);
+  Reflect.set(node, "innerHTML", safe);
+  return node;
+}
+
+function createTranslationElement(el: HTMLElement, safe: string, inlineLeaf: boolean): HTMLElement {
+  if (mode === "replace") {
+    const node = createNativeTranslationElement(el, inlineLeaf);
+    Reflect.set(node, "innerHTML", safe);
+    return node;
+  }
+
+  const font = document.createElement("font");
+  // marker class 让 CSS 区分 inline-leaf (流畅 inline) vs block-leaf (占行 block).
+  // 装饰 (border / 字号 / 间距) 在 CSS rule 里按 mode 控制, 不再 inline style.
+  font.className = TR_CLASS + " " + (inlineLeaf ? TR_INLINE_CLASS : TR_BLOCK_CLASS);
+  Reflect.set(font, "innerHTML", safe);
+  return font;
 }
 
 function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
@@ -498,7 +843,7 @@ function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
   if (mode === "off" || !raw) return;
   // 译文等于原文 (模型决定不翻 — 专有名词 / handle / 版本号等) → 不 inject sibling,
   // 否则视觉上原文显示 2 遍 (V 截图 #8 user info 重复 3 次的 root cause).
-  const original = (el.innerText || el.textContent || "").trim();
+  const original = sourceText(el);
   if (raw.trim() === original) return;
   // server 返 plain text with \n\n 段分隔. 浏览器把 \n 当 whitespace 渲染,
   // 段间会粘连, 转 <br><br> 才有视觉换行 (DOMPurify allowlist 含 br).
@@ -507,22 +852,48 @@ function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
     .replace(/\n{2,}/g, "<br><br>")
     .replace(/\n/g, "<br>");
   const safe = DOMPurify.sanitize(withBreaks, SAFE_HTML_OPTS);
-  if (mode === "auto") {
-    Reflect.set(el, "innerHTML", safe);
-    // F4: innerHTML 替换后子树都是我们的 sanitized 译文 (含允许的 span/mark/a 等),
-    // 不 mark 的话 MO addedNodes 看到这些 inline 子树会重新 collect → 假性"原文"翻译.
-    el.querySelectorAll("*").forEach((c) => skipMoNodes.add(c));
+  const inlineLeaf = isInlineElement(el);
+  if (shouldRenderInPlace(el, original)) {
+    const template = markInPlaceSource(el);
+    const tr = createInPlaceTranslationElement(template, safe);
+    skipMoNodes.add(tr);
+    el.setAttribute(INPLACE_ATTR, "1");
+    if (template) {
+      template.insertAdjacentElement("afterend", tr);
+    } else {
+      el.appendChild(tr);
+    }
     if (hash) recentlyInjected.set(hash, Date.now());
     return;
   }
-  const font = document.createElement("font");
-  font.className = TR_CLASS;
-  font.setAttribute("style", TR_STYLE);
-  Reflect.set(font, "innerHTML", safe);
-  // MO sentinel: 自己 inject 的 font 加进 skipMoNodes, MO addedNodes 看到跳 (防自触发).
-  skipMoNodes.add(font);
-  el.insertAdjacentElement("afterend", font);
+  const tr = createTranslationElement(el, safe, inlineLeaf);
+  // MO sentinel: 自己 inject 的 node 加进 skipMoNodes, MO addedNodes 看到跳 (防自触发).
+  skipMoNodes.add(tr);
+  // sibling 注入 — 5 源共识 (kiss translator.js:1359 .after / 沉浸式 Zs insertBefore /
+  // read-frog page-translation.ts insertBefore / old-immersive). 防死循环靠"不处理
+  // removedNodes" (F6 已删), 不靠 appendChild 进 leaf. appendChild 实测在 X 上 React
+  // 仍 swap 整 SPAN, 加上 getComputedStyle reflow = 整页 layout thrashing 闪.
+  el.insertAdjacentElement("afterend", tr);
   if (hash) recentlyInjected.set(hash, Date.now());
+}
+
+function rerenderCachedTranslations() {
+  clearAllTranslations();
+  recentlyInjected.clear();
+  if (mode === "off") return;
+  document.querySelectorAll(`[${HASH_ATTR}]`).forEach((node) => {
+    if (!(node instanceof HTMLElement)) return;
+    const text = sourceText(node);
+    if (!shouldTranslate(text)) return;
+    const fresh = hashText(normalizeForHash(text), TARGET_LANG);
+    const translated = cache.get(fresh);
+    if (translated !== undefined) {
+      node.setAttribute(HASH_ATTR, fresh);
+      injectTranslation(node, translated, fresh);
+      return;
+    }
+    processCandidate(node, "rerun");
+  });
 }
 
 // ── candidate processing ──────────────────────────────────────────────
@@ -548,7 +919,7 @@ function processCandidate(el: HTMLElement, src: TraceSource = "init") {
 }
 
 function doProcessCandidate(el: HTMLElement, src: TraceSource) {
-  const text = (el.innerText || el.textContent || "").trim();
+  const text = sourceText(el);
   if (!text) {
     trace(src, el, "", "skip_no_text");
     return;
@@ -558,13 +929,12 @@ function doProcessCandidate(el: HTMLElement, src: TraceSource) {
     return;
   }
 
-  const fresh = hashText(text, TARGET_LANG);
+  const fresh = hashText(normalizeForHash(text), TARGET_LANG);
   const existing = el.getAttribute(HASH_ATTR);
 
   // SPA 重 mount 时, 旧 .bbt-tr sibling 可能跟随 hash 节点带过来; 但 text 已变 →
   // hash 不一致 → 旧译文跟新内容不对应, 必须清掉重翻.
-  const next = el.nextElementSibling;
-  const hasInjected = !!(next && next.classList.contains(TR_CLASS));
+  const hasInjected = hasInjectedTranslation(el);
   if (hasInjected && existing === fresh) {
     trace(src, el, fresh, "already", text);
     return;
@@ -591,38 +961,65 @@ function doProcessCandidate(el: HTMLElement, src: TraceSource) {
     return;
   }
 
+  // hash in-flight: 同 text 跨 element instance 已 enqueue 在 server roundtrip 中,
+  // 不重 enqueue 触发并发 flush. 等 flush 完 cache.set 后, 同 hash 走 cache hit.
+  if (inFlightHashes.has(fresh)) {
+    trace(src, el, fresh, "in_flight_defer", text);
+    return;
+  }
+
   trace(src, el, fresh, "enqueue", text);
   inFlightElements.add(el);
-  queue.set(fresh, el);
+  inFlightHashes.add(fresh);
+  queue.set(fresh, { el, text });
   // queue cap — V 快速滚时 evict 最老 (FIFO insertion order).
   if (queue.size > QUEUE_MAX) {
     const oldest = queue.keys().next().value as string | undefined;
-    if (oldest && oldest !== fresh) queue.delete(oldest);
+    if (oldest && oldest !== fresh) {
+      const evicted = queue.get(oldest);
+      queue.delete(oldest);
+      inFlightHashes.delete(oldest);
+      if (evicted) inFlightElements.delete(evicted.el);
+    }
   }
   scheduleFlush();
 }
 
 function scheduleFlush() {
+  if (flushInProgress) return;
   if (flushTimer !== null) return;
   flushTimer = window.setTimeout(flush, FLUSH_DEBOUNCE_MS);
 }
 
 async function flush() {
   flushTimer = null;
+  if (flushInProgress) {
+    scheduleFlush();
+    return;
+  }
   if (queue.size === 0) return;
+  flushInProgress = true;
+  try {
+    await flushOnce();
+  } finally {
+    flushInProgress = false;
+    if (queue.size > 0) scheduleFlush();
+  }
+}
 
+async function flushOnce() {
   // FIFO 取 BATCH_SIZE — 不再按 viewport drop, V 滚出去的也翻完
   // ("能读取到的尽量都翻"). slice 暂不删, 等 round-trip 完按 network 状态决定.
-  const slice: { hash: string; el: HTMLElement }[] = [];
-  for (const [h, el] of queue) {
-    slice.push({ hash: h, el });
+  const slice: { hash: string; el: HTMLElement; text: string }[] = [];
+  for (const [h, item] of queue) {
+    slice.push({ hash: h, el: item.el, text: item.text });
     if (slice.length >= BATCH_SIZE) break;
   }
   if (slice.length === 0) return;
 
-  const batch = slice.map(({ hash, el }) => ({
+  const batch = slice.map(({ hash, text }) => ({
     hash,
-    text: (el.innerText || el.textContent || "").trim(),
+    text,
   }));
 
   let results: { hash: string; translated: string }[] = [];
@@ -642,21 +1039,32 @@ async function flush() {
   }
   // SW / server 没 ready 或 extension reload → 整 slice 留 queue, scheduleFlush 下次重试.
 
-  const byHash = new Map(slice.map(({ hash, el }) => [hash, el]));
+  const byHash = new Map(slice.map((item) => [item.hash, item]));
+  const staleRechecks: HTMLElement[] = [];
   for (const r of results) {
-    const el = byHash.get(r.hash);
-    if (!el || !r.translated) continue;
+    const item = byHash.get(r.hash);
+    if (!item || !r.translated) continue;
     cache.set(r.hash, r.translated);
-    injectTranslation(el, r.translated, r.hash);
+    const currentText = sourceText(item.el);
+    const currentHash = currentText ? hashText(normalizeForHash(currentText), TARGET_LANG) : "";
+    if (currentHash !== r.hash) {
+      trace("mo_add", item.el, r.hash, "stale_result", currentText);
+      staleRechecks.push(item.el);
+      continue;
+    }
+    injectTranslation(item.el, r.translated, r.hash);
   }
 
   if (networkOk) {
     // server 处理过 (即使部分 result 缺也算 LLM 已尝试), 删 slice 防 retry 浪费.
     for (const { hash } of slice) queue.delete(hash);
   }
-  // 不管 networkOk 与否, slice 里 element 释放 in-flight 锁 (allow 下次 mutation 触发新翻).
+  // 不管 networkOk 与否, slice 里 element / hash 释放 in-flight 锁.
   for (const { el } of slice) inFlightElements.delete(el);
-  if (queue.size > 0) scheduleFlush();
+  for (const { hash } of slice) inFlightHashes.delete(hash);
+  for (const el of staleRechecks) {
+    if (el.isConnected) processCandidate(el, "mo_add");
+  }
 }
 
 // ── observers ─────────────────────────────────────────────────────────
@@ -712,6 +1120,20 @@ function observeMutations() {
         if (target.classList.contains(TR_CLASS)) continue;
         if (target.closest && target.closest(`.${TR_CLASS}`)) continue;
       }
+      // class/style/hidden 变化能让原本 display:none 的段落变可见. hiddenCache /
+      // inlineCache 都基于 computed style, 属性变更时必须失效并重新 collect.
+      if (r.type === "attributes") {
+        if (target instanceof HTMLElement) {
+          hiddenCache.delete(target);
+          inlineCache.delete(target);
+          multiCache.delete(target);
+          if (target.hasAttribute(LEAF_ATTR)) {
+            processCandidate(target, "mo_add");
+          }
+          observeNew(target, "mo_add");
+        }
+        continue;
+      }
       // F-V-display-more: X "显示更多" 点开后, X 用 React 替换 tweetText nodeValue
       // (characterData mutation 不是 childList). 抄 kiss translator.js:718-723 模式:
       // oldValue !== nodeValue 才触发 (filter noop), processCandidate parent 重 enqueue.
@@ -725,6 +1147,14 @@ function observeMutations() {
         }
         continue;
       }
+      // childList mutation: target 内部 children 变了, 但 target 自己 (= 已 leaf 的段落)
+      // 没被显式 reprocess. X "显示更多" 用 React 替换 tweetText.children (整 child list
+      // swap, 不走 characterData), target=tweetText 没动. 之前漏掉这条路径 = 展开后 text
+      // 变了 hash 不变 (旧 hash attr 仍在), 永不 re-translate. 加这条让 leaf target 自检.
+      if (target instanceof HTMLElement && target.hasAttribute(LEAF_ATTR)) {
+        processCandidate(target, "mo_add");
+      }
+
       for (const node of r.addedNodes) {
         // 自己 inject 的 .bbt-tr font 跳 (kiss translator.js:711 同模式) — 防自触发 loop.
         if (skipMoNodes.has(node)) continue;
@@ -746,35 +1176,19 @@ function observeMutations() {
         observeNew(node, "mo_add");
       }
 
-      // F6: X SPA 干掉 .bbt-tr 但 source 仍在 DOM (主推漏翻 case).
-      // previousSibling 是 hashed source 时, 200ms trailing 后 re-inject (cache 命中不调 server).
-      // 200ms 让 X 这一波 reconcile burst 走完, source 仍在则补译文; 不在则 noop.
-      for (const node of r.removedNodes) {
-        if (!(node instanceof HTMLElement)) continue;
-        if (!node.classList.contains(TR_CLASS)) continue;
-        const source = r.previousSibling;
-        if (!(source instanceof HTMLElement)) continue;
-        if (!source.hasAttribute(HASH_ATTR)) continue;
-        const hash = source.getAttribute(HASH_ATTR);
-        if (!hash) continue;
-        const cached = cache.get(hash);
-        if (cached === undefined) continue;
-        // 不 delete recentlyInjected — 删了会让 200ms 内 addedNodes 路径 processCandidate
-        // 跳过 800ms debounce 抢先 inject + setTimeout 200ms 后又 inject = double.
-        // 让 800ms debounce 自然挡 addedNodes; setTimeout 内 sibling check 兜底.
-        window.setTimeout(() => {
-          if (!source.isConnected) return;
-          if (source.nextElementSibling?.classList?.contains(TR_CLASS)) return;
-          // re-validate: text 仍是当时的 hash, 避免 X 重 mount 后 text 变了
-          const text = (source.innerText || source.textContent || "").trim();
-          if (hashText(text, TARGET_LANG) !== hash) return;
-          trace("mo_add", source, hash, "reinject_timer", text);
-          injectTranslation(source, cached, hash);
-        }, REINJECT_DELAY_MS);
-      }
+      // 故意不处理 r.removedNodes — 5 源对照 (agent 反编译铁证):
+      //   kiss translator.js:707-749 / read-frog page-translation.ts:516-532 /
+      //   old-immersive pageTranslator.js:284 全部 only addedNodes 不动 removedNodes;
+      //   沉浸式 v1.28.5 content_main_beauty.js:45687 `I$()` 检 mutation 整段
+      //   self-induced 时整条 skip (默认 checkSelfUpdate=true).
+      // 老 F6 200ms reinject 是反应式补丁, 实测在 X 上跟 React reconcile 形成死循环
+      // (V 12s 89 次 add/rm 实测铁证). 删之. React 删 .bbt-tr 后 babata 不反应,
+      // 下次 mutation cycle 通过 addedNodes 路径自然 reprocess.
     }
   });
   mo.observe(document.body, {
+    attributes: true,
+    attributeFilter: ["class", "style", "hidden", "aria-hidden"],
     childList: true,
     subtree: true,
     characterData: true,
@@ -784,34 +1198,84 @@ function observeMutations() {
 
 // ── boot ──────────────────────────────────────────────────────────────
 
+function normalizeMode(v: unknown): Mode {
+  // 老 "auto" → "replace" (UX 等价: 视觉上替换原文, 但走 sibling+CSS hide 不抢 DOM).
+  if (v === "off") return "off";
+  if (v === "auto" || v === "replace") return "replace";
+  return "bilingual";
+}
+
 async function loadMode() {
   try {
     const got = await chrome.storage.local.get("babata.translation_mode");
-    if (got["babata.translation_mode"]) {
-      mode = got["babata.translation_mode"] as Mode;
+    const stored = got["babata.translation_mode"];
+    mode = normalizeMode(stored);
+    // 老 "auto" 一次性迁移到 "replace" — widget UI radio 才能正确选中.
+    if (stored === "auto") {
+      void chrome.storage.local.set({ "babata.translation_mode": "replace" });
     }
   } catch {
     /* default bilingual */
   }
 }
 
-function rerunAll() {
-  document.querySelectorAll(`.${TR_CLASS}`).forEach((e) => e.remove());
-  // F5: V 显式 toggle mode 是 user action, 清 debounce 让 processCandidate 立即 re-inject.
-  recentlyInjected.clear();
-  if (mode === "off") return;
-  document.querySelectorAll(`[${HASH_ATTR}]`).forEach((e) => {
-    if (e instanceof HTMLElement) processCandidate(e, "rerun");
-  });
+// CSS rules — mode 切换不重调 LLM, 只重绘 page-side cached translation nodes.
+// 关键设计:
+//   replace 用 `:has(+ .${TR_CLASS})` 避免空窗 — leaf 只在 sibling 译文已 inject 时
+//   才隐藏, 翻译没回来前 leaf 仍显示原文 (V 反馈 "少了一大堆" = 之前无条件 hide).
+//   replace 的 .bbt-tr-native 复制原 leaf tag/class/style/data state, 让站点原 CSS 决定
+//   字号/间距/布局; bilingual 才用额外 display + border-left / 字号 / margin 装饰区分.
+const MODE_STYLE_ID = "bbt-mode-style";
+function injectModeStyle() {
+  let style = document.getElementById(MODE_STYLE_ID) as HTMLStyleElement | null;
+  if (!style) {
+    style = document.createElement("style");
+    style.id = MODE_STYLE_ID;
+    (document.head || document.documentElement).appendChild(style);
+  }
+  style.textContent = `
+    .${TR_CLASS} { color: inherit; }
+    html[data-bbt-mode="off"] .${TR_CLASS} { display: none !important; }
+    html[data-bbt-mode="replace"] [${LEAF_ATTR}]:has(+ .${TR_CLASS}) { display: none !important; }
+    html[data-bbt-mode="replace"] .${TR_NATIVE_CLASS} { color: inherit; }
+    html[data-bbt-mode="replace"] [${INPLACE_ATTR}]:has(> .${TR_INPLACE_CLASS}) > .${SRC_CLASS} {
+      display: none !important;
+    }
+    html[data-bbt-mode="replace"] [${INPLACE_ATTR}] > .${TR_INPLACE_CLASS} {
+      color: inherit;
+    }
+    html[data-bbt-mode="bilingual"] .${TR_INLINE_CLASS} { display: inline; }
+    html[data-bbt-mode="bilingual"] .${TR_BLOCK_CLASS} { display: block; }
+    html[data-bbt-mode="bilingual"] .${TR_BLOCK_CLASS} {
+      color: #5b5b5b;
+      font-size: .95em;
+      line-height: 1.5;
+      margin-top: 3px;
+      border-left: 2px solid #d8d2c5;
+      padding-left: 8px;
+    }
+    html[data-bbt-mode="bilingual"] .${TR_INLINE_CLASS} {
+      color: #5b5b5b;
+      margin-left: 4px;
+    }
+  `;
+}
+function applyModeAttr() {
+  document.documentElement.setAttribute("data-bbt-mode", mode);
 }
 
 function boot() {
   if (window.top !== window.self) return;
+  broadcastTeardown();
   const w = window as unknown as { __babataTranslateBooted?: boolean };
   if (w.__babataTranslateBooted) return;
   w.__babataTranslateBooted = true;
+  document.addEventListener(TEARDOWN_EVENT, teardownAll);
+  registerCleanup(() => document.removeEventListener(TEARDOWN_EVENT, teardownAll));
 
+  injectModeStyle();
   void loadMode().then(() => {
+    applyModeAttr();
     makeIO();
     observeNew(document.body);
     observeMutations();
@@ -821,18 +1285,29 @@ function boot() {
   });
 
   try {
-    chrome.storage.onChanged.addListener((changes) => {
+    const onStorageChanged = (changes: Record<string, chrome.storage.StorageChange>) => {
       if (changes["babata.translation_mode"]) {
-        mode = changes["babata.translation_mode"].newValue as Mode;
-        rerunAll();
+        const prev = mode;
+        mode = normalizeMode(changes["babata.translation_mode"].newValue);
+        applyModeAttr();
+        // bilingual ↔ replace 需要重绘 wrapper 形态: replace 用 native clone,
+        // bilingual 用中性 font sibling; 译文本身仍走 L1 cache, 不重调 LLM.
+        if (prev !== mode && mode !== "off") {
+          rerenderCachedTranslations();
+          // off → bilingual/replace: 之前没翻新内容, 触发 collect 走 cache hit / enqueue.
+          observeNew(document.body, "rerun");
+        }
       }
-    });
+    };
+    chrome.storage.onChanged.addListener(onStorageChanged);
+    registerCleanup(() => chrome.storage.onChanged.removeListener(onStorageChanged));
   } catch {
     /* extension context invalidated — 老 content script 不 re-bind, V 刷 page 后新 SC 接手 */
   }
 
   // F8: page unload / extension reload 时清 timer + MO, 防老 content script leak.
   window.addEventListener("pagehide", teardownAll, { once: true });
+  registerCleanup(() => window.removeEventListener("pagehide", teardownAll));
 }
 
 if (document.readyState === "loading") {

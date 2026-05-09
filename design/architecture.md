@@ -8,18 +8,28 @@ V 在 session 3bc3bc47 中沉积的三句陈述, 是整个 sidebar 的北极星:
 2. **"活在浏览器里, 一切都要如原生般丝滑"** (UX 原生)
 3. **"时刻记住, 要从底层完全掌握我的浏览器, 如原生, 如呼吸"** (技术深度 + 自动化无感)
 
-落地 6 条铁律:
+设计铁律 (live / target 分层):
 
 - **全渗透**, 不留隐私黑名单 (V 2026-05-07 明示否决, 见 babata memory `feedback_no_privacy_blacklist.md`)
 - **One CPU**, sidebar 跟 TG / 微信 channel 同一个 CC binary (`feedback_one_cpu_many_channels.md`)
-- **底层接入**: A11y tree content script `document_start all_frames`, 不延迟; chrome.debugger CDP V0 标配
-- **默认 always-on**: V 打开 Edge sidebar SW 已 ready, content script 已注入, a11y tree 已扫描. 不等 V 触发
+- **底层接入**: live 已有 `page_snapshot` / `page_click_ref`; target 是 full A11y tree content script `document_start all_frames` + chrome.debugger CDP trusted input
+- **默认 always-on**: live 是 SW / offscreen / widget / translate content script ready; target 是 full a11y tree 预扫描, 不等 V 触发
 - **异步学习**: site-profile / chat-archive 复盘永远 offscreen / launchd consumer, 不卡 UI
 - **静默自愈**: profile miss / API 错 / SW 重启 全程无 toast 无 badge (`feedback_self_heal_no_escalate.md`)
 
 ---
 
 ## 拓扑
+
+> Live status (2026-05-09): 下图仍是目标拓扑. 当前代码已落地
+> `src/service-worker.ts` / `src/offscreen.ts` / `src/sidepanel.tsx` /
+> `src/content/babata-widget.ts` / `src/content/babata-translate.ts` 和 babata
+> main repo 的 `sidebar_bot.py` / `sidebar_mcp.py` / `sidebar_bridge.py` /
+> `sidebar_translate.py`. 已有可见页面 `page_snapshot` / `page_click_ref`
+> (ref / selector / URL-scoped is_new diff) 基础链路, 以及 sidepanel Port
+> sentinel 和 tab-targeted mascot bubble. 尚未落地的目标能力包括 full a11y tree content script,
+> trusted `chrome.debugger` click/type/screenshot, visual indicator, site profile
+> consumer, per-window session, unified tool registry.
 
 ```
 ┌─ V 的 Edge (Profile 1, V 已登录态全保留) ────────────────────────────┐
@@ -76,15 +86,14 @@ V 在 session 3bc3bc47 中沉积的三句陈述, 是整个 sidebar 的北极星:
 
 | 组件 | 文件 | 职责 |
 |------|------|------|
-| Service Worker | `assets/service-worker.ts` | message router / commands / webNavigation / debugger lifecycle |
-| Offscreen Document | `offscreen.html` + `offscreen.js` | 持 WSS to babata server (keep SW alive 副作用); 流式 token 转发 |
-| Side Panel UI | `sidepanel.html` + Preact 组件 | 4 tab: chat / 本站经验 / 浏览器管家 / 设置 |
-| A11y Content Script | `content/accessibility-tree.ts` | DOM → ax tree 单行扁平 (`[refN]<role>"name" attrs`), all_urls all_frames document_start, 抄 Anthropic `__generateAccessibilityTree` pattern |
-| Visual Indicator | `content/agent-visual-indicator.ts` | Shadow DOM 浮层: phantom cursor (跟 CDP `Input.dispatchMouseEvent` 联动) / glow border / stop button |
-| Bilingual Inject | `content/bilingual-translate.ts` | DOM 直接注入 `<font class="bbt-tr">`, IntersectionObserver 懒加载, 复用沉浸式 137 站点 inlineTags / stayOriginalTags / lineBreakRegexStr |
-| Selection Popup | `content/selection-popup.ts` | 划词浮层 Shadow DOM (`mode:"closed"` + `:host{all:initial}`) |
-| Pairing | `pairing.html` (V2) | 跟 babata.icu 网页 OAuth 配对, V0 留口子 |
-| Options | `options.html` | 设置 (V0 已被 sidebar tab 覆盖, options 可 fallback) |
+| Service Worker | `src/service-worker.ts` | message router / sidepanel Port sentinel / commands / webNavigation / raw DOM + visible page snapshot/ref actions + browser keeper actions |
+| Offscreen Document | `src/offscreen.html` + `src/offscreen.ts` | 持 WS to babata server, 抗 MV3 SW idle kill; 双向转发 SW request/response |
+| Side Panel UI | `src/sidepanel.html` + `src/sidepanel.tsx` | chat / streaming markdown / history restore / file-image-video upload / suggestion chips |
+| Widget | `src/content/babata-widget.ts` | page floating entry, translation mode popover, page popup iframe, tab-targeted mascot bubble |
+| Bilingual Inject | `src/content/babata-translate.ts` | DOM sibling 注入 `.bbt-tr`, batch translate, SPA mutation recovery, trace/attention push |
+| A11y Content Script | planned `content/accessibility-tree.ts` | DOM → ax tree 单行扁平; 当前尚未实现 |
+| Visual Indicator | planned `content/agent-visual-indicator.ts` | Shadow DOM phantom cursor / glow border / stop button; 当前尚未实现 |
+| Selection Popup | planned `content/selection-popup.ts` | 划词浮层 Shadow DOM; 当前尚未实现 |
 
 ---
 
@@ -93,7 +102,7 @@ V 在 session 3bc3bc47 中沉积的三句陈述, 是整个 sidebar 的北极星:
 | 组件 | 文件 | 职责 |
 |------|------|------|
 | HTTP/SSE/WS server | `sidebar_bot.py` | 接收扩展 HTTP 请求 + SSE 流式回 + WS bridge for 实时 |
-| MCP tools | `sidebar_mcp.py` | 暴露给 CC: page_a11y / page_click / page_type / page_screenshot / bookmark_* / tabs_* / history_* / downloads_* / site_profile_* |
+| MCP tools | `sidebar_mcp.py` | 暴露给 CC: tab_metadata / dom_* / page_snapshot / page_click_ref / bookmarks_* / tabs_* / history_* |
 | Bridge | `sidebar_bridge.py` | Unix socket `/tmp/babata-sidebar-bridge.sock`, 跟 `bridge.py` / `weixin_bridge.py` 同构, MCP → 扩展反向 |
 | CC channel #3 | `cc.py` 改 | 加 `source_prompt_sidebar` + `state_file=~/.babata/sidebar/state.json` |
 | Site profile evolver | `scripts/sidebar-profile-consumer.sh` | launchd `com.babata.sidebar-profile-consumer` 每 5min, 跟 `~/.claude/skills/skill-evolve/consumer.sh` 同构 |
@@ -114,14 +123,18 @@ sidepanel.tsx 发送 → SW.runtime.onMessage → fetch http://127.0.0.1:18791/c
 ### Page action (LLM 调 MCP tool)
 
 ```
-CC tool_use sidebar_mcp.page_click(ref="e42")
-  → sidebar_mcp.py 通过 sidebar_bridge.sock 发 {action:click, ref:"e42"}
+CC tool_use sidebar_mcp.page_snapshot(tab_id=...)
+  → sidebar_mcp.py 通过 sidebar_bridge.sock 发 {action:"page_snapshot"}
+  → SW chrome.scripting.executeScript 生成可见元素 ref / selector / is_new
+  → CC tool_use sidebar_mcp.page_click_ref(snapshot_id="...", ref="e42")
   → sidebar_bot.py WS 推到扩展 SW
-  → SW chrome.debugger sendCommand Input.dispatchMouseEvent (trusted input)
-  → Visual indicator phantom cursor 同步移动 (UPDATE_PHANTOM_CURSOR message)
+  → SW 用 snapshot 存储的 selector scrollIntoView + synthetic .click()
   → result 反向回流
   → CC 看到 tool_result 继续推理
 ```
+
+V1 再把 `page_click_ref` 底层从 synthetic `.click()` 升级为
+`chrome.debugger` trusted input, 并补 visual indicator.
 
 ### Site profile lookup
 
@@ -205,7 +218,7 @@ sidebar 自己 state 写 ~/.babata/sidebar/state.json (独立 channel)
 
 ## Permission + CSP
 
-`manifest.json` (V0 一次申请全, V 自装自用):
+`src/manifest.json` (V0 一次申请全, V 自装自用; live list):
 
 ```json
 {
@@ -215,17 +228,12 @@ sidebar 自己 state 写 ~/.babata/sidebar/state.json (独立 channel)
     "bookmarks", "history", "downloads",
     "scripting", "debugger",
     "alarms", "notifications", "offscreen",
-    "nativeMessaging", "webNavigation",
-    "declarativeNetRequest", "declarativeNetRequestWithHostAccess",
-    "activeTab", "unlimitedStorage",
-    "identity", "contextMenus"
+    "webNavigation", "activeTab", "unlimitedStorage",
+    "contextMenus"
   ],
   "host_permissions": ["<all_urls>"],
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' http://127.0.0.1:18791 ws://127.0.0.1:18791;"
-  },
-  "externally_connectable": {
-    "matches": ["https://babata.icu/*"]
   }
 }
 ```

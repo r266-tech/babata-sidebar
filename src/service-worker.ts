@@ -13,7 +13,38 @@
 //
 // V0 暴露的 raw primitive (LLM 在 server 端 reason 完调):
 //   tab_metadata / dom_query / dom_inject / dom_set / dom_click / tab_navigate
+//   page_snapshot / page_click_ref
 // 后续按需加, 但每加一个都重新审视: LLM compose 现有 primitive 真做不到这事吗?
+
+type SnapshotItem = {
+  ref: string;
+  role: string;
+  tag: string;
+  name: string;
+  selector: string;
+  is_new: boolean;
+  rect: { x: number; y: number; w: number; h: number };
+};
+
+type SnapshotStore = {
+  tabId: number;
+  url: string;
+  selectors: Record<string, string>;
+  createdAt: number;
+};
+
+type SnapshotRawItem = SnapshotItem & { key: string };
+type SnapshotPageResult = {
+  url: string;
+  title: string;
+  items: SnapshotRawItem[];
+};
+
+const lastSnapshotKeysByTab = new Map<number, { url: string; keys: Set<string> }>();
+const snapshotStores = new Map<string, SnapshotStore>();
+const SNAPSHOT_STORE_MAX = 20;
+const SIDEPANEL_PORT = "babata-sidepanel";
+const sidepanelPorts = new Set<chrome.runtime.Port>();
 
 async function ensureOffscreen() {
   // chrome.offscreen.hasDocument 在某些版本不存在, 用 getContexts fallback.
@@ -41,6 +72,25 @@ async function ensureOffscreen() {
 }
 
 // ── messages from offscreen / sidepanel ──────────────────────────────
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== SIDEPANEL_PORT) return;
+  sidepanelPorts.add(port);
+  void ensureOffscreen();
+  port.onMessage.addListener((msg) => {
+    const m = msg as { type?: string; ts?: number } | undefined;
+    if (m?.type === "babata.sidepanel_ping") {
+      try {
+        port.postMessage({ type: "babata.sidepanel_pong", ts: m.ts ?? Date.now() });
+      } catch {
+        /* disconnected */
+      }
+    }
+  });
+  port.onDisconnect.addListener(() => {
+    sidepanelPorts.delete(port);
+  });
+});
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== "object") return;
@@ -160,22 +210,41 @@ async function handleWsInbound(raw: string) {
       sendToWs({ kind: "response", id: inbound.id, ok: false, error: err });
     }
   } else if (inbound.kind === "notification") {
-    // server → SW notification → 转 sidepanel. sidepanel 没挂 / widget 没注册
-    // listener 时 reject (no receiver), V0 接受 lossy 但 debug log 留下来.
-    chrome.runtime
-      .sendMessage({
-        type: "babata.notification",
-        action: inbound.action,
-        args: inbound.args ?? {},
-      })
-      .catch((e) => {
-        console.debug(
-          "[babata-sw] notification dropped (no receiver):",
-          inbound.action,
-          (e as Error)?.message ?? e,
-        );
-      });
+    void dispatchNotification(inbound.action ?? "", inbound.args ?? {});
   }
+}
+
+async function dispatchNotification(action: string, args: Record<string, unknown>) {
+  const message = {
+    type: "babata.notification",
+    action,
+    args,
+  };
+
+  if (action === "mascot_speak") {
+    try {
+      const tab = await targetTab(args);
+      await chrome.tabs.sendMessage(tab.id!, message);
+      return;
+    } catch (e) {
+      console.debug(
+        "[babata-sw] mascot notification dropped:",
+        (e as Error)?.message ?? e,
+      );
+      return;
+    }
+  }
+
+  // Extension-page notifications: sidepanel / popup iframe.
+  chrome.runtime
+    .sendMessage(message)
+    .catch((e) => {
+      console.debug(
+        "[babata-sw] notification dropped (no receiver):",
+        action,
+        (e as Error)?.message ?? e,
+      );
+    });
 }
 
 function sendToWs(payload: object) {
@@ -189,19 +258,64 @@ function sendToWs(payload: object) {
 
 // ── action dispatch (运行在 active tab 的 page-side, SW 序列化 func 注入) ─
 
-async function activeTab(): Promise<chrome.tabs.Tab> {
-  const [tab] = await chrome.tabs.query({
+function intArg(args: Record<string, unknown>, ...names: string[]): number | undefined {
+  for (const name of names) {
+    const value = args[name];
+    if (typeof value === "number" && Number.isInteger(value)) return value;
+    if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
+  }
+  return undefined;
+}
+
+function normalizeTranslationMode(v: unknown): "off" | "bilingual" | "replace" {
+  if (v === "off") return "off";
+  if (v === "auto" || v === "replace") return "replace";
+  return "bilingual";
+}
+
+async function targetTab(args: Record<string, unknown> = {}): Promise<chrome.tabs.Tab> {
+  const explicitTabId = intArg(args, "tab_id", "tabId");
+  if (explicitTabId !== undefined) {
+    const tab = await chrome.tabs.get(explicitTabId);
+    if (!tab?.id) throw new Error(`tab not found: ${explicitTabId}`);
+    return tab;
+  }
+
+  const query: chrome.tabs.QueryInfo = {
     active: true,
-    lastFocusedWindow: true,
+  };
+  const windowId = intArg(args, "window_id", "windowId");
+  if (windowId !== undefined) {
+    query.windowId = windowId;
+  } else {
+    query.lastFocusedWindow = true;
+  }
+  const [tab] = await chrome.tabs.query({
+    ...query,
   });
   if (!tab?.id) throw new Error("no active tab");
   return tab;
 }
 
+function pruneSnapshotStores(now = Date.now()) {
+  for (const [id, store] of snapshotStores) {
+    if (now - store.createdAt > 10 * 60_000) {
+      snapshotStores.delete(id);
+    }
+  }
+  const ordered = [...snapshotStores.entries()].sort(
+    (a, b) => a[1].createdAt - b[1].createdAt,
+  );
+  while (ordered.length > SNAPSHOT_STORE_MAX) {
+    const [id] = ordered.shift()!;
+    snapshotStores.delete(id);
+  }
+}
+
 async function dispatchAction(action: string, args: Record<string, unknown>) {
   switch (action) {
     case "tab_metadata":
-      return await actTabMetadata();
+      return await actTabMetadata(args);
     case "dom_query":
       return await actDomQuery(args);
     case "dom_inject":
@@ -210,6 +324,10 @@ async function dispatchAction(action: string, args: Record<string, unknown>) {
       return await actDomSet(args);
     case "dom_click":
       return await actDomClick(args);
+    case "page_snapshot":
+      return await actPageSnapshot(args);
+    case "page_click_ref":
+      return await actPageClickRef(args);
     case "tab_navigate":
       return await actTabNavigate(args);
     case "bookmarks_search":
@@ -231,8 +349,8 @@ async function dispatchAction(action: string, args: Record<string, unknown>) {
   }
 }
 
-async function actTabMetadata() {
-  const tab = await activeTab();
+async function actTabMetadata(args: Record<string, unknown>) {
+  const tab = await targetTab(args);
   const [exec] = await chrome.scripting.executeScript({
     target: { tabId: tab.id! },
     func: () => ({
@@ -244,7 +362,8 @@ async function actTabMetadata() {
       lang: document.documentElement.lang || "",
     }),
   });
-  return exec?.result ?? null;
+  const result = (exec?.result ?? null) as Record<string, unknown> | null;
+  return result ? { ...result, tab_id: tab.id, window_id: tab.windowId } : null;
 }
 
 async function actDomQuery(args: Record<string, unknown>) {
@@ -255,7 +374,7 @@ async function actDomQuery(args: Record<string, unknown>) {
     ? (args.props as string[])
     : ["tag", "text"];
 
-  const tab = await activeTab();
+  const tab = await targetTab(args);
   const [exec] = await chrome.scripting.executeScript({
     target: { tabId: tab.id! },
     args: [{ selector, root, limit, props }],
@@ -310,7 +429,7 @@ async function actDomInject(args: Record<string, unknown>) {
     typeof args.position === "string" ? (args.position as InsertPosition) : "beforeend";
   if (!selector || !html) throw new Error("dom_inject: selector and html required");
 
-  const tab = await activeTab();
+  const tab = await targetTab(args);
   const [exec] = await chrome.scripting.executeScript({
     target: { tabId: tab.id! },
     args: [{ selector, html, position: positionRaw }],
@@ -337,7 +456,7 @@ async function actDomSet(args: Record<string, unknown>) {
   const value = typeof args.value === "string" ? args.value : "";
   if (!selector) throw new Error("dom_set: selector required");
 
-  const tab = await activeTab();
+  const tab = await targetTab(args);
   const [exec] = await chrome.scripting.executeScript({
     target: { tabId: tab.id! },
     args: [{ selector, prop, value }],
@@ -370,7 +489,7 @@ async function actDomClick(args: Record<string, unknown>) {
   const selector = typeof args.selector === "string" ? args.selector : "";
   if (!selector) throw new Error("dom_click: selector required");
 
-  const tab = await activeTab();
+  const tab = await targetTab(args);
   const [exec] = await chrome.scripting.executeScript({
     target: { tabId: tab.id! },
     args: [{ selector }],
@@ -384,10 +503,292 @@ async function actDomClick(args: Record<string, unknown>) {
   return exec?.result ?? { ok: false, reason: "no result" };
 }
 
+async function actPageSnapshot(args: Record<string, unknown>) {
+  const rawLimit = intArg(args, "limit") ?? 120;
+  const limit = Math.max(1, Math.min(rawLimit, 250));
+  const tab = await targetTab(args);
+  const [exec] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id! },
+    args: [{ limit }],
+    func: (a: { limit: number }) => {
+      const escapeCss = (value: string) => {
+        const css = globalThis.CSS as { escape?: (v: string) => string } | undefined;
+        return css?.escape ? css.escape(value) : value.replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+      };
+      const escapeAttr = (value: string) =>
+        value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      const oneLine = (value: string, max = 240) => {
+        const text = value.replace(/\s+/g, " ").trim();
+        return text.length > max ? `${text.slice(0, max)}...` : text;
+      };
+      const isVisible = (el: Element) => {
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 1 || rect.height < 1) return false;
+        if (
+          rect.bottom < 0 ||
+          rect.right < 0 ||
+          rect.top > window.innerHeight ||
+          rect.left > window.innerWidth
+        ) {
+          return false;
+        }
+        const style = window.getComputedStyle(el);
+        if (
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          Number(style.opacity) === 0
+        ) {
+          return false;
+        }
+        if ((el as HTMLElement).hidden || el.getAttribute("aria-hidden") === "true") {
+          return false;
+        }
+        return true;
+      };
+      const roleFor = (el: HTMLElement) => {
+        const explicit = el.getAttribute("role");
+        if (explicit) return explicit;
+        const tag = el.tagName.toLowerCase();
+        if (tag === "a") return "link";
+        if (tag === "button" || tag === "summary") return "button";
+        if (tag === "textarea") return "textbox";
+        if (tag === "select") return "combobox";
+        if (tag === "input") {
+          const type = (el as HTMLInputElement).type || "text";
+          if (type === "checkbox" || type === "radio") return type;
+          if (type === "submit" || type === "button") return "button";
+          return "textbox";
+        }
+        if (/^h[1-6]$/.test(tag)) return "heading";
+        if (tag === "li") return "listitem";
+        if (tag === "td" || tag === "th") return "cell";
+        if (tag === "label") return "label";
+        return "text";
+      };
+      const nameFor = (el: HTMLElement) => {
+        const aria = el.getAttribute("aria-label") || el.getAttribute("title") || "";
+        if (aria.trim()) return oneLine(aria);
+        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+          const inputText =
+            el.value ||
+            el.placeholder ||
+            el.getAttribute("name") ||
+            el.getAttribute("type") ||
+            "";
+          if (inputText.trim()) return oneLine(inputText);
+        }
+        if (el instanceof HTMLImageElement && el.alt) return oneLine(el.alt);
+        return oneLine(el.innerText || el.textContent || "");
+      };
+      const unique = (selector: string, el: Element) => {
+        try {
+          const matches = document.querySelectorAll(selector);
+          return matches.length === 1 && matches[0] === el;
+        } catch {
+          return false;
+        }
+      };
+      const selectorFor = (el: HTMLElement) => {
+        const tag = el.tagName.toLowerCase();
+        if (el.id) {
+          const selector = `#${escapeCss(el.id)}`;
+          if (unique(selector, el)) return selector;
+        }
+        for (const attr of ["data-testid", "data-test", "data-cy", "aria-label", "name"]) {
+          const value = el.getAttribute(attr);
+          if (!value) continue;
+          const selector = `${tag}[${attr}="${escapeAttr(value)}"]`;
+          if (unique(selector, el)) return selector;
+        }
+        const parts: string[] = [];
+        let cur: Element | null = el;
+        while (cur && cur.nodeType === Node.ELEMENT_NODE) {
+          const curTag = cur.tagName.toLowerCase();
+          if (cur instanceof HTMLElement && cur.id) {
+            const idSelector = `#${escapeCss(cur.id)}`;
+            if (unique(idSelector, cur)) {
+              parts.unshift(idSelector);
+              break;
+            }
+          }
+          if (cur === document.body) {
+            parts.unshift("body");
+            break;
+          }
+          if (cur === document.documentElement) {
+            parts.unshift("html");
+            break;
+          }
+          const siblings = Array.from(cur.parentElement?.children ?? []).filter(
+            (child) => child.tagName === cur!.tagName,
+          );
+          const index = Math.max(1, siblings.indexOf(cur) + 1);
+          parts.unshift(`${curTag}:nth-of-type(${index})`);
+          cur = cur.parentElement;
+        }
+        return parts.join(" > ");
+      };
+
+      const interactive = [
+        "a[href]",
+        "button",
+        "input:not([type='hidden'])",
+        "textarea",
+        "select",
+        "summary",
+        "[role]",
+        "[contenteditable='true']",
+        "[onclick]",
+        "[tabindex]:not([tabindex='-1'])",
+      ].join(",");
+      const readable = "h1,h2,h3,h4,h5,h6,p,li,blockquote,td,th,label";
+      const nodes = Array.from(
+        document.querySelectorAll(`${interactive},${readable}`),
+      ) as HTMLElement[];
+      const seenSelectors = new Set<string>();
+      const seenText = new Set<string>();
+      const items: SnapshotRawItem[] = [];
+
+      for (const el of nodes) {
+        if (items.length >= a.limit) break;
+        if (!isVisible(el)) continue;
+        const role = roleFor(el);
+        const name = nameFor(el);
+        const interactiveRole = !["text", "heading", "listitem", "cell", "label"].includes(role);
+        if (!name && !interactiveRole) continue;
+        if (!interactiveRole && name.length < 2) continue;
+        const selector = selectorFor(el);
+        if (!selector || seenSelectors.has(selector)) continue;
+        const textKey = `${role}|${name}`;
+        if (!interactiveRole && seenText.has(textKey)) continue;
+        seenSelectors.add(selector);
+        seenText.add(textKey);
+        const rect = el.getBoundingClientRect();
+        const tag = el.tagName.toLowerCase();
+        const key = `${role}|${selector}|${name.slice(0, 120)}`;
+        items.push({
+          ref: `e${items.length + 1}`,
+          role,
+          tag,
+          name,
+          selector,
+          is_new: false,
+          rect: {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            w: Math.round(rect.width),
+            h: Math.round(rect.height),
+          },
+          key,
+        });
+      }
+      return { url: location.href, title: document.title, items };
+    },
+  });
+
+  const page = exec?.result as SnapshotPageResult | undefined;
+  if (!page) return { snapshot_id: "", tab_id: tab.id, window_id: tab.windowId, items: [] };
+
+  const previousStore = lastSnapshotKeysByTab.get(tab.id!);
+  const previous = previousStore?.url === page.url ? previousStore.keys : new Set<string>();
+  const currentKeys = new Set<string>();
+  const selectors: Record<string, string> = {};
+  const items = page.items.map((item) => {
+    const key = item.key || `${item.role}|${item.selector}|${item.name}`;
+    currentKeys.add(key);
+    selectors[item.ref] = item.selector;
+    return {
+      ref: item.ref,
+      role: item.role,
+      tag: item.tag,
+      name: item.name,
+      selector: item.selector,
+      is_new: !previous.has(key),
+      rect: item.rect,
+    };
+  });
+  lastSnapshotKeysByTab.set(tab.id!, { url: page.url, keys: currentKeys });
+
+  const snapshotId = `${tab.id}-${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2, 7)}`;
+  snapshotStores.set(snapshotId, {
+    tabId: tab.id!,
+    url: page.url,
+    selectors,
+    createdAt: Date.now(),
+  });
+  pruneSnapshotStores();
+
+  const lines = items.map((item) => {
+    const mark = item.is_new ? "*" : " ";
+    const label = JSON.stringify(item.name || item.role);
+    const rect = `${item.rect.x},${item.rect.y} ${item.rect.w}x${item.rect.h}`;
+    return `${mark}[${item.ref}] ${item.role}<${item.tag}> ${label} @${rect}`;
+  });
+
+  return {
+    snapshot_id: snapshotId,
+    tab_id: tab.id,
+    window_id: tab.windowId,
+    url: page.url,
+    title: page.title,
+    items,
+    lines,
+  };
+}
+
+async function actPageClickRef(args: Record<string, unknown>) {
+  const snapshotId = typeof args.snapshot_id === "string" ? args.snapshot_id : "";
+  const ref = typeof args.ref === "string" ? args.ref : "";
+  if (!snapshotId || !ref) throw new Error("page_click_ref: snapshot_id and ref required");
+  const store = snapshotStores.get(snapshotId);
+  if (!store) throw new Error(`page_click_ref: snapshot not found or expired: ${snapshotId}`);
+  const explicitTabId = intArg(args, "tab_id", "tabId");
+  if (explicitTabId !== undefined && explicitTabId !== store.tabId) {
+    throw new Error(`page_click_ref: snapshot belongs to tab ${store.tabId}`);
+  }
+  const selector = store.selectors[ref];
+  if (!selector) throw new Error(`page_click_ref: ref not found in snapshot: ${ref}`);
+
+  const tab = await chrome.tabs.get(store.tabId);
+  if (!tab?.id) throw new Error(`page_click_ref: tab not found: ${store.tabId}`);
+  if (tab.url && store.url && tab.url !== store.url) {
+    throw new Error("page_click_ref: snapshot is stale because the tab URL changed");
+  }
+  const [exec] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    args: [{ selector }],
+    func: (a: { selector: string }) => {
+      const el = document.querySelector(a.selector) as HTMLElement | null;
+      if (!el) return { ok: false, reason: "selector no longer found", selector: a.selector };
+      el.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
+      try {
+        el.focus({ preventScroll: true });
+      } catch {
+        /* not focusable */
+      }
+      el.click();
+      const rect = el.getBoundingClientRect();
+      return {
+        ok: true,
+        selector: a.selector,
+        rect: {
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          w: Math.round(rect.width),
+          h: Math.round(rect.height),
+        },
+      };
+    },
+  });
+  return exec?.result ?? { ok: false, reason: "no result", selector };
+}
+
 async function actTabNavigate(args: Record<string, unknown>) {
   const url = typeof args.url === "string" ? args.url : "";
   if (!url) throw new Error("tab_navigate: url required");
-  const tab = await activeTab();
+  const tab = await targetTab(args);
   await chrome.tabs.update(tab.id!, { url });
   return { ok: true, tab_id: tab.id, url };
 }
@@ -555,12 +956,10 @@ async function runProactive(tabId: number) {
   proactiveLastFire.set(url, Date.now());
 
   // 读 V 当前翻译档位 (chrome.storage.local 由 content widget 设置).
-  let translationMode = "bilingual";
+  let translationMode: "off" | "bilingual" | "replace" = "bilingual";
   try {
     const got = await chrome.storage.local.get("babata.translation_mode");
-    if (got["babata.translation_mode"]) {
-      translationMode = got["babata.translation_mode"] as string;
-    }
+    translationMode = normalizeTranslationMode(got["babata.translation_mode"]);
   } catch {
     /* default bilingual */
   }
@@ -573,6 +972,7 @@ async function runProactive(tabId: number) {
         url,
         title: tab.title ?? "",
         tab_id: tabId,
+        window_id: tab.windowId,
         translation_mode: translationMode,
       }),
     });
@@ -589,6 +989,13 @@ chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
 
 chrome.tabs.onActivated.addListener((info) => {
   scheduleProactive(info.tabId);
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  lastSnapshotKeysByTab.delete(tabId);
+  for (const [snapshotId, store] of snapshotStores) {
+    if (store.tabId === tabId) snapshotStores.delete(snapshotId);
+  }
 });
 
 chrome.commands.onCommand.addListener(async (command, tab) => {
