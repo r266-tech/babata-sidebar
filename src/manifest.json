@@ -17,6 +17,19 @@
   },
   "content_scripts": [
     {
+      "matches": ["*://*.youtube.com/*", "*://*.youtube-nocookie.com/*"],
+      "js": ["src/content/youtube-subtitles.ts"],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["*://*.youtube.com/*", "*://*.youtube-nocookie.com/*"],
+      "js": ["src/content/youtube-subtitles-main.ts"],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "MAIN"
+    },
+    {
       "matches": ["<all_urls>"],
       "js": ["src/content/babata-widget.ts"],
       "run_at": "document_idle",
