@@ -93,6 +93,98 @@ html, body, #app {
 .bbt-md th { background: rgba(0,0,0,0.04); font-weight: 600; }
 .bbt-md img { max-width: 100%; height: auto; border-radius: 4px; }
 
+.bbt-tools {
+  margin-top: 0.45rem;
+  max-width: 100%;
+}
+
+.bbt-tools-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-height: 1.5rem;
+  padding: 0.18rem 0.45rem;
+  border: 1px solid var(--bbt-border);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.025);
+  color: var(--bbt-muted);
+  font-size: 11px;
+  line-height: 1;
+  transition: background .12s, color .12s;
+}
+
+.bbt-tools-toggle:hover {
+  background: rgba(0, 0, 0, 0.055);
+  color: var(--bbt-fg);
+}
+
+.bbt-tools-list {
+  margin-top: 0.45rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  width: min(100%, 620px);
+}
+
+.bbt-tool-card {
+  border: 1px solid var(--bbt-border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.62);
+  overflow: hidden;
+}
+
+.bbt-tool-card.bbt-tool-error {
+  border-color: #e3b5a4;
+  background: #fff7f3;
+}
+
+.bbt-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.42rem 0.55rem;
+  border-bottom: 1px solid var(--bbt-border);
+  font-size: 11px;
+}
+
+.bbt-tool-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.bbt-tool-status {
+  color: var(--bbt-subtle);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: nowrap;
+}
+
+.bbt-tool-pre {
+  margin: 0;
+  padding: 0.55rem;
+  max-height: 180px;
+  overflow: auto;
+  border-bottom: 1px solid var(--bbt-border);
+  color: #383633;
+  background: rgba(0, 0, 0, 0.018);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.bbt-tool-pre:last-child {
+  border-bottom: 0;
+}
+
+.bbt-tool-result {
+  background: rgba(0, 0, 0, 0.035);
+}
+
 /* Scrollbar — 跟 Anthropic 一样几乎隐形. */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 3px; }

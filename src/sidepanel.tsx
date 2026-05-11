@@ -14,10 +14,25 @@ type Attachment = {
   preview_url?: string;
 };
 
+type ToolTraceStatus = "running" | "done" | "error";
+
+type ToolTrace = {
+  id: string;
+  name: string;
+  input?: unknown;
+  result?: string;
+  status: ToolTraceStatus;
+  is_error?: boolean;
+  started_at?: number;
+  ended_at?: number;
+  duration_ms?: number;
+};
+
 type Msg = {
   role: "user" | "assistant";
   text: string;
   attachments?: Attachment[];
+  tools?: ToolTrace[];
 };
 
 type LightContext = {
@@ -35,8 +50,8 @@ const SIDEPANEL_PORT = "babata-sidepanel";
 
 type ServerEvent =
   | { type: "text_delta"; text: string }
-  | { type: "tool_use"; name: string; input?: unknown }
-  | { type: "tool_result"; is_error?: boolean; text?: string }
+  | { type: "tool_use"; trace_id?: string; name: string; input?: unknown }
+  | { type: "tool_result"; trace_id?: string; is_error?: boolean; text?: string }
   | { type: "session"; session_id: string }
   | { type: "done" }
   | { type: "error"; text: string };
@@ -63,6 +78,96 @@ function MarkdownView(props: { text: string; placeholder?: string }) {
     }
   }, [props.text, props.placeholder]);
   return <div ref={ref} class="bbt-md" />;
+}
+
+function toolStatus(t: ToolTrace): ToolTraceStatus {
+  if (t.status === "error" || t.is_error) return "error";
+  if (t.status === "done") return "done";
+  return "running";
+}
+
+function toolPayloadText(value: unknown): string {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function clippedToolPayload(value: unknown): string {
+  const text = toolPayloadText(value);
+  if (text.length <= 8000) return text;
+  return `${text.slice(0, 8000)}\n... [truncated ${text.length - 8000} chars]`;
+}
+
+function normalizeToolTrace(raw: unknown): ToolTrace[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+    .map((item, i) => ({
+      id: typeof item.id === "string" ? item.id : `history-tool-${i + 1}`,
+      name: typeof item.name === "string" ? item.name : "tool",
+      input: item.input,
+      result: typeof item.result === "string" ? item.result : undefined,
+      status:
+        item.status === "done" || item.status === "error" || item.status === "running"
+          ? item.status
+          : item.is_error
+            ? "error"
+            : "done",
+      is_error: item.is_error === true,
+      started_at: typeof item.started_at === "number" ? item.started_at : undefined,
+      ended_at: typeof item.ended_at === "number" ? item.ended_at : undefined,
+      duration_ms: typeof item.duration_ms === "number" ? item.duration_ms : undefined,
+    }));
+}
+
+function ToolTracePanel(props: { tools: ToolTrace[]; show: boolean; onToggle: () => void }) {
+  const count = props.tools.length;
+  if (count === 0) return null;
+  return (
+    <div class="bbt-tools">
+      <button
+        class="bbt-tools-toggle"
+        onClick={props.onToggle}
+        title={props.show ? "隐藏工具调用过程" : "显示工具调用过程"}
+      >
+        <svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+          <path
+            d="M5.2 2.4h3.6M4.1 5h5.8M3.2 7.6h7.6M5.2 10.2h3.6"
+            stroke="currentColor"
+            stroke-width="1.25"
+            stroke-linecap="round"
+          />
+        </svg>
+        <span>{props.show ? "隐藏工具调用" : `工具调用 ${count}`}</span>
+      </button>
+      {props.show && (
+        <div class="bbt-tools-list">
+          {props.tools.map((tool) => {
+            const status = toolStatus(tool);
+            const inputText = clippedToolPayload(tool.input);
+            const resultText = clippedToolPayload(tool.result);
+            return (
+              <div key={tool.id} class={`bbt-tool-card bbt-tool-${status}`}>
+                <div class="bbt-tool-head">
+                  <span class="bbt-tool-name">{tool.name}</span>
+                  <span class="bbt-tool-status">
+                    {status === "running" ? "running" : status === "error" ? "error" : "done"}
+                    {tool.duration_ms !== undefined ? ` · ${tool.duration_ms}ms` : ""}
+                  </span>
+                </div>
+                {inputText && <pre class="bbt-tool-pre">{inputText}</pre>}
+                {resultText && <pre class="bbt-tool-pre bbt-tool-result">{resultText}</pre>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function classifyAttachment(file: File): Attachment["kind"] {
@@ -137,10 +242,25 @@ function App() {
   const [selection, setSelection] = useState<string>("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+  const [showTools, setShowTools] = useState(() => {
+    try {
+      return window.localStorage.getItem("bbt-show-tools") === "1";
+    } catch {
+      return false;
+    }
+  });
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lastSentUrl = useRef<string>("");
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("bbt-show-tools", showTools ? "1" : "0");
+    } catch {
+      /* ignore storage failures */
+    }
+  }, [showTools]);
 
   useEffect(() => {
     let port: chrome.runtime.Port | null = null;
@@ -221,7 +341,10 @@ function App() {
     let cancelled = false;
     fetch(`${SERVER}/history?limit=200`)
       .then((r) => r.json())
-      .then((data: { ok?: boolean; turns?: Array<{ role: string; text: string }> }) => {
+      .then((data: {
+        ok?: boolean;
+        turns?: Array<{ role: string; text: string; tool_trace?: unknown }>;
+      }) => {
         if (cancelled || !data.ok) return;
         const turns = data.turns ?? [];
         const restored: Msg[] = turns
@@ -229,6 +352,7 @@ function App() {
           .map((t) => ({
             role: t.role as "user" | "assistant",
             text: t.text ?? "",
+            tools: normalizeToolTrace(t.tool_trace),
           }));
         if (restored.length > 0) setMsgs(restored);
       })
@@ -294,7 +418,7 @@ function App() {
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [msgs]);
+  }, [msgs, showTools]);
 
   async function ingestFile(file: File) {
     if (file.size > 50 * 1024 * 1024) {
@@ -388,12 +512,71 @@ function App() {
     abortRef.current = ctrl;
 
     let accum = "";
-    const appendAssistant = (chunk: string) => {
-      accum += chunk;
+    const updateLastAssistant = (fn: (msg: Msg) => Msg) => {
       setMsgs((m) => {
         const last = m[m.length - 1];
         if (!last || last.role !== "assistant") return m;
-        return [...m.slice(0, -1), { ...last, text: accum }];
+        return [...m.slice(0, -1), fn(last)];
+      });
+    };
+    const appendAssistant = (chunk: string) => {
+      accum += chunk;
+      updateLastAssistant((last) => ({ ...last, text: accum }));
+    };
+    const appendToolUse = (ev: Extract<ServerEvent, { type: "tool_use" }>) => {
+      const id = ev.trace_id || `live-tool-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      updateLastAssistant((last) => ({
+        ...last,
+        tools: [
+          ...(last.tools ?? []),
+          {
+            id,
+            name: ev.name,
+            input: ev.input,
+            status: "running",
+            started_at: Date.now() / 1000,
+          },
+        ],
+      }));
+    };
+    const appendToolResult = (ev: Extract<ServerEvent, { type: "tool_result" }>) => {
+      updateLastAssistant((last) => {
+        const tools = [...(last.tools ?? [])];
+        let idx = ev.trace_id ? tools.findIndex((t) => t.id === ev.trace_id) : -1;
+        if (idx === -1) {
+          for (let i = tools.length - 1; i >= 0; i -= 1) {
+            if (toolStatus(tools[i]) === "running") {
+              idx = i;
+              break;
+            }
+          }
+        }
+        const endedAt = Date.now() / 1000;
+        if (idx === -1) {
+          tools.push({
+            id: ev.trace_id || `live-result-${Date.now()}`,
+            name: "tool_result",
+            status: ev.is_error ? "error" : "done",
+            is_error: ev.is_error,
+            result: ev.text ?? "",
+            ended_at: endedAt,
+          });
+        } else {
+          const current = tools[idx];
+          const duration =
+            typeof current.started_at === "number"
+              ? Math.max(0, Math.round((endedAt - current.started_at) * 1000))
+              : current.duration_ms;
+          tools[idx] = {
+            ...current,
+            status: ev.is_error ? "error" : "done",
+            is_error: ev.is_error,
+            result: ev.text ?? "",
+            ended_at: endedAt,
+            duration_ms: duration,
+          };
+        }
+        return { ...last, tools };
       });
     };
 
@@ -448,6 +631,10 @@ function App() {
           }
           if (ev.type === "text_delta" && typeof ev.text === "string") {
             appendAssistant(ev.text);
+          } else if (ev.type === "tool_use" && typeof ev.name === "string") {
+            appendToolUse(ev);
+          } else if (ev.type === "tool_result") {
+            appendToolResult(ev);
           } else if (ev.type === "error" && typeof ev.text === "string") {
             appendAssistant(`\n\n[err] ${ev.text}`);
           }
@@ -602,6 +789,13 @@ function App() {
                 text={m.text}
                 placeholder={streaming && i === msgs.length - 1 ? "…" : ""}
               />
+              {m.tools && m.tools.length > 0 && (
+                <ToolTracePanel
+                  tools={m.tools}
+                  show={showTools}
+                  onToggle={() => setShowTools((v) => !v)}
+                />
+              )}
               {m.text && (!streaming || i !== msgs.length - 1) && (
                 <div class="flex gap-1 mt-1.5 -ml-1 opacity-0 group-hover:opacity-100 transition-opacity">
                   <button
