@@ -9,7 +9,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "smoke:rich-card": "node scripts/smoke-rich-card.mjs"
+    "smoke:sidebar": "node scripts/smoke-sidebar.mjs",
+    "smoke:rich-card": "node scripts/smoke-rich-card.mjs",
+    "smoke": "npm run smoke:sidebar && npm run smoke:rich-card"
   },
   "dependencies": {
     "@types/dompurify": "^3.0.5",
