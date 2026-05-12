@@ -3,6 +3,7 @@ const EXT_ID = process.env.BABATA_EXTENSION_ID || "giaglakcelnaklncmnhnpbmkfiffa
 const EXT_ORIGIN = `chrome-extension://${EXT_ID}`;
 const RUN_ID = `SMOKE_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 const HTTP_TIMEOUT_MS = Number(process.env.BABATA_LLM_SMOKE_HTTP_TIMEOUT_MS || "180000");
+const TRANSLATE_TIMEOUT_MS = Number(process.env.BABATA_LLM_SMOKE_TRANSLATE_TIMEOUT_MS || "180000");
 const CLEAN_READ_TIMEOUT_MS = Number(process.env.BABATA_LLM_SMOKE_CLEAN_TIMEOUT_MS || "180000");
 
 function assert(condition, message, detail) {
@@ -72,6 +73,32 @@ async function smokeChat() {
     events,
   });
   return { expected, reply_chars: reply.length };
+}
+
+async function smokeTranslate() {
+  const hash = `translate_${RUN_ID}`;
+  const source = `Babata translate smoke ${RUN_ID}: The browser sidebar should translate text without any router provider.`;
+  const { res, text } = await request("/translate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    timeout_ms: TRANSLATE_TIMEOUT_MS,
+    body: JSON.stringify({
+      site: "babata-smoke",
+      url: `https://babata.local/translate-smoke/${RUN_ID}`,
+      target: "zh",
+      batch: [{ hash, text: source }],
+    }),
+  });
+  assert(res.status === 200, "/translate should return 200", { status: res.status, text: text.slice(0, 1000) });
+  const payload = JSON.parse(text);
+  assert(payload.ok === true, "/translate did not return ok", payload);
+  const item = (payload.results || []).find((result) => result.hash === hash);
+  assert(item && typeof item.translated === "string" && item.translated.trim(), "/translate returned no text", payload);
+  assert(item.translated.trim() !== source, "/translate returned the source unchanged", {
+    source,
+    translated: item.translated,
+  });
+  return { translated_chars: item.translated.length };
 }
 
 function smokeArticleText() {
@@ -146,8 +173,9 @@ async function main() {
   const health = await request("/health", { method: "GET", timeout_ms: 10000 });
   assert(health.res.status === 200, "health failed", { status: health.res.status, text: health.text });
   const chat = await smokeChat();
+  const translate = await smokeTranslate();
   const clean_read = await smokeCleanRead();
-  console.log(JSON.stringify({ ok: true, run_id: RUN_ID, chat, clean_read }, null, 2));
+  console.log(JSON.stringify({ ok: true, run_id: RUN_ID, chat, translate, clean_read }, null, 2));
 }
 
 main().catch((err) => {
