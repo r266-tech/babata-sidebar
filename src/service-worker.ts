@@ -39,6 +39,26 @@ type SnapshotPageResult = {
   title: string;
   items: SnapshotRawItem[];
 };
+type ProactiveIntent = "prompt_suggestions" | "agent_view";
+type ArticleParagraph = {
+  id: string;
+  type: string;
+  text: string;
+};
+type ArticleExtractResult = {
+  url: string;
+  title: string;
+  site_title: string;
+  byline: string;
+  published_at: string;
+  lang: string;
+  excerpt: string;
+  text: string;
+  markdown: string;
+  paragraphs: ArticleParagraph[];
+  char_count: number;
+  extraction_method: string;
+};
 
 const lastSnapshotKeysByTab = new Map<number, { url: string; keys: Set<string> }>();
 const snapshotStores = new Map<string, SnapshotStore>();
@@ -104,6 +124,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (m.type === "babata.ws.inbound" && typeof m.payload === "string") {
     handleWsInbound(m.payload).then(() => sendResponse?.({ ok: true }));
     return true;
+  }
+
+  if (m.type === "babata.current_tab_context") {
+    const tab = sender.tab;
+    sendResponse?.({
+      ok: !!tab?.id,
+      tab_id: tab?.id,
+      window_id: tab?.windowId,
+      url: tab?.url ?? "",
+      title: tab?.title ?? "",
+    });
+    return false;
   }
 
   // page-side 推 attention/viewport state → forward 到 server /attention 写 events.jsonl.
@@ -190,6 +222,46 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // page widget 主动触发: 单击要 prompt chips, 双击要桌宠锐评.
+  // 复用 server /proactive endpoint, 但用 intent 明确语义.
+  if (m.type === "babata.suggest_prompts" || m.type === "babata.agent_view") {
+    void (async () => {
+      try {
+        const tabId = sender.tab?.id;
+        if (tabId === undefined) {
+          sendResponse?.({ ok: false, error: "no sender tab" });
+          return;
+        }
+        const intent: ProactiveIntent =
+          m.type === "babata.agent_view" ? "agent_view" : "prompt_suggestions";
+        const ok = await requestProactive(tabId, intent);
+        sendResponse?.({ ok });
+      } catch (e) {
+        sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
+      }
+    })();
+    return true;
+  }
+
+  // page widget 三击头像 — 净化阅读当前文章. 扩展先抽取正文, server 再做 LLM
+  // 保真重构/锐评, 结果通过 notification 回 sidepanel.
+  if (m.type === "babata.clean_read") {
+    void (async () => {
+      try {
+        const tabId = sender.tab?.id;
+        if (tabId === undefined) {
+          sendResponse?.({ ok: false, error: "no sender tab" });
+          return;
+        }
+        const ok = await requestCleanRead(tabId);
+        sendResponse?.({ ok });
+      } catch (e) {
+        sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
+      }
+    })();
+    return true;
+  }
+
   return false;
 });
 
@@ -232,6 +304,19 @@ async function dispatchNotification(action: string, args: Record<string, unknown
         (e as Error)?.message ?? e,
       );
       return;
+    }
+  }
+
+  if (action.startsWith("clean_read_")) {
+    try {
+      const tab = await targetTab(args);
+      await chrome.tabs.sendMessage(tab.id!, message);
+    } catch (e) {
+      console.debug(
+        "[babata-sw] clean_read page notification dropped:",
+        action,
+        (e as Error)?.message ?? e,
+      );
     }
   }
 
@@ -900,6 +985,179 @@ async function actHistorySearch(args: Record<string, unknown>) {
   }));
 }
 
+async function extractArticleFromTab(tabId: number): Promise<ArticleExtractResult> {
+  const [exec] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      type P = { id: string; type: string; text: string };
+      const oneLine = (value: string, max = 280) => {
+        const text = value.replace(/\s+/g, " ").trim();
+        return text.length > max ? `${text.slice(0, max)}...` : text;
+      };
+      const meta = (...names: string[]) => {
+        for (const name of names) {
+          const el = document.querySelector(
+            `meta[name="${name}"],meta[property="${name}"]`,
+          ) as HTMLMetaElement | null;
+          const value = el?.content?.trim();
+          if (value) return value;
+        }
+        return "";
+      };
+      const isHidden = (el: Element) => {
+        if ((el as HTMLElement).hidden || el.getAttribute("aria-hidden") === "true") {
+          return true;
+        }
+        const style = window.getComputedStyle(el);
+        return (
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          Number(style.opacity) === 0
+        );
+      };
+      const textOf = (el: Element) => (el.textContent || "").replace(/\s+/g, " ").trim();
+      const linkTextLen = (el: Element) =>
+        Array.from(el.querySelectorAll("a")).reduce(
+          (sum, a) => sum + textOf(a).length,
+          0,
+        );
+      const scoreCandidate = (el: Element) => {
+        const text = textOf(el);
+        if (text.length < 300) return 0;
+        const pCount = el.querySelectorAll("p").length;
+        const headingCount = el.querySelectorAll("h1,h2,h3").length;
+        const mediaCount = el.querySelectorAll("img,figure,pre,blockquote").length;
+        const linkRatio = linkTextLen(el) / Math.max(text.length, 1);
+        const chromeCount = el.querySelectorAll(
+          "nav,footer,aside,form,button,input,select,textarea,[role='navigation'],[role='banner'],[role='contentinfo']",
+        ).length;
+        return (
+          text.length +
+          pCount * 220 +
+          headingCount * 80 +
+          mediaCount * 35 -
+          linkRatio * text.length * 0.75 -
+          chromeCount * 120
+        );
+      };
+      const candidateSelectors = [
+        "article",
+        "main",
+        "[role='main']",
+        "[itemprop='articleBody']",
+        "[class*='article' i]",
+        "[id*='article' i]",
+        "[class*='content' i]",
+        "[id*='content' i]",
+        "body",
+      ];
+      const candidates = candidateSelectors
+        .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+        .filter((el, i, arr) => arr.indexOf(el) === i && !isHidden(el));
+      const root =
+        candidates
+          .map((el) => ({ el, score: scoreCandidate(el) }))
+          .sort((a, b) => b.score - a.score)[0]?.el || document.body;
+      const clone = root.cloneNode(true) as HTMLElement;
+      clone
+        .querySelectorAll(
+          [
+            "script",
+            "style",
+            "link",
+            "noscript",
+            "svg",
+            "nav",
+            "footer",
+            "aside",
+            "form",
+            "button",
+            "input",
+            "select",
+            "textarea",
+            "iframe",
+            "canvas",
+            "video",
+            "audio",
+            "[hidden]",
+            "[aria-hidden='true']",
+            "[role='navigation']",
+            "[role='banner']",
+            "[role='contentinfo']",
+            "[role='complementary']",
+          ].join(","),
+        )
+        .forEach((el) => el.remove());
+
+      const blocks = Array.from(
+        clone.querySelectorAll("h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,figcaption"),
+      );
+      const paragraphs: P[] = [];
+      const seen = new Set<string>();
+      const push = (type: string, text: string) => {
+        const cleaned = text.replace(/\s+\n/g, "\n").replace(/\n\s+/g, "\n").trim();
+        if (!cleaned) return;
+        if (type !== "heading" && type !== "code" && cleaned.length < 12) return;
+        const key = `${type}|${cleaned.slice(0, 180)}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        paragraphs.push({ id: `p${paragraphs.length + 1}`, type, text: cleaned });
+      };
+
+      for (const block of blocks) {
+        const tag = block.tagName.toLowerCase();
+        const raw = block.textContent || "";
+        if (/^h[1-6]$/.test(tag)) push("heading", oneLine(raw, 220));
+        else if (tag === "li") push("list", oneLine(raw, 500));
+        else if (tag === "blockquote") push("quote", oneLine(raw, 900));
+        else if (tag === "pre") push("code", raw.trim().slice(0, 1600));
+        else if (tag === "figcaption") push("caption", oneLine(raw, 500));
+        else push("paragraph", oneLine(raw, 1200));
+        if (paragraphs.reduce((sum, p) => sum + p.text.length, 0) > 70_000) break;
+      }
+
+      if (paragraphs.length < 3) {
+        const fallback = textOf(clone || document.body);
+        for (const chunk of fallback.split(/(?<=[。！？.!?])\s+|\n{2,}/).slice(0, 80)) {
+          push("paragraph", oneLine(chunk, 1200));
+        }
+      }
+
+      const markdown = paragraphs
+        .map((p) => {
+          if (p.type === "heading") return `\n## ${p.text}\n`;
+          if (p.type === "list") return `- ${p.text}`;
+          if (p.type === "quote") return `> ${p.text}`;
+          if (p.type === "code") return `\n\`\`\`\n${p.text}\n\`\`\`\n`;
+          if (p.type === "caption") return `_图注：${p.text}_`;
+          return p.text;
+        })
+        .join("\n\n")
+        .trim()
+        .slice(0, 70_000);
+      const text = paragraphs.map((p) => `[${p.id}] ${p.text}`).join("\n\n").slice(0, 70_000);
+
+      return {
+        url: location.href,
+        title: document.title || meta("og:title", "twitter:title"),
+        site_title: meta("og:site_name", "application-name"),
+        byline: meta("author", "article:author", "parsely-author"),
+        published_at: meta("article:published_time", "pubdate", "date", "datePublished"),
+        lang: document.documentElement.lang || "",
+        excerpt: meta("description", "og:description", "twitter:description"),
+        text,
+        markdown,
+        paragraphs,
+        char_count: text.length,
+        extraction_method: root === document.body ? "body_score_fallback" : "scored_article_root",
+      };
+    },
+  });
+  const result = exec?.result as ArticleExtractResult | undefined;
+  if (!result) throw new Error("article_extract: no result");
+  return result;
+}
+
 // ── lifecycle ─────────────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -911,33 +1169,17 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.runtime.onStartup.addListener(() => ensureOffscreen());
 
-// ── proactive review trigger ─────────────────────────────────────────
-// V 切 tab / URL 完成加载 → debounce 5s → POST /proactive 让 server cheap LLM
-// 看一眼自决 (翻译 / 推 chip / 静默 — LLM driven, SW 不写死规则).
+// ── manual proactive trigger ─────────────────────────────────────────
+// Widget 单击打开 chat popup 后 → prompt_suggestions;
+// Widget 双击头像唤醒 → agent_view 一句话锐评.
+// 不再在 tab 切换 / URL 完成加载时自动触发.
 
-const PROACTIVE_DEBOUNCE_MS = 5000;
-const PROACTIVE_MIN_GAP_MS = 30_000; // 同一 URL 30s 内不重复触发
-const proactiveLastFire = new Map<string, number>();
-let proactiveTimer: number | null = null;
-let proactivePendingTabId: number | null = null;
-
-function scheduleProactive(tabId: number) {
-  proactivePendingTabId = tabId;
-  if (proactiveTimer !== null) {
-    clearTimeout(proactiveTimer);
-  }
-  proactiveTimer = self.setTimeout(() => {
-    proactiveTimer = null;
-    void runProactive(proactivePendingTabId!);
-  }, PROACTIVE_DEBOUNCE_MS) as unknown as number;
-}
-
-async function runProactive(tabId: number) {
+async function requestProactive(tabId: number, intent: ProactiveIntent): Promise<boolean> {
   let tab: chrome.tabs.Tab;
   try {
     tab = await chrome.tabs.get(tabId);
   } catch {
-    return;
+    return false;
   }
   const url = tab.url ?? "";
   if (
@@ -949,11 +1191,8 @@ async function runProactive(tabId: number) {
     url.startsWith("view-source:") ||
     url.startsWith("file://")
   ) {
-    return;
+    return false;
   }
-  const last = proactiveLastFire.get(url) ?? 0;
-  if (Date.now() - last < PROACTIVE_MIN_GAP_MS) return;
-  proactiveLastFire.set(url, Date.now());
 
   // 读 V 当前翻译档位 (chrome.storage.local 由 content widget 设置).
   let translationMode: "off" | "bilingual" | "replace" = "bilingual";
@@ -974,22 +1213,78 @@ async function runProactive(tabId: number) {
         tab_id: tabId,
         window_id: tab.windowId,
         translation_mode: translationMode,
+        intent,
       }),
     });
+    return true;
   } catch {
     /* server 没起 — 静默 (feedback_self_heal_no_escalate). */
+    return false;
   }
 }
 
-chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
-  if (info.status !== "complete") return;
-  if (!tab.active) return;
-  scheduleProactive(tabId);
-});
+async function requestCleanRead(tabId: number): Promise<boolean> {
+  let tab: chrome.tabs.Tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return false;
+  }
+  const url = tab.url ?? "";
+  if (
+    !url ||
+    url.startsWith("chrome://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("about:") ||
+    url.startsWith("chrome-extension://") ||
+    url.startsWith("view-source:") ||
+    url.startsWith("file://")
+  ) {
+    return false;
+  }
 
-chrome.tabs.onActivated.addListener((info) => {
-  scheduleProactive(info.tabId);
-});
+  const runId = `${tabId}-${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2, 7)}`;
+  void dispatchNotification("clean_read_started", {
+    run_id: runId,
+    url,
+    title: tab.title ?? "",
+    tab_id: tabId,
+    window_id: tab.windowId,
+  });
+
+  try {
+    const article = await extractArticleFromTab(tabId);
+    if (!article.text.trim() || article.char_count < 200) {
+      throw new Error("没抽到足够正文");
+    }
+    const resp = await fetch("http://127.0.0.1:18791/clean_read", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        run_id: runId,
+        url,
+        title: tab.title ?? article.title ?? "",
+        tab_id: tabId,
+        window_id: tab.windowId,
+        article,
+      }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return true;
+  } catch (e) {
+    void dispatchNotification("clean_read_error", {
+      run_id: runId,
+      url,
+      title: tab.title ?? "",
+      error: (e as Error).message ?? String(e),
+      tab_id: tabId,
+      window_id: tab.windowId,
+    });
+    return false;
+  }
+}
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   lastSnapshotKeysByTab.delete(tabId);

@@ -1,22 +1,37 @@
 /// <reference types="chrome" />
 
+import avatarUrl from "../assets/babata-avatar.png";
+
 // babata 桌宠 floating widget — 可拖拽圆形按钮 + 设置弹窗 + 主动 bubble.
 //
 // 哲学: 内容物 LLM 决定 (bubble 文本 / 翻译要不要做), widget 只是容器.
 // Shadow DOM 物理隔离站点 CSS, all:initial 防 site reset 干扰.
 //
 // V0 元素:
-//   主按钮 (drag-able, 点击 = toggle sidebar)
+//   主按钮 (drag-able, 单击 = 打开 page chat popup + prompt chips; 双击 = agent 锐评; 三击 = 净化阅读)
 //   设置按钮 (翻译三档位)
 //   bubble (server 推 mascot_speak 时浮起来, 30s auto-dismiss, V 点 X 关掉)
 
 type TranslationMode = "off" | "bilingual" | "replace";
+type OpenChatPopupOptions = { suggest?: boolean };
+type BubbleOptions = {
+  tone?: "normal" | "thinking";
+  dismissible?: boolean;
+  interactive?: boolean;
+};
 
 const HOST_ID = "__babata_widget_host__";
 const TEARDOWN_EVENT = "babata:widget-teardown";
 const STORAGE_POS = "babata.widget.pos";
 const STORAGE_MODE = "babata.translation_mode";
 const DEFAULT_MODE: TranslationMode = "bilingual";
+const MAIN_SINGLE_CLICK_DELAY_MS = 500;
+const AGENT_VIEW_THINKING_TEXT = "思考中…";
+const CLEAN_READ_THINKING_TEXT = "正在净读…";
+const AGENT_VIEW_THINKING_DURATION_MS = 12_000;
+const BUBBLE_GAP_PX = 12;
+const BUBBLE_VIEWPORT_PADDING_PX = 12;
+const BUBBLE_MAX_WIDTH_PX = 360;
 
 interface WidgetPos {
   right: number;
@@ -24,15 +39,18 @@ interface WidgetPos {
 }
 
 type ChatPopupElement = HTMLDivElement & { cleanup?: () => void };
+type CleanReadOverlayElement = HTMLDivElement & { cleanup?: () => void };
 
 const DEFAULT_POS: WidgetPos = { right: 18, top: 0.5 }; // top 比例 (0-1)
 
 let widgetState: {
   shadow: ShadowRoot;
   root: HTMLDivElement;
+  mainAnchor: HTMLDivElement;
   bubbleSlot: HTMLDivElement;
   bubble: HTMLDivElement | null;
   bubbleHideTimer: number | null;
+  openChatPopup: ((opts?: OpenChatPopupOptions) => void) | null;
   mode: TranslationMode;
   pos: WidgetPos;
 } | null = null;
@@ -76,6 +94,14 @@ function applyPos(root: HTMLElement, pos: WidgetPos) {
   root.style.top = `${pos.top * window.innerHeight}px`;
 }
 
+function refreshBubbleMetrics() {
+  if (!widgetState) return;
+  const anchorRect = widgetState.mainAnchor.getBoundingClientRect();
+  const availableLeft = anchorRect.left - BUBBLE_GAP_PX - BUBBLE_VIEWPORT_PADDING_PX;
+  const maxWidth = Math.max(80, Math.min(BUBBLE_MAX_WIDTH_PX, Math.floor(availableLeft)));
+  widgetState.mainAnchor.style.setProperty("--bubble-max-width", `${maxWidth}px`);
+}
+
 function normalizeMode(v: unknown): TranslationMode {
   if (v === "off") return "off";
   if (v === "auto" || v === "replace") return "replace";
@@ -109,6 +135,16 @@ function svg(d: string, opts: { size?: number; stroke?: number } = {}): SVGSVGEl
   return s;
 }
 
+function avatar(className: string, alt: string): HTMLImageElement {
+  const img = document.createElement("img");
+  const extensionPath = avatarUrl.replace(/^\//, "");
+  img.className = className;
+  img.src = safeChromeCall(() => chrome.runtime.getURL(extensionPath)) ?? avatarUrl;
+  img.alt = alt;
+  img.draggable = false;
+  return img;
+}
+
 function createWidget() {
   // 当前 frame 是顶 frame 才注入 (避免 iframe 内重复 widget).
   if (window.top !== window.self) return;
@@ -132,13 +168,21 @@ function createWidget() {
       flex-direction: column;
       gap: 8px;
       align-items: flex-end;
+      --bubble-gap: ${BUBBLE_GAP_PX}px;
+      --bubble-max-width: min(${BUBBLE_MAX_WIDTH_PX}px, calc(100vw - 96px));
       font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
       color: #1c1c1c;
       pointer-events: auto;
       user-select: none;
     }
+    .main-anchor {
+      position: relative;
+      width: 56px;
+      height: 56px;
+      flex: 0 0 56px;
+    }
     .btn {
-      width: 38px; height: 38px; border-radius: 999px;
+      width: 56px; height: 56px; border-radius: 999px;
       border: 1px solid rgba(0,0,0,.06);
       background: #ffffff;
       box-shadow: 0 4px 14px rgba(0,0,0,.10), 0 1px 3px rgba(0,0,0,.06);
@@ -150,7 +194,18 @@ function createWidget() {
     .btn:hover { background: #faf9f7; box-shadow: 0 6px 18px rgba(0,0,0,.14); }
     .btn:active { transform: scale(.94); }
     .btn.dragging { cursor: grabbing; opacity: .85; }
-    .btn-secondary { width: 32px; height: 32px; }
+    .btn-main {
+      overflow: hidden;
+      padding: 0;
+    }
+    .btn-secondary { width: 50px; height: 50px; }
+    .avatar-main {
+      width: 100%;
+      height: 100%;
+      border-radius: 999px;
+      object-fit: cover;
+      display: block;
+    }
 
     /* secondary 默认折叠 — 仅主按钮可见; hover widget 或弹层打开时浮现.
        仍保留 layout 高度, hover 命中区域稳定不闪烁 (visibility:hidden 占位). */
@@ -197,8 +252,20 @@ function createWidget() {
     }
     .btn-close:hover { background: rgba(0,0,0,.85); transform: scale(1.1); }
 
+    .bubble-slot {
+      position: absolute;
+      right: calc(100% + var(--bubble-gap));
+      top: 0;
+      width: var(--bubble-max-width);
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      pointer-events: none;
+      z-index: 2;
+    }
     .bubble {
-      max-width: 240px;
+      box-sizing: border-box;
+      max-width: 100%;
       background: #1c1c1c;
       color: #f5f1eb;
       padding: 10px 14px;
@@ -208,11 +275,23 @@ function createWidget() {
       box-shadow: 0 6px 20px rgba(0,0,0,.18);
       position: relative;
       cursor: pointer;
+      pointer-events: auto;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      user-select: text;
+    }
+    .bubble-thinking {
+      max-width: 120px;
+      padding: 8px 12px;
+      background: rgba(28,28,28,.92);
+      font-size: 12px;
+      letter-spacing: 0;
+      cursor: default;
     }
     .bubble::after {
       content: "";
       position: absolute;
-      right: -6px; top: 14px;
+      right: -6px; top: 23px;
       width: 0; height: 0;
       border-left: 6px solid #1c1c1c;
       border-top: 5px solid transparent;
@@ -286,7 +365,13 @@ function createWidget() {
       display: flex; align-items: center; gap: 6px;
       font-size: 12.5px; color: #1c1c1c;
     }
-    .chat-popup-header .header-left .logo { color: #c66a4a; flex-shrink: 0; }
+    .chat-popup-header .header-left .avatar-mini {
+      width: 16px;
+      height: 16px;
+      border-radius: 999px;
+      object-fit: cover;
+      flex-shrink: 0;
+    }
     .chat-popup-header .header-left .label { font-weight: 600; }
     .chat-popup-header .header-tools {
       display: flex; gap: 2px;
@@ -303,6 +388,127 @@ function createWidget() {
     .chat-popup iframe {
       flex: 1; width: 100%; border: 0; display: block;
     }
+
+    .clean-read-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 2147483645;
+      background: rgba(250,249,247,.96);
+      display: flex;
+      justify-content: center;
+      align-items: stretch;
+      box-sizing: border-box;
+      padding: 28px;
+      pointer-events: auto;
+      user-select: text;
+    }
+    .clean-read-shell {
+      width: min(920px, 100%);
+      max-height: 100%;
+      background: #fff;
+      border: 1px solid rgba(0,0,0,.08);
+      border-radius: 14px;
+      box-shadow: 0 18px 60px rgba(0,0,0,.18);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .clean-read-head {
+      flex: 0 0 auto;
+      min-height: 46px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px 8px 16px;
+      background: #f3efe6;
+      border-bottom: 1px solid rgba(0,0,0,.06);
+    }
+    .clean-read-title {
+      flex: 1;
+      min-width: 0;
+      font-size: 13px;
+      font-weight: 650;
+      color: #1c1c1c;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .clean-read-actions {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex: 0 0 auto;
+    }
+    .clean-read-btn {
+      height: 30px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: #6e6b66;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 8px;
+      font-size: 12px;
+    }
+    .clean-read-btn:hover { background: rgba(0,0,0,.06); color: #1c1c1c; }
+    .clean-read-icon {
+      width: 30px;
+      padding: 0;
+      font-size: 18px;
+      line-height: 1;
+    }
+    .clean-read-body {
+      flex: 1;
+      overflow: auto;
+      padding: 30px 34px 44px;
+      font-size: 16px;
+      line-height: 1.78;
+      color: #1c1c1c;
+      letter-spacing: 0;
+    }
+    .clean-read-body h1 {
+      margin: 0 0 18px;
+      font-size: 24px;
+      line-height: 1.3;
+      font-weight: 760;
+      letter-spacing: 0;
+    }
+    .clean-read-body h2 {
+      margin: 28px 0 10px;
+      padding-top: 12px;
+      border-top: 1px solid rgba(0,0,0,.08);
+      font-size: 18px;
+      line-height: 1.35;
+      font-weight: 720;
+      letter-spacing: 0;
+    }
+    .clean-read-body p { margin: 0 0 14px; }
+    .clean-read-body ul { margin: 0 0 16px 22px; padding: 0; }
+    .clean-read-body li { margin: 5px 0; padding-left: 2px; }
+    .clean-read-body blockquote {
+      margin: 14px 0;
+      padding: 8px 14px;
+      border-left: 3px solid #c66a4a;
+      background: #faf7f0;
+      color: #3c3832;
+    }
+    .clean-read-body pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      background: #1f1f1f;
+      color: #f5f1eb;
+      border-radius: 8px;
+      padding: 12px 14px;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    @media (max-width: 720px) {
+      .clean-read-overlay { padding: 0; }
+      .clean-read-shell { border-radius: 0; border-left: 0; border-right: 0; }
+      .clean-read-body { padding: 22px 18px 34px; font-size: 15px; }
+    }
   `;
   shadow.appendChild(style);
 
@@ -311,6 +517,7 @@ function createWidget() {
   shadow.appendChild(root);
   const cleanupFns: Array<() => void> = [];
   let chatPopup: ChatPopupElement | null = null;
+  let cleanReadOverlay: CleanReadOverlayElement | null = null;
   let popover: HTMLDivElement | null = null;
   let cleanedUp = false;
 
@@ -321,6 +528,11 @@ function createWidget() {
       chatPopup.cleanup?.();
       chatPopup.remove();
       chatPopup = null;
+    }
+    if (cleanReadOverlay) {
+      cleanReadOverlay.cleanup?.();
+      cleanReadOverlay.remove();
+      cleanReadOverlay = null;
     }
     if (popover) {
       popover.remove();
@@ -357,27 +569,36 @@ function createWidget() {
   });
   root.appendChild(closeWidgetBtn);
 
-  // bubble 容器 (上方)
-  const bubbleSlot = document.createElement("div");
-  bubbleSlot.className = "stack";
-  root.appendChild(bubbleSlot);
-
-  // 按钮组 (下方)
+  // 按钮组
   const btnStack = document.createElement("div");
   btnStack.className = "stack";
   root.appendChild(btnStack);
+
+  // 主头像锚点: bubble 绝对定位到头像左侧, 不参与按钮栈布局.
+  const mainAnchor = document.createElement("div");
+  mainAnchor.className = "main-anchor";
+  btnStack.appendChild(mainAnchor);
+
+  const bubbleSlot = document.createElement("div");
+  bubbleSlot.className = "bubble-slot";
+  mainAnchor.appendChild(bubbleSlot);
 
   // 初始化 state — 先用 default, async load 后 apply.
   widgetState = {
     shadow,
     root,
+    mainAnchor,
     bubbleSlot,
     bubble: null,
     bubbleHideTimer: null,
+    openChatPopup: null,
     mode: DEFAULT_MODE,
     pos: DEFAULT_POS,
   };
   applyPos(root, DEFAULT_POS);
+  const onResize = () => refreshBubbleMetrics();
+  window.addEventListener("resize", onResize);
+  cleanupFns.push(() => window.removeEventListener("resize", onResize));
 
   const onRuntimeMessage = (
     msg: unknown,
@@ -389,6 +610,24 @@ function createWidget() {
     if (m.type === "babata.notification" && m.action === "mascot_speak") {
       const text = (m.args?.text as string | undefined) ?? "";
       if (text) showBubble(text);
+      sendResponse?.({ ok: true });
+      return false;
+    }
+    if (
+      m.type === "babata.notification" &&
+      m.action === "clean_read_result"
+    ) {
+      const text = (m.args?.markdown as string | undefined) ?? "";
+      renderCleanReadOverlay(text || "净化阅读完成，但结果为空。", {
+        title: (m.args?.title as string | undefined) ?? document.title,
+        url: (m.args?.url as string | undefined) ?? location.href,
+      });
+      sendResponse?.({ ok: true });
+      return false;
+    }
+    if (m.type === "babata.notification" && m.action === "clean_read_error") {
+      const err = (m.args?.error as string | undefined) ?? "净化阅读失败";
+      showBubble(`净读失败：${err}`, 12_000);
       sendResponse?.({ ok: true });
       return false;
     }
@@ -404,52 +643,163 @@ function createWidget() {
     safeChromeCall(() => chrome.runtime.onMessage.removeListener(onRuntimeMessage));
   });
 
-  // 主按钮 — 点击 toggle sidebar, drag 移动.
-  const mainBtn = document.createElement("button");
-  mainBtn.className = "btn";
-  mainBtn.title = "babata · 拖动改位置 · 点击开关侧边栏";
-  // 简笔 babata "B" 圆形 logo.
-  const logo = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  logo.setAttribute("width", "20");
-  logo.setAttribute("height", "20");
-  logo.setAttribute("viewBox", "0 0 20 20");
-  logo.setAttribute("fill", "none");
-  const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-  c.setAttribute("cx", "10"); c.setAttribute("cy", "10"); c.setAttribute("r", "8");
-  c.setAttribute("stroke", "currentColor"); c.setAttribute("stroke-width", "1.6");
-  logo.appendChild(c);
-  const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-  text.setAttribute("x", "10"); text.setAttribute("y", "13.5");
-  text.setAttribute("text-anchor", "middle");
-  text.setAttribute("font-size", "10");
-  text.setAttribute("font-weight", "600");
-  text.setAttribute("fill", "currentColor");
-  text.textContent = "b";
-  logo.appendChild(text);
-  mainBtn.appendChild(logo);
-  btnStack.appendChild(mainBtn);
+  function renderCleanReadMarkdown(markdown: string): DocumentFragment {
+    const fragment = document.createDocumentFragment();
+    const lines = markdown.replace(/\r\n?/g, "\n").split("\n");
+    let paragraph: string[] = [];
+    let list: HTMLUListElement | null = null;
+    let codeLines: string[] | null = null;
 
-  // chat popup 按钮 — 像 Grok 那样, 在 page 上弹小聊天框 (iframe 嵌 sidepanel.html).
-  const chatBtn = document.createElement("button");
-  chatBtn.className = "btn btn-collapsible";
-  chatBtn.title = "弹出聊天 (iframe 嵌 sidepanel)";
-  // chat bubble icon
-  const chatSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  chatSvg.setAttribute("width", "18");
-  chatSvg.setAttribute("height", "18");
-  chatSvg.setAttribute("viewBox", "0 0 18 18");
-  chatSvg.setAttribute("fill", "none");
-  const chatPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  chatPath.setAttribute(
-    "d",
-    "M3 7.5C3 5.6 4.6 4 6.5 4h5C13.4 4 15 5.6 15 7.5v2c0 1.9-1.6 3.5-3.5 3.5H8l-3 2.5V13H6.5C4.6 13 3 11.4 3 9.5z",
-  );
-  chatPath.setAttribute("stroke", "currentColor");
-  chatPath.setAttribute("stroke-width", "1.5");
-  chatPath.setAttribute("stroke-linejoin", "round");
-  chatSvg.appendChild(chatPath);
-  chatBtn.appendChild(chatSvg);
-  btnStack.appendChild(chatBtn);
+    const flushParagraph = () => {
+      if (paragraph.length === 0) return;
+      const p = document.createElement("p");
+      p.textContent = paragraph.join(" ").trim();
+      fragment.appendChild(p);
+      paragraph = [];
+    };
+    const flushList = () => {
+      if (!list) return;
+      fragment.appendChild(list);
+      list = null;
+    };
+    const closeBlocks = () => {
+      flushParagraph();
+      flushList();
+    };
+
+    for (const line of lines) {
+      if (/^```/.test(line.trim())) {
+        if (codeLines) {
+          const pre = document.createElement("pre");
+          pre.textContent = codeLines.join("\n");
+          closeBlocks();
+          fragment.appendChild(pre);
+          codeLines = null;
+        } else {
+          closeBlocks();
+          codeLines = [];
+        }
+        continue;
+      }
+      if (codeLines) {
+        codeLines.push(line);
+        continue;
+      }
+      const trimmed = line.trim();
+      if (!trimmed) {
+        closeBlocks();
+        continue;
+      }
+      if (trimmed.startsWith("## ")) {
+        closeBlocks();
+        const h = document.createElement("h2");
+        h.textContent = trimmed.slice(3).trim();
+        fragment.appendChild(h);
+        continue;
+      }
+      if (trimmed.startsWith("# ")) {
+        closeBlocks();
+        const h = document.createElement("h1");
+        h.textContent = trimmed.slice(2).trim();
+        fragment.appendChild(h);
+        continue;
+      }
+      if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+        flushParagraph();
+        if (!list) list = document.createElement("ul");
+        const li = document.createElement("li");
+        li.textContent = trimmed.slice(2).trim();
+        list.appendChild(li);
+        continue;
+      }
+      if (trimmed.startsWith("> ")) {
+        closeBlocks();
+        const quote = document.createElement("blockquote");
+        quote.textContent = trimmed.slice(2).trim();
+        fragment.appendChild(quote);
+        continue;
+      }
+      flushList();
+      paragraph.push(trimmed);
+    }
+
+    if (codeLines) {
+      const pre = document.createElement("pre");
+      pre.textContent = codeLines.join("\n");
+      fragment.appendChild(pre);
+    }
+    closeBlocks();
+    return fragment;
+  }
+
+  function renderCleanReadOverlay(markdown: string, meta: { title: string; url: string }) {
+    if (chatPopup) closeChatPopup();
+    if (cleanReadOverlay) {
+      cleanReadOverlay.cleanup?.();
+      cleanReadOverlay.remove();
+      cleanReadOverlay = null;
+    }
+    const overlay = document.createElement("div") as CleanReadOverlayElement;
+    overlay.className = "clean-read-overlay";
+    const shell = document.createElement("div");
+    shell.className = "clean-read-shell";
+    overlay.appendChild(shell);
+
+    const head = document.createElement("div");
+    head.className = "clean-read-head";
+    const title = document.createElement("div");
+    title.className = "clean-read-title";
+    title.textContent = meta.title || meta.url || "净化阅读";
+    head.appendChild(title);
+    const actions = document.createElement("div");
+    actions.className = "clean-read-actions";
+
+    const copy = document.createElement("button");
+    copy.className = "clean-read-btn";
+    copy.textContent = "复制";
+    copy.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void navigator.clipboard?.writeText(markdown).catch(() => {});
+    });
+    actions.appendChild(copy);
+
+    const close = document.createElement("button");
+    close.className = "clean-read-btn clean-read-icon";
+    close.textContent = "×";
+    close.title = "关闭";
+    close.addEventListener("click", (e) => {
+      e.stopPropagation();
+      overlay.cleanup?.();
+      overlay.remove();
+      if (cleanReadOverlay === overlay) cleanReadOverlay = null;
+    });
+    actions.appendChild(close);
+    head.appendChild(actions);
+    shell.appendChild(head);
+
+    const body = document.createElement("div");
+    body.className = "clean-read-body";
+    body.appendChild(renderCleanReadMarkdown(markdown));
+    shell.appendChild(body);
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      overlay.cleanup?.();
+      overlay.remove();
+      if (cleanReadOverlay === overlay) cleanReadOverlay = null;
+    };
+    document.addEventListener("keydown", onKey);
+    overlay.cleanup = () => document.removeEventListener("keydown", onKey);
+    shadow.appendChild(overlay);
+    cleanReadOverlay = overlay;
+  }
+
+  // 主按钮 — 单击打开 page chat popup, 打开后触发模型建议 prompt; drag 移动.
+  const mainBtn = document.createElement("button");
+  mainBtn.className = "btn btn-main";
+  mainBtn.title = "babata · 拖动改位置 · 单击对话 · 双击锐评 · 三击净化阅读";
+  mainBtn.appendChild(avatar("avatar-main", "babata"));
+  mainAnchor.appendChild(mainBtn);
 
   // 设置按钮
   const settingsBtn = document.createElement("button");
@@ -458,34 +808,73 @@ function createWidget() {
   settingsBtn.appendChild(svg("M3 8h10 M3 4h10 M3 12h10", { size: 14, stroke: 1.4 }));
   btnStack.appendChild(settingsBtn);
 
-  // chat popup state — 同时只一个 popup, toggle 开关.
-  chatBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
+  const openSidebar = () => {
+    void safeChromePromise(() => chrome.runtime.sendMessage({ type: "babata.toggle_sidebar" }));
+  };
+
+  const requestPromptSuggestions = () => {
+    void safeChromePromise(() => chrome.runtime.sendMessage({ type: "babata.suggest_prompts" }));
+  };
+
+  const requestAgentView = () => {
+    showBubble(AGENT_VIEW_THINKING_TEXT, AGENT_VIEW_THINKING_DURATION_MS, {
+      tone: "thinking",
+      dismissible: false,
+      interactive: false,
+    });
+    void safeChromePromise(() => chrome.runtime.sendMessage({ type: "babata.agent_view" }));
+  };
+
+  const closeChatPopup = () => {
+    if (!chatPopup) return;
+    chatPopup.cleanup?.();
+    chatPopup.remove();
+    chatPopup = null;
+    root.classList.remove("chat-open");
+  };
+
+  const openChatPopup = (opts: OpenChatPopupOptions = {}) => {
     if (chatPopup) {
-      chatPopup.cleanup?.();
-      chatPopup.remove();
-      chatPopup = null;
-      root.classList.remove("chat-open");
+      if (opts.suggest) requestPromptSuggestions();
       return;
     }
-    chatPopup = renderChatPopup(() => {
-      if (chatPopup) {
-        chatPopup.cleanup?.();
-        chatPopup.remove();
-        chatPopup = null;
-      }
-      root.classList.remove("chat-open");
-    });
+    chatPopup = renderChatPopup(
+      closeChatPopup,
+      openSidebar,
+      opts.suggest ? requestPromptSuggestions : undefined,
+    );
     shadow.appendChild(chatPopup);
     // chat 打开时整个 widget 隐藏 — b 已"进入" chat header.
     root.classList.add("chat-open");
-  });
+  };
+
+  if (widgetState) widgetState.openChatPopup = openChatPopup;
+
+  const requestCleanRead = () => {
+    showBubble(CLEAN_READ_THINKING_TEXT, AGENT_VIEW_THINKING_DURATION_MS, {
+      tone: "thinking",
+      dismissible: false,
+      interactive: false,
+    });
+    openChatPopup();
+    window.setTimeout(() => {
+      void safeChromePromise(() => chrome.runtime.sendMessage({ type: "babata.clean_read" }));
+    }, 180);
+  };
 
   // ── interactions ─────────────────────────────────────────────────
 
   // drag — 跟踪 mousedown→mousemove→mouseup. 阈值 4px 区分 click vs drag.
   let dragOrigin: { x: number; y: number; startRight: number; startTop: number } | null = null;
   let dragged = false;
+  let singleClickTimer: number | null = null;
+
+  const clearSingleClickTimer = () => {
+    if (singleClickTimer === null) return;
+    window.clearTimeout(singleClickTimer);
+    singleClickTimer = null;
+  };
+  cleanupFns.push(clearSingleClickTimer);
 
   mainBtn.addEventListener("mousedown", (e) => {
     if (e.button !== 0) return;
@@ -511,6 +900,7 @@ function createWidget() {
     const top = Math.max(8, Math.min(window.innerHeight - 60, dragOrigin.startTop + dy));
     widgetState.pos = { right, top: top / window.innerHeight };
     applyPos(widgetState.root, widgetState.pos);
+    refreshBubbleMetrics();
   };
   document.addEventListener("mousemove", onDragMove);
   cleanupFns.push(() => document.removeEventListener("mousemove", onDragMove));
@@ -534,7 +924,19 @@ function createWidget() {
       e.stopPropagation();
       return;
     }
-    void safeChromePromise(() => chrome.runtime.sendMessage({ type: "babata.toggle_sidebar" }));
+    e.preventDefault();
+    e.stopPropagation();
+    const clickCount = Math.min(e.detail || 1, 3);
+    clearSingleClickTimer();
+    if (clickCount >= 3) {
+      requestCleanRead();
+      return;
+    }
+    singleClickTimer = window.setTimeout(() => {
+      singleClickTimer = null;
+      if (clickCount === 2) requestAgentView();
+      else openChatPopup({ suggest: true });
+    }, MAIN_SINGLE_CLICK_DELAY_MS);
   });
 
   // settings popover toggle
@@ -575,10 +977,15 @@ function createWidget() {
     widgetState.mode = mode;
     widgetState.pos = pos;
     applyPos(widgetState.root, pos);
+    refreshBubbleMetrics();
   })();
 }
 
-function renderChatPopup(onClose: () => void): ChatPopupElement {
+function renderChatPopup(
+  onClose: () => void,
+  onOpenSidebar: () => void,
+  onReady?: () => void,
+): ChatPopupElement {
   const pop = document.createElement("div") as ChatPopupElement;
   pop.className = "chat-popup";
   const rightOffset = 70;
@@ -589,30 +996,11 @@ function renderChatPopup(onClose: () => void): ChatPopupElement {
   const header = document.createElement("div");
   header.className = "chat-popup-header";
 
-  // 左: babata b logo + label.
+  // 左: babata avatar + label.
   const left = document.createElement("div");
   left.className = "header-left";
 
-  const NS = "http://www.w3.org/2000/svg";
-  const logo = document.createElementNS(NS, "svg");
-  logo.setAttribute("class", "logo");
-  logo.setAttribute("width", "16");
-  logo.setAttribute("height", "16");
-  logo.setAttribute("viewBox", "0 0 20 20");
-  logo.setAttribute("fill", "none");
-  const c = document.createElementNS(NS, "circle");
-  c.setAttribute("cx", "10"); c.setAttribute("cy", "10"); c.setAttribute("r", "8");
-  c.setAttribute("stroke", "currentColor"); c.setAttribute("stroke-width", "1.6");
-  logo.appendChild(c);
-  const t = document.createElementNS(NS, "text");
-  t.setAttribute("x", "10"); t.setAttribute("y", "13.5");
-  t.setAttribute("text-anchor", "middle");
-  t.setAttribute("font-size", "10");
-  t.setAttribute("font-weight", "600");
-  t.setAttribute("fill", "currentColor");
-  t.textContent = "b";
-  logo.appendChild(t);
-  left.appendChild(logo);
+  left.appendChild(avatar("avatar-mini", "babata"));
 
   const label = document.createElement("span");
   label.className = "label";
@@ -621,9 +1009,20 @@ function renderChatPopup(onClose: () => void): ChatPopupElement {
 
   header.appendChild(left);
 
-  // 右: icon 工具行 (V0 只放 close, 后续按需加新对话/历史/展开 sidebar).
+  // 右: icon 工具行.
   const tools = document.createElement("div");
   tools.className = "header-tools";
+  const openSide = document.createElement("button");
+  openSide.className = "icon-btn";
+  openSide.title = "打开侧边栏";
+  openSide.appendChild(svg("M5 11l6-6 M7 5h4v4", { size: 13, stroke: 1.8 }));
+  openSide.addEventListener("click", (e) => {
+    e.stopPropagation();
+    onOpenSidebar();
+    onClose();
+  });
+  tools.appendChild(openSide);
+
   const close = document.createElement("button");
   close.className = "icon-btn";
   close.title = "关闭";
@@ -639,10 +1038,55 @@ function renderChatPopup(onClose: () => void): ChatPopupElement {
 
   const iframe = document.createElement("iframe");
   const sidepanelUrl = safeChromeCall(() => chrome.runtime.getURL("src/sidepanel.html"));
-  if (sidepanelUrl) iframe.src = sidepanelUrl;
+  const setIframeSrc = (ctx?: unknown) => {
+    if (!sidepanelUrl) return;
+    try {
+      const url = new URL(sidepanelUrl);
+      const c = (ctx && typeof ctx === "object") ? (ctx as Record<string, unknown>) : {};
+      if (typeof c.tab_id === "number") url.searchParams.set("tab_id", String(c.tab_id));
+      if (typeof c.window_id === "number") url.searchParams.set("window_id", String(c.window_id));
+      iframe.src = url.toString();
+    } catch {
+      iframe.src = sidepanelUrl;
+    }
+  };
+  if (sidepanelUrl) {
+    void safeChromePromise(() =>
+      chrome.runtime.sendMessage({ type: "babata.current_tab_context" }),
+    ).then((ctx) => setIframeSrc(ctx));
+    window.setTimeout(() => {
+      if (!iframe.getAttribute("src")) setIframeSrc();
+    }, 150);
+  }
   iframe.title = "babata sidepanel";
   iframe.allow = "clipboard-read; clipboard-write";
   pop.appendChild(iframe);
+
+  let readyTimer: number | null = null;
+  let postLoadTimer: number | null = null;
+  const clearReadyTimers = () => {
+    if (readyTimer !== null) {
+      window.clearTimeout(readyTimer);
+      readyTimer = null;
+    }
+    if (postLoadTimer !== null) {
+      window.clearTimeout(postLoadTimer);
+      postLoadTimer = null;
+    }
+  };
+  const triggerReady = () => {
+    clearReadyTimers();
+    if (!pop.isConnected) return;
+    onReady?.();
+  };
+  const onIframeLoad = () => {
+    clearReadyTimers();
+    postLoadTimer = window.setTimeout(triggerReady, 120);
+  };
+  if (onReady) {
+    iframe.addEventListener("load", onIframeLoad, { once: true });
+    readyTimer = window.setTimeout(triggerReady, 1200);
+  }
 
   // popup 拖拽 — 抓 header 移动整个 popup.
   let drag: { x: number; y: number; right: number; bottom: number } | null = null;
@@ -671,6 +1115,8 @@ function renderChatPopup(onClose: () => void): ChatPopupElement {
   document.addEventListener("mousemove", onPopupDragMove);
   document.addEventListener("mouseup", onPopupDragEnd);
   pop.cleanup = () => {
+    clearReadyTimers();
+    iframe.removeEventListener("load", onIframeLoad);
     document.removeEventListener("mousemove", onPopupDragMove);
     document.removeEventListener("mouseup", onPopupDragEnd);
   };
@@ -723,7 +1169,7 @@ function renderPopover(): HTMLDivElement {
 
 // ── bubble (server 推 mascot_speak 时浮起来) ────────────────────────
 
-function showBubble(text: string, durationMs = 30_000) {
+function showBubble(text: string, durationMs = 30_000, opts: BubbleOptions = {}) {
   if (!widgetState) return;
   // 同时只一个 bubble — 新的覆盖旧的.
   if (widgetState.bubble) {
@@ -736,29 +1182,34 @@ function showBubble(text: string, durationMs = 30_000) {
   }
 
   const b = document.createElement("div");
-  b.className = "bubble";
+  b.className = opts.tone === "thinking" ? "bubble bubble-thinking" : "bubble";
   b.textContent = text;
 
-  const close = document.createElement("button");
-  close.className = "bubble-close";
-  close.textContent = "×";
-  close.title = "关掉";
-  close.addEventListener("click", (e) => {
-    e.stopPropagation();
-    if (widgetState?.bubble) {
-      widgetState.bubble.remove();
-      widgetState.bubble = null;
-    }
-  });
-  b.appendChild(close);
+  if (opts.dismissible !== false) {
+    const close = document.createElement("button");
+    close.className = "bubble-close";
+    close.textContent = "×";
+    close.title = "关掉";
+    close.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (widgetState?.bubble) {
+        widgetState.bubble.remove();
+        widgetState.bubble = null;
+      }
+    });
+    b.appendChild(close);
+  }
 
-  // 点 bubble 本体 = 打开 sidebar.
-  b.addEventListener("click", () => {
-    void safeChromePromise(() => chrome.runtime.sendMessage({ type: "babata.toggle_sidebar" }));
-  });
+  // 点 bubble 本体 = 进入 page chat popup; sidebar 必须再点 popup 顶部按钮.
+  if (opts.interactive !== false) {
+    b.addEventListener("click", () => {
+      widgetState?.openChatPopup?.();
+    });
+  }
 
   widgetState.bubbleSlot.appendChild(b);
   widgetState.bubble = b;
+  refreshBubbleMetrics();
   widgetState.bubbleHideTimer = window.setTimeout(() => {
     if (widgetState?.bubble) {
       widgetState.bubble.remove();

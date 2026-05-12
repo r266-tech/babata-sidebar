@@ -62,6 +62,9 @@ const FLUSH_DEBOUNCE_MS = 300;
 // 不再按 viewport drop scroll-out: V 明确 "DOM 里能读到的尽量都翻".
 const QUEUE_MAX = 5000;
 const MISSING_RESULT_MAX_RETRIES = 2;
+const TRANSPORT_MAX_RETRIES = 5;
+const TRANSPORT_RETRY_BASE_MS = 1500;
+const TRANSPORT_RETRY_MAX_MS = 30_000;
 const VISIBLE_PRIORITY_MARGIN_PX = 800;
 
 const SELECTION_DEBOUNCE_MS = 220;
@@ -82,6 +85,8 @@ const VIEWPORT_PUSH_DEBOUNCE_MS = 1000;
 // "Extension context invalidated" — `.catch()` 接不到 sync throw. 一次 set true
 // 后所有 chrome.* 调用 short-circuit, 静默直到 V 刷 page reload 我.
 let extInvalidated = false;
+let transportFailures = 0;
+let nextFlushNotBefore = 0;
 function isInvalidatedError(e: unknown): boolean {
   return /Extension context invalidated/.test((e as Error)?.message ?? String(e));
 }
@@ -208,6 +213,12 @@ const YOUTUBE_CAPTION_EXCLUDE_SELECTORS = [
 ];
 const STAY_ORIGINAL_SELECTOR = ADDITIONAL_STAY_ORIGINAL_SELECTORS.join(", ");
 const ATOMIC_BLOCK_SELECTOR = ATOMIC_BLOCK_SELECTORS.join(", ");
+const RICH_MEDIA_SELECTOR = [
+  "img", "picture", "video", "canvas", "iframe", "object", "embed", "[role='img']",
+].join(", ");
+const RICH_MEDIA_MIN_EDGE_PX = 32;
+const RICH_MEDIA_MIN_AREA_PX = 2048;
+const RICH_MEDIA_SCAN_LIMIT = 160;
 const DEFAULT_MIN_TEXT_COUNT = Math.min(PARAGRAPH_MIN_TEXT_COUNT, MAIN_FRAME_MIN_TEXT_COUNT);
 const MAX_TRANSLATABLE_TEXT_COUNT = Math.max(4000, LONG_BUILD_DOM_LENGTH);
 const LINE_BREAK_ABBREVIATION_RE = /(?:etc\.|Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.|Sr\.|Jr\.|U\.S\.|U\.K\.|Co\.|Inc\.|Ltd\.|St\.)$/i;
@@ -263,7 +274,8 @@ const inFlightHashes = new Set<string>();
 type TraceSource = "io" | "mo_add" | "mo_char" | "rerun" | "init";
 type TraceDecision = "throttle" | "not_translatable" | "already" | "debounce"
   | "cache_inject" | "enqueue" | "in_flight_defer" | "stable_pending"
-  | "stale_result" | "skip_no_text" | "missing_result_retry" | "missing_result_drop";
+  | "stale_result" | "skip_no_text" | "missing_result_retry" | "missing_result_drop"
+  | "transport_retry" | "transport_drop";
 interface TraceRecord {
   ts: number;
   src: TraceSource;
@@ -507,6 +519,46 @@ function isAtomicBlockElement(el: HTMLElement): boolean {
   return el.matches(ATOMIC_BLOCK_SELECTOR);
 }
 
+function hasLargeVisualBox(el: HTMLElement): boolean {
+  const rect = el.getBoundingClientRect();
+  return rect.width >= RICH_MEDIA_MIN_EDGE_PX
+    && rect.height >= RICH_MEDIA_MIN_EDGE_PX
+    && rect.width * rect.height >= RICH_MEDIA_MIN_AREA_PX;
+}
+
+function hasCssBackgroundImage(el: HTMLElement): boolean {
+  try {
+    const bg = window.getComputedStyle(el).backgroundImage;
+    return !!bg && bg !== "none";
+  } catch {
+    return false;
+  }
+}
+
+function hasRichMediaSurface(el: HTMLElement): boolean {
+  const mediaNodes = [el, ...Array.from(el.querySelectorAll(RICH_MEDIA_SELECTOR))];
+  for (const node of mediaNodes) {
+    if (!(node instanceof HTMLElement)) continue;
+    if (isTranslationElement(node) || isHidden(node)) continue;
+    if (node.matches(RICH_MEDIA_SELECTOR) && hasLargeVisualBox(node)) return true;
+  }
+
+  let scanned = 0;
+  for (const node of [el, ...Array.from(el.querySelectorAll<HTMLElement>("*"))]) {
+    if (scanned++ >= RICH_MEDIA_SCAN_LIMIT) break;
+    if (isTranslationElement(node) || isHidden(node)) continue;
+    if (hasLargeVisualBox(node) && hasCssBackgroundImage(node)) return true;
+  }
+  return false;
+}
+
+function hasNonInlineElementChild(el: HTMLElement): boolean {
+  for (const child of Array.from(el.children)) {
+    if (child instanceof HTMLElement && !isInlineElement(child)) return true;
+  }
+  return false;
+}
+
 function hasTranslationChild(el: HTMLElement): boolean {
   for (const child of Array.from(el.children)) {
     if (!(child instanceof HTMLElement)) continue;
@@ -536,7 +588,11 @@ function sourceText(el: HTMLElement): string {
     }
     if (!(node instanceof HTMLElement)) return;
     if (isTranslationElement(node)) return;
-    if (node !== el && isStayOriginalElement(node)) return;
+    if (node !== el && isStayOriginalElement(node)) {
+      const text = node.textContent || "";
+      if (text) parts.push(text);
+      return;
+    }
     if (node !== el) {
       if (node.getAttribute("aria-hidden") === "true") return;
       if (!node.classList.contains(SRC_CLASS) && isHidden(node)) return;
@@ -567,7 +623,8 @@ function sourceText(el: HTMLElement): string {
     .trim();
 }
 
-function isLeafTextElement(el: HTMLElement): boolean {
+function isLeafTextElement(el: HTMLElement, knownHasRichMedia = hasRichMediaSurface(el)): boolean {
+  if (knownHasRichMedia) return false;
   // 直接子节点必须全是 text 或 inline 元素 + 含可视 text.
   let hasMeaningfulText = false;
   for (const child of Array.from(el.childNodes)) {
@@ -638,14 +695,15 @@ function collectTranslatable(root: ParentNode): HTMLElement[] {
 
     if (isInline) {
       // INLINE 标签自身仅在 leaf 时 ACCEPT (X 推 span / X article sibling 内容).
-      // 子树不深入 (inline 内含 nested block 罕见, 接受 trade-off).
-      if (!containsTranslation && isLeafTextElement(el)) {
+      // rich card / nested block 链接继续下钻, 避免 replace 模式隐藏媒体预览.
+      const hasRichMedia = hasRichMediaSurface(el);
+      if (!containsTranslation && isLeafTextElement(el, hasRichMedia)) {
         el.setAttribute(LEAF_ATTR, "1");
         result.push(el);
       }
       // 如果 inline parent 已含 babata 译文，不能把 parent 的原文+译文当
       // 一个新 leaf；下钻回原 source child，避免 X 上译文污染 hash。
-      if (containsTranslation) {
+      if (containsTranslation || hasRichMedia || hasNonInlineElementChild(el)) {
         for (const child of Array.from(el.children)) {
           if (child instanceof HTMLElement) visit(child);
         }
@@ -1397,10 +1455,11 @@ function doProcessCandidate(el: HTMLElement, src: TraceSource) {
   scheduleFlush();
 }
 
-function scheduleFlush() {
+function scheduleFlush(delayMs = FLUSH_DEBOUNCE_MS) {
   if (flushInProgress) return;
   if (flushTimer !== null) return;
-  flushTimer = window.setTimeout(flush, FLUSH_DEBOUNCE_MS);
+  const backoffMs = Math.max(0, nextFlushNotBefore - Date.now());
+  flushTimer = window.setTimeout(flush, Math.max(delayMs, backoffMs));
 }
 
 async function flush() {
@@ -1455,8 +1514,31 @@ async function flushOnce() {
   if (resp?.ok && Array.isArray(resp.results)) {
     results = resp.results;
     networkOk = true;
+    transportFailures = 0;
+    nextFlushNotBefore = 0;
   }
-  // SW / server 没 ready 或 extension reload → 整 slice 留 queue, scheduleFlush 下次重试.
+  // SW / server 没 ready 或 extension reload → bounded retry with backoff. The old
+  // 300ms loop hammered localhost indefinitely when the server was down.
+  if (!networkOk) {
+    transportFailures += 1;
+    const retryDelay = Math.min(
+      TRANSPORT_RETRY_BASE_MS * Math.pow(2, Math.max(0, transportFailures - 1)),
+      TRANSPORT_RETRY_MAX_MS,
+    );
+    nextFlushNotBefore = Date.now() + retryDelay;
+    for (const { hash, el, text } of slice) {
+      const queued = queue.get(hash);
+      if (!queued) continue;
+      queued.attempts += 1;
+      if (queued.attempts > TRANSPORT_MAX_RETRIES) {
+        trace("mo_add", el, hash, "transport_drop", text);
+        queue.delete(hash);
+      } else {
+        queued.visible = queued.visible || isElementNearViewport(el);
+        trace("mo_add", el, hash, "transport_retry", text);
+      }
+    }
+  }
 
   const byHash = new Map(slice.map((item) => [item.hash, item]));
   const staleRechecks: HTMLElement[] = [];

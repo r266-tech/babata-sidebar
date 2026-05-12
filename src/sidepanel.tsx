@@ -33,6 +33,8 @@ type Msg = {
   text: string;
   attachments?: Attachment[];
   tools?: ToolTrace[];
+  clean_read_id?: string;
+  pending?: boolean;
 };
 
 type LightContext = {
@@ -41,9 +43,11 @@ type LightContext = {
   url_changed: boolean;
   tab_id?: number;
   window_id?: number;
+  selection?: string;
 };
 
 type Suggestion = { id: string; text: string };
+type PinnedTarget = { tab_id?: number; window_id?: number };
 
 const SERVER = "http://127.0.0.1:18791";
 const SIDEPANEL_PORT = "babata-sidepanel";
@@ -100,6 +104,30 @@ function clippedToolPayload(value: unknown): string {
   const text = toolPayloadText(value);
   if (text.length <= 8000) return text;
   return `${text.slice(0, 8000)}\n... [truncated ${text.length - 8000} chars]`;
+}
+
+function pinnedTargetFromLocation(): PinnedTarget | null {
+  const params = new URLSearchParams(window.location.search);
+  const tab = Number(params.get("tab_id") ?? "");
+  const win = Number(params.get("window_id") ?? "");
+  const target: PinnedTarget = {};
+  if (Number.isInteger(tab) && tab > 0) target.tab_id = tab;
+  if (Number.isInteger(win) && win >= 0) target.window_id = win;
+  return target.tab_id !== undefined || target.window_id !== undefined ? target : null;
+}
+
+async function tabForTarget(target?: PinnedTarget | null): Promise<chrome.tabs.Tab | null> {
+  if (target?.tab_id !== undefined) {
+    return await chrome.tabs.get(target.tab_id);
+  }
+  const query: chrome.tabs.QueryInfo = { active: true };
+  if (target?.window_id !== undefined) {
+    query.windowId = target.window_id;
+  } else {
+    query.lastFocusedWindow = true;
+  }
+  const [tab] = await chrome.tabs.query(query);
+  return tab ?? null;
 }
 
 function normalizeToolTrace(raw: unknown): ToolTrace[] {
@@ -190,9 +218,12 @@ function readAsBase64(file: File): Promise<string> {
   });
 }
 
-async function captureLightContext(lastUrl: string): Promise<LightContext | null> {
+async function captureLightContext(
+  lastUrl: string,
+  target?: PinnedTarget | null,
+): Promise<LightContext | null> {
   try {
-    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    const tab = await tabForTarget(target);
     if (!tab) return null;
     const url = tab.url ?? "";
     const title = tab.title ?? "";
@@ -208,9 +239,9 @@ async function captureLightContext(lastUrl: string): Promise<LightContext | null
   }
 }
 
-async function captureCurrentSelection(): Promise<string> {
+async function captureCurrentSelection(target?: PinnedTarget | null): Promise<string> {
   try {
-    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    const tab = await tabForTarget(target);
     if (!tab?.id) return "";
     const url = tab.url ?? "";
     if (
@@ -253,6 +284,7 @@ function App() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lastSentUrl = useRef<string>("");
+  const pinnedTarget = useRef<PinnedTarget | null>(pinnedTargetFromLocation());
 
   useEffect(() => {
     try {
@@ -354,7 +386,7 @@ function App() {
             text: t.text ?? "",
             tools: normalizeToolTrace(t.tool_trace),
           }));
-        if (restored.length > 0) setMsgs(restored);
+        if (restored.length > 0) setMsgs((prev) => (prev.length === 0 ? restored : prev));
       })
       .catch(() => {});
     return () => {
@@ -366,8 +398,8 @@ function App() {
     let alive = true;
     const refresh = async () => {
       const [ctx, sel] = await Promise.all([
-        captureLightContext(lastSentUrl.current),
-        captureCurrentSelection(),
+        captureLightContext(lastSentUrl.current, pinnedTarget.current),
+        captureCurrentSelection(pinnedTarget.current),
       ]);
       if (!alive) return;
       setPageMeta(ctx);
@@ -398,6 +430,8 @@ function App() {
         | { type?: string; action?: string; args?: Record<string, unknown> }
         | undefined;
       if (m?.type !== "babata.notification") return;
+      const argText = (key: string) =>
+        typeof m.args?.[key] === "string" ? (m.args[key] as string) : "";
       if (m.action === "suggest_prompts") {
         const arr = Array.isArray(m.args?.prompts) ? (m.args!.prompts as unknown[]) : [];
         const next: Suggestion[] = arr
@@ -407,6 +441,51 @@ function App() {
         setSuggestions(next);
       } else if (m.action === "clear_suggestions") {
         setSuggestions([]);
+      } else if (m.action === "clean_read_started") {
+        const runId = argText("run_id") || `${Date.now()}`;
+        const title = argText("title");
+        const url = argText("url");
+        const label = title || url || "当前文章";
+        setSuggestions([]);
+        setMsgs((prev) => [
+          ...prev,
+          { role: "user", text: `净化阅读：${label}`, clean_read_id: runId },
+          {
+            role: "assistant",
+            text: "正在抽取文章，保留好梗，剥掉传播噪声…",
+            clean_read_id: runId,
+            pending: true,
+          },
+        ]);
+      } else if (m.action === "clean_read_result") {
+        const runId = argText("run_id");
+        const markdown = argText("markdown") || "净化阅读完成，但结果为空。";
+        setMsgs((prev) => {
+          let updated = false;
+          const next = prev.map((item) => {
+            if (item.role === "assistant" && item.clean_read_id === runId) {
+              updated = true;
+              return { ...item, text: markdown, pending: false };
+            }
+            return item;
+          });
+          return updated ? next : [...next, { role: "assistant", text: markdown }];
+        });
+      } else if (m.action === "clean_read_error") {
+        const runId = argText("run_id");
+        const error = argText("error") || "净化阅读失败";
+        const text = `[净化阅读失败] ${error}`;
+        setMsgs((prev) => {
+          let updated = false;
+          const next = prev.map((item) => {
+            if (item.role === "assistant" && item.clean_read_id === runId) {
+              updated = true;
+              return { ...item, text, pending: false };
+            }
+            return item;
+          });
+          return updated ? next : [...next, { role: "assistant", text }];
+        });
       }
     };
     chrome.runtime.onMessage.addListener(listener);
@@ -482,9 +561,17 @@ function App() {
   }
 
   function newSession() {
+    abortRef.current?.abort();
     setMsgs([]);
     setSuggestions([]);
     setInput("");
+    setStreaming(false);
+    setAttachments((prev) => {
+      prev.forEach((a) => {
+        if (a.preview_url) URL.revokeObjectURL(a.preview_url);
+      });
+      return [];
+    });
     // 让 server 起新 session: 发 /new 给 cc.py (复用 cc 的 /new 命令路径).
     void fetch(`${SERVER}/chat`, {
       method: "POST",
@@ -580,8 +667,15 @@ function App() {
       });
     };
 
-    const ctx = await captureLightContext(lastSentUrl.current);
+    const [ctx, liveSelection] = await Promise.all([
+      captureLightContext(lastSentUrl.current, pinnedTarget.current),
+      captureCurrentSelection(pinnedTarget.current),
+    ]);
+    const pageContext =
+      ctx && liveSelection ? { ...ctx, selection: liveSelection } : ctx;
     if (ctx?.url) lastSentUrl.current = ctx.url;
+    setPageMeta(ctx);
+    setSelection(liveSelection);
 
     const wireAttachments = sentAttachments.map((a) => ({
       kind: a.kind,
@@ -597,7 +691,7 @@ function App() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           message: text,
-          page_context: ctx ?? undefined,
+          page_context: pageContext ?? undefined,
           attachments: wireAttachments.length > 0 ? wireAttachments : undefined,
         }),
         signal: ctrl.signal,
@@ -660,12 +754,12 @@ function App() {
   }
 
   const headerLine = (() => {
-    if (!pageMeta) return "—";
+    if (!pageMeta) return "";
     try {
       const host = new URL(pageMeta.url).host;
-      return `${host}${pageMeta.title ? ` · ${pageMeta.title}` : ""}`;
+      return host.replace(/^www\./, "");
     } catch {
-      return pageMeta.title || pageMeta.url || "—";
+      return pageMeta.url || pageMeta.title || "";
     }
   })();
 
@@ -678,9 +772,7 @@ function App() {
         handleDrop(e);
       }}
     >
-      {/* 单 bar — Edge 自带 title bar 已显示 "babata" + 关闭, 我们只塞 status
-          点 + 当前 tab + 新对话 + 菜单 一行紧凑搞定. */}
-      <div class="px-3 pt-2 pb-1.5 flex items-center gap-2 text-[12px]">
+      <div class="px-3 pt-2 pb-1 flex items-center gap-2 text-[12px] min-h-[34px]">
         <span
           class="inline-block w-1.5 h-1.5 rounded-full shrink-0"
           style={{
@@ -696,8 +788,8 @@ function App() {
           }
         />
         <span
-          class="text-bbt-muted truncate flex-1"
-          title={pageMeta?.url ?? ""}
+          class="text-bbt-subtle truncate flex-1"
+          title={pageMeta ? `${pageMeta.title || ""}\n${pageMeta.url || ""}`.trim() : ""}
         >
           {headerLine}
         </span>
@@ -713,27 +805,15 @@ function App() {
       </div>
       {selection && (
         <div
-          class="px-3 pb-1.5 text-bbt-subtle text-[11px] truncate italic"
+          class="px-3 pb-1 text-bbt-subtle text-[11px] truncate"
           title={selection}
         >
-          选中: “{selection.length > 80 ? selection.slice(0, 80) + "…" : selection}”
+          {selection.length > 80 ? selection.slice(0, 80) + "…" : selection}
         </div>
       )}
 
       {/* Chat history */}
-      <div ref={scrollRef} class="flex-1 overflow-y-auto px-4 py-2 space-y-5">
-        {msgs.length === 0 && (
-          <div class="text-bbt-muted text-[13px] leading-relaxed pt-8">
-            <p class="mb-2">
-              babata 浏览器侧边栏 · 跟 TG / 微信同一个 babata · 跨 channel 共享 chat-archive 长期记忆.
-            </p>
-            <p>
-              她看到你当前 tab 的 url/title/url_changed, 自己决定要不要抓页面 / 翻译 / 推建议.
-              ⌘+Enter 发送 · Alt+S 唤起 · 直接粘贴/拖图片/文件/视频进 sidebar.
-            </p>
-          </div>
-        )}
-
+      <div ref={scrollRef} class="flex-1 overflow-y-auto px-4 py-2 space-y-4">
         {msgs.map((m, i) => {
           if (m.role === "user") {
             return (
@@ -861,16 +941,15 @@ function App() {
           </div>
         )}
 
-        <div class="bg-bbt-input border border-bbt rounded-2xl flex flex-col">
+        <div class="bg-bbt-input border border-bbt rounded-2xl flex flex-col shadow-[0_1px_8px_rgba(0,0,0,0.03)]">
           <textarea
-            class="resize-none bg-transparent outline-none px-3.5 pt-3 pb-1 text-[14px] placeholder:text-bbt-subtle"
-            rows={2}
-            placeholder="跟 babata 说点什么… (Enter 发送 · Shift+Enter 换行)"
+            class="resize-none bg-transparent outline-none px-3.5 pt-3 pb-1 text-[14px] leading-6 placeholder:text-bbt-subtle"
+            rows={1}
+            placeholder="问 babata..."
             value={input}
             onInput={(e) => setInput((e.target as HTMLTextAreaElement).value)}
             onPaste={(e) => handlePaste(e as unknown as ClipboardEvent)}
             onKeyDown={(e) => {
-              // Enter 发送, Shift+Enter 换行 (跟 ChatGPT/Claude.ai 同肌肉记忆).
               if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
                 e.preventDefault();
                 send();
