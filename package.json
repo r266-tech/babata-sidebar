@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit",
     "smoke:sidebar": "node scripts/smoke-sidebar.mjs",
     "smoke:rich-card": "node scripts/smoke-rich-card.mjs",
+    "smoke:llm": "node scripts/smoke-llm.mjs",
     "smoke": "npm run smoke:sidebar && npm run smoke:rich-card"
   },
   "dependencies": {
