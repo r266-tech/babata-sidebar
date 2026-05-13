@@ -24,6 +24,8 @@ const HOST_ID = "__babata_widget_host__";
 const TEARDOWN_EVENT = "babata:widget-teardown";
 const STORAGE_POS = "babata.widget.pos";
 const STORAGE_MODE = "babata.translation_mode";
+const CLEAN_READ_STYLE_ID = "__babata_clean_read_style__";
+const CLEAN_READ_ROOT_ID = "__babata_clean_read_root__";
 const DEFAULT_MODE: TranslationMode = "bilingual";
 const MAIN_SINGLE_CLICK_DELAY_MS = 500;
 const AGENT_VIEW_THINKING_TEXT = "思考中…";
@@ -40,6 +42,9 @@ interface WidgetPos {
 
 type ChatPopupElement = HTMLDivElement & { cleanup?: () => void };
 type CleanReadOverlayElement = HTMLDivElement & { cleanup?: () => void };
+type CleanReadBlockKind = "heading" | "paragraph" | "quote" | "code";
+type CleanReadBlock = { kind: CleanReadBlockKind; text: string };
+type CleanReadSnapshot = { el: HTMLElement; html: string; style: string | null };
 
 const DEFAULT_POS: WidgetPos = { right: 18, top: 0.5 }; // top 比例 (0-1)
 
@@ -618,7 +623,7 @@ function createWidget() {
       m.action === "clean_read_result"
     ) {
       const text = (m.args?.markdown as string | undefined) ?? "";
-      renderCleanReadOverlay(text || "净化阅读完成，但结果为空。", {
+      renderCleanReadInPage(text || "净化阅读完成，但结果为空。", {
         title: (m.args?.title as string | undefined) ?? document.title,
         url: (m.args?.url as string | undefined) ?? location.href,
       });
@@ -643,24 +648,26 @@ function createWidget() {
     safeChromeCall(() => chrome.runtime.onMessage.removeListener(onRuntimeMessage));
   });
 
-  function renderCleanReadMarkdown(markdown: string): DocumentFragment {
-    const fragment = document.createDocumentFragment();
+  function parseCleanReadMarkdown(markdown: string): CleanReadBlock[] {
+    const blocks: CleanReadBlock[] = [];
     const lines = markdown.replace(/\r\n?/g, "\n").split("\n");
     let paragraph: string[] = [];
-    let list: HTMLUListElement | null = null;
+    let list: string[] = [];
     let codeLines: string[] | null = null;
 
     const flushParagraph = () => {
       if (paragraph.length === 0) return;
-      const p = document.createElement("p");
-      p.textContent = paragraph.join(" ").trim();
-      fragment.appendChild(p);
+      const text = cleanReadInlineMarkdown(paragraph.join(" ").trim());
+      if (text) blocks.push({ kind: "paragraph", text });
       paragraph = [];
     };
     const flushList = () => {
-      if (!list) return;
-      fragment.appendChild(list);
-      list = null;
+      if (list.length === 0) return;
+      list.forEach((item) => {
+        const text = cleanReadInlineMarkdown(item);
+        if (text) blocks.push({ kind: "paragraph", text: `• ${text}` });
+      });
+      list = [];
     };
     const closeBlocks = () => {
       flushParagraph();
@@ -670,10 +677,9 @@ function createWidget() {
     for (const line of lines) {
       if (/^```/.test(line.trim())) {
         if (codeLines) {
-          const pre = document.createElement("pre");
-          pre.textContent = codeLines.join("\n");
+          const text = codeLines.join("\n").trim();
           closeBlocks();
-          fragment.appendChild(pre);
+          if (text) blocks.push({ kind: "code", text });
           codeLines = null;
         } else {
           closeBlocks();
@@ -690,33 +696,27 @@ function createWidget() {
         closeBlocks();
         continue;
       }
-      if (trimmed.startsWith("## ")) {
+      if (/^[-*_]{3,}$/.test(trimmed)) {
         closeBlocks();
-        const h = document.createElement("h2");
-        h.textContent = trimmed.slice(3).trim();
-        fragment.appendChild(h);
         continue;
       }
-      if (trimmed.startsWith("# ")) {
+      const headingMatch = /^(#{1,6})\s+(.+)$/.exec(trimmed);
+      if (headingMatch) {
         closeBlocks();
-        const h = document.createElement("h1");
-        h.textContent = trimmed.slice(2).trim();
-        fragment.appendChild(h);
+        const text = cleanReadInlineMarkdown(headingMatch[2].trim());
+        if (text) blocks.push({ kind: "heading", text });
         continue;
       }
-      if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+      const listMatch = /^(?:[-*]|\d+[.)])\s+(.+)$/.exec(trimmed);
+      if (listMatch) {
         flushParagraph();
-        if (!list) list = document.createElement("ul");
-        const li = document.createElement("li");
-        li.textContent = trimmed.slice(2).trim();
-        list.appendChild(li);
+        list.push(listMatch[1].trim());
         continue;
       }
       if (trimmed.startsWith("> ")) {
         closeBlocks();
-        const quote = document.createElement("blockquote");
-        quote.textContent = trimmed.slice(2).trim();
-        fragment.appendChild(quote);
+        const text = cleanReadInlineMarkdown(trimmed.slice(2).trim());
+        if (text) blocks.push({ kind: "quote", text });
         continue;
       }
       flushList();
@@ -724,74 +724,217 @@ function createWidget() {
     }
 
     if (codeLines) {
-      const pre = document.createElement("pre");
-      pre.textContent = codeLines.join("\n");
-      fragment.appendChild(pre);
+      const text = codeLines.join("\n").trim();
+      if (text) blocks.push({ kind: "code", text });
     }
     closeBlocks();
-    return fragment;
+    return blocks.length > 0 ? blocks : [{ kind: "paragraph", text: markdown.trim() || "净化阅读完成。" }];
   }
 
-  function renderCleanReadOverlay(markdown: string, meta: { title: string; url: string }) {
-    if (chatPopup) closeChatPopup();
-    if (cleanReadOverlay) {
-      cleanReadOverlay.cleanup?.();
-      cleanReadOverlay.remove();
-      cleanReadOverlay = null;
+  function cleanReadInlineMarkdown(text: string): string {
+    return text
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+      .replace(/\*\*([^*]+)\*\*/g, "$1")
+      .replace(/__([^_]+)__/g, "$1")
+      .replace(/`([^`]+)`/g, "$1")
+      .replace(/\\([\\`*_[\]()#+\-.!>])/g, "$1")
+      .trim();
+  }
+
+  function ensureCleanReadPageStyle() {
+    let s = document.getElementById(CLEAN_READ_STYLE_ID) as HTMLStyleElement | null;
+    if (!s) {
+      s = document.createElement("style");
+      s.id = CLEAN_READ_STYLE_ID;
+      (document.head || document.documentElement).appendChild(s);
     }
-    const overlay = document.createElement("div") as CleanReadOverlayElement;
-    overlay.className = "clean-read-overlay";
-    const shell = document.createElement("div");
-    shell.className = "clean-read-shell";
-    overlay.appendChild(shell);
+    s.textContent = `
+      .bbt-clean-read-hidden { display: none !important; }
+      #${CLEAN_READ_ROOT_ID} { display: none !important; }
+    `;
+  }
 
-    const head = document.createElement("div");
-    head.className = "clean-read-head";
-    const title = document.createElement("div");
-    title.className = "clean-read-title";
-    title.textContent = meta.title || meta.url || "净化阅读";
-    head.appendChild(title);
-    const actions = document.createElement("div");
-    actions.className = "clean-read-actions";
+  function cleanReadTextLen(el: Element): number {
+    return (el.textContent || "").replace(/\s+/g, " ").trim().length;
+  }
 
-    const copy = document.createElement("button");
-    copy.className = "clean-read-btn";
-    copy.textContent = "复制";
-    copy.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void navigator.clipboard?.writeText(markdown).catch(() => {});
+  function findCleanReadRoot(): HTMLElement {
+    for (const selector of ["#js_content", ".rich_media_content", "article", "[itemprop='articleBody']"]) {
+      const el = document.querySelector(selector);
+      if (el instanceof HTMLElement && cleanReadTextLen(el) >= 200) return el;
+    }
+    const selectors = [
+      "#js_content",
+      ".rich_media_content",
+      "article",
+      "main",
+      "[role='main']",
+      "[itemprop='articleBody']",
+      "[class*='article' i]",
+      "[id*='article' i]",
+      "[class*='content' i]",
+      "[id*='content' i]",
+      "body",
+    ];
+    const candidates = selectors
+      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+      .filter((el, i, arr): el is HTMLElement => {
+        if (!(el instanceof HTMLElement)) return false;
+        if (arr.indexOf(el) !== i) return false;
+        if (el.id === HOST_ID || el.id === CLEAN_READ_ROOT_ID) return false;
+        const textLen = cleanReadTextLen(el);
+        return textLen >= 200 || el === document.body;
+      });
+    const scored = candidates.map((el) => {
+      const textLen = cleanReadTextLen(el);
+      const pCount = el.querySelectorAll("p").length;
+      const headingCount = el.querySelectorAll("h1,h2,h3").length;
+      const linkLen = Array.from(el.querySelectorAll("a")).reduce(
+        (sum, a) => sum + cleanReadTextLen(a),
+        0,
+      );
+      const linkPenalty = linkLen / Math.max(textLen, 1);
+      const chromePenalty = el.querySelectorAll("nav,footer,aside,form,button,input").length;
+      const bodyPenalty = el === document.body ? textLen * 0.8 : 0;
+      return {
+        el,
+        score:
+          textLen +
+          pCount * 220 +
+          headingCount * 80 -
+          linkPenalty * textLen -
+          chromePenalty * 120 -
+          bodyPenalty,
+      };
     });
-    actions.appendChild(copy);
+    return (scored.sort((a, b) => b.score - a.score)[0]?.el || document.body) as HTMLElement;
+  }
 
-    const close = document.createElement("button");
-    close.className = "clean-read-btn clean-read-icon";
-    close.textContent = "×";
-    close.title = "关闭";
-    close.addEventListener("click", (e) => {
-      e.stopPropagation();
-      overlay.cleanup?.();
-      overlay.remove();
-      if (cleanReadOverlay === overlay) cleanReadOverlay = null;
+  function isCleanReadTextBlock(el: HTMLElement): boolean {
+    if (el.id === HOST_ID || el.id === CLEAN_READ_ROOT_ID) return false;
+    if (el.dataset.bbtCleanReadInserted === "1") return false;
+    if (el.closest(`#${CLEAN_READ_ROOT_ID}`)) return false;
+    if (["SCRIPT", "STYLE", "LINK", "NOSCRIPT", "IFRAME", "SVG", "IMG", "VIDEO", "CANVAS"].includes(el.tagName)) {
+      return false;
+    }
+    const textLen = cleanReadTextLen(el);
+    if (textLen < 2) return false;
+    const tag = el.tagName.toLowerCase();
+    if (/^h[1-6]$/.test(tag) || ["p", "li", "blockquote", "pre"].includes(tag)) return true;
+    if (["section", "div"].includes(tag)) {
+      if (el.querySelector("img,video,canvas,iframe,svg")) return false;
+      const childTextBlocks = Array.from(el.children).filter(
+        (child) => child instanceof HTMLElement && cleanReadTextLen(child) > 0,
+      );
+      return childTextBlocks.length <= 1 && textLen < 600;
+    }
+    return false;
+  }
+
+  function collectCleanReadSlots(articleRoot: HTMLElement): HTMLElement[] {
+    const direct = Array.from(articleRoot.children).filter(
+      (child): child is HTMLElement => child instanceof HTMLElement && isCleanReadTextBlock(child),
+    );
+    if (direct.length >= 3) return direct;
+    return Array.from(
+      articleRoot.querySelectorAll<HTMLElement>("h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,section,div"),
+    ).filter((el) => {
+      if (!isCleanReadTextBlock(el)) return false;
+      const parentBlock = el.parentElement?.closest("h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,section,div");
+      return !parentBlock || parentBlock === articleRoot;
     });
-    actions.appendChild(close);
-    head.appendChild(actions);
-    shell.appendChild(head);
+  }
 
-    const body = document.createElement("div");
-    body.className = "clean-read-body";
-    body.appendChild(renderCleanReadMarkdown(markdown));
-    shell.appendChild(body);
+  function cleanReadBlockText(blocks: CleanReadBlock[], index: number, maxSlots: number): string {
+    if (index < maxSlots - 1 || blocks.length <= maxSlots) return blocks[index]?.text ?? "";
+    return blocks
+      .slice(index)
+      .map((block) => block.text)
+      .filter(Boolean)
+      .join("\n\n");
+  }
+
+  function rememberCleanReadSlot(
+    snapshots: CleanReadSnapshot[],
+    seen: WeakSet<HTMLElement>,
+    el: HTMLElement,
+  ) {
+    if (seen.has(el)) return;
+    seen.add(el);
+    snapshots.push({ el, html: el.innerHTML, style: el.getAttribute("style") });
+  }
+
+  function restoreCleanReadSnapshot(snapshot: CleanReadSnapshot) {
+    snapshot.el.innerHTML = snapshot.html;
+    if (snapshot.style === null) snapshot.el.removeAttribute("style");
+    else snapshot.el.setAttribute("style", snapshot.style);
+    snapshot.el.classList.remove("bbt-clean-read-hidden");
+    delete snapshot.el.dataset.bbtCleanReadHidden;
+  }
+
+  function restoreCleanRead() {
+    cleanReadOverlay?.cleanup?.();
+    document.getElementById(CLEAN_READ_ROOT_ID)?.remove();
+    document.querySelectorAll<HTMLElement>("[data-bbt-clean-read-inserted='1']").forEach((el) => el.remove());
+    cleanReadOverlay = null;
+    document
+      .querySelectorAll<HTMLElement>("[data-bbt-clean-read-hidden='1']")
+      .forEach((el) => {
+        el.classList.remove("bbt-clean-read-hidden");
+        delete el.dataset.bbtCleanReadHidden;
+      });
+  }
+
+  function renderCleanReadInPage(markdown: string, meta: { title: string; url: string }) {
+    if (chatPopup) closeChatPopup();
+    restoreCleanRead();
+    ensureCleanReadPageStyle();
+
+    const articleRoot = findCleanReadRoot();
+    const slots = collectCleanReadSlots(articleRoot);
+    const blocks = parseCleanReadMarkdown(markdown);
+    const marker = document.createElement("div") as CleanReadOverlayElement;
+    marker.id = CLEAN_READ_ROOT_ID;
+    marker.title = meta.title || meta.url || "净化阅读";
+    const firstSlot = slots[0] ?? articleRoot.firstChild;
+    const snapshots: CleanReadSnapshot[] = [];
+    const seen = new WeakSet<HTMLElement>();
+
+    articleRoot.insertBefore(marker, firstSlot);
+    if (slots.length === 0) {
+      const fallback = document.createElement("p");
+      fallback.dataset.bbtCleanReadInserted = "1";
+      fallback.textContent = blocks.map((block) => block.text).join("\n\n");
+      marker.after(fallback);
+      rememberCleanReadSlot(snapshots, seen, fallback);
+    } else {
+      const writeCount = Math.min(blocks.length, slots.length);
+      for (let i = 0; i < writeCount; i += 1) {
+        const slot = slots[i];
+        rememberCleanReadSlot(snapshots, seen, slot);
+        slot.textContent = cleanReadBlockText(blocks, i, slots.length);
+        slot.classList.remove("bbt-clean-read-hidden");
+        delete slot.dataset.bbtCleanReadHidden;
+      }
+      slots.slice(writeCount).forEach((slot) => {
+        rememberCleanReadSlot(snapshots, seen, slot);
+        slot.dataset.bbtCleanReadHidden = "1";
+        slot.classList.add("bbt-clean-read-hidden");
+      });
+    }
 
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      overlay.cleanup?.();
-      overlay.remove();
-      if (cleanReadOverlay === overlay) cleanReadOverlay = null;
+      restoreCleanRead();
     };
     document.addEventListener("keydown", onKey);
-    overlay.cleanup = () => document.removeEventListener("keydown", onKey);
-    shadow.appendChild(overlay);
-    cleanReadOverlay = overlay;
+    marker.cleanup = () => {
+      document.removeEventListener("keydown", onKey);
+      document.querySelectorAll<HTMLElement>("[data-bbt-clean-read-inserted='1']").forEach((el) => el.remove());
+      snapshots.forEach(restoreCleanReadSnapshot);
+    };
+    cleanReadOverlay = marker;
+    (slots[0] ?? articleRoot).scrollIntoView({ block: "start", behavior: "smooth" });
   }
 
   // 主按钮 — 单击打开 page chat popup, 打开后触发模型建议 prompt; drag 移动.
@@ -851,12 +994,16 @@ function createWidget() {
   if (widgetState) widgetState.openChatPopup = openChatPopup;
 
   const requestCleanRead = () => {
+    if (cleanReadOverlay) {
+      restoreCleanRead();
+      showBubble("已恢复原文", 2_500);
+      return;
+    }
     showBubble(CLEAN_READ_THINKING_TEXT, AGENT_VIEW_THINKING_DURATION_MS, {
       tone: "thinking",
       dismissible: false,
       interactive: false,
     });
-    openChatPopup();
     window.setTimeout(() => {
       void safeChromePromise(() => chrome.runtime.sendMessage({ type: "babata.clean_read" }));
     }, 180);
