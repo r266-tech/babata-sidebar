@@ -28,9 +28,21 @@ type ToolTrace = {
   duration_ms?: number;
 };
 
+type MessagePart =
+  | { type: "text"; id: string; text: string }
+  | {
+      type: "page_read";
+      id: string;
+      name: string;
+      status: ToolTraceStatus;
+      is_error?: boolean;
+      duration_ms?: number;
+    };
+
 type Msg = {
   role: "user" | "assistant";
   text: string;
+  parts?: MessagePart[];
   attachments?: Attachment[];
   tools?: ToolTrace[];
   clean_read_id?: string;
@@ -62,6 +74,38 @@ type ServerEvent =
 
 marked.setOptions({ breaks: true, gfm: true });
 
+const PAGE_READ_TOOLS = new Set(["tab_metadata", "page_snapshot", "dom_query", "article_extract"]);
+
+function objectField(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object") return undefined;
+  return (value as Record<string, unknown>)[key];
+}
+
+function textField(value: unknown, key: string): string {
+  const found = objectField(value, key);
+  return typeof found === "string" ? found : "";
+}
+
+function effectiveToolName(name: string, input?: unknown): string {
+  const rawTool = textField(input, "tool");
+  const rawServer = textField(input, "server");
+  if (rawTool) return rawServer ? `${rawServer}.${rawTool}` : rawTool;
+  return name;
+}
+
+function isPageReadTool(name: string, input?: unknown): boolean {
+  const effective = effectiveToolName(name, input);
+  if (PAGE_READ_TOOLS.has(effective)) return true;
+  for (const tool of PAGE_READ_TOOLS) {
+    if (effective.endsWith(`.${tool}`) || effective.endsWith(`/${tool}`)) return true;
+  }
+  return false;
+}
+
+function newPartId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
 function renderMarkdown(text: string): string {
   if (!text) return "";
   const html = marked.parse(text, { async: false }) as string;
@@ -90,22 +134,6 @@ function toolStatus(t: ToolTrace): ToolTraceStatus {
   return "running";
 }
 
-function toolPayloadText(value: unknown): string {
-  if (value === undefined || value === null || value === "") return "";
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
-
-function clippedToolPayload(value: unknown): string {
-  const text = toolPayloadText(value);
-  if (text.length <= 8000) return text;
-  return `${text.slice(0, 8000)}\n... [truncated ${text.length - 8000} chars]`;
-}
-
 function pinnedTargetFromLocation(): PinnedTarget | null {
   const params = new URLSearchParams(window.location.search);
   const tab = Number(params.get("tab_id") ?? "");
@@ -116,18 +144,57 @@ function pinnedTargetFromLocation(): PinnedTarget | null {
   return target.tab_id !== undefined || target.window_id !== undefined ? target : null;
 }
 
+function isPageUrl(url?: string): boolean {
+  if (!url) return false;
+  return !(
+    url.startsWith("chrome://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("about:") ||
+    url.startsWith("chrome-extension://") ||
+    url.startsWith("view-source:")
+  );
+}
+
+async function activePageContextFromSw(): Promise<PinnedTarget | null> {
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: "babata.active_page_context" }) as
+      | { ok?: boolean; tab_id?: number; window_id?: number }
+      | undefined;
+    if (!resp?.ok || typeof resp.tab_id !== "number") return null;
+    return {
+      tab_id: resp.tab_id,
+      window_id: typeof resp.window_id === "number" ? resp.window_id : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function tabForTarget(target?: PinnedTarget | null): Promise<chrome.tabs.Tab | null> {
   if (target?.tab_id !== undefined) {
     return await chrome.tabs.get(target.tab_id);
   }
-  const query: chrome.tabs.QueryInfo = { active: true };
-  if (target?.window_id !== undefined) {
-    query.windowId = target.window_id;
-  } else {
-    query.lastFocusedWindow = true;
+  const queries: chrome.tabs.QueryInfo[] = target?.window_id !== undefined
+    ? [{ active: true, windowId: target.window_id }]
+    : [
+        { active: true, lastFocusedWindow: true },
+        { active: true, currentWindow: true },
+        { active: true },
+      ];
+  for (const query of queries) {
+    try {
+      const tabs = await chrome.tabs.query(query);
+      const tab = tabs.find((candidate) => candidate.id !== undefined && isPageUrl(candidate.url));
+      if (tab) return tab;
+    } catch {
+      /* try next query */
+    }
   }
-  const [tab] = await chrome.tabs.query(query);
-  return tab ?? null;
+  const remembered = await activePageContextFromSw();
+  if (remembered?.tab_id !== undefined) {
+    return await chrome.tabs.get(remembered.tab_id);
+  }
+  return null;
 }
 
 function normalizeToolTrace(raw: unknown): ToolTrace[] {
@@ -152,48 +219,61 @@ function normalizeToolTrace(raw: unknown): ToolTrace[] {
     }));
 }
 
-function ToolTracePanel(props: { tools: ToolTrace[]; show: boolean; onToggle: () => void }) {
-  const count = props.tools.length;
-  if (count === 0) return null;
+function pageReadText(status: ToolTraceStatus): string {
+  if (status === "running") return "正在读取当前网页";
+  if (status === "error") return "读取网页失败";
+  return "已读取当前网页";
+}
+
+function PageReadInline(props: {
+  status: ToolTraceStatus;
+  duration_ms?: number;
+}) {
   return (
-    <div class="bbt-tools">
-      <button
-        class="bbt-tools-toggle"
-        onClick={props.onToggle}
-        title={props.show ? "隐藏工具调用过程" : "显示工具调用过程"}
-      >
-        <svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-          <path
-            d="M5.2 2.4h3.6M4.1 5h5.8M3.2 7.6h7.6M5.2 10.2h3.6"
-            stroke="currentColor"
-            stroke-width="1.25"
-            stroke-linecap="round"
-          />
-        </svg>
-        <span>{props.show ? "隐藏工具调用" : `工具调用 ${count}`}</span>
-      </button>
-      {props.show && (
-        <div class="bbt-tools-list">
-          {props.tools.map((tool) => {
-            const status = toolStatus(tool);
-            const inputText = clippedToolPayload(tool.input);
-            const resultText = clippedToolPayload(tool.result);
-            return (
-              <div key={tool.id} class={`bbt-tool-card bbt-tool-${status}`}>
-                <div class="bbt-tool-head">
-                  <span class="bbt-tool-name">{tool.name}</span>
-                  <span class="bbt-tool-status">
-                    {status === "running" ? "running" : status === "error" ? "error" : "done"}
-                    {tool.duration_ms !== undefined ? ` · ${tool.duration_ms}ms` : ""}
-                  </span>
-                </div>
-                {inputText && <pre class="bbt-tool-pre">{inputText}</pre>}
-                {resultText && <pre class="bbt-tool-pre bbt-tool-result">{resultText}</pre>}
-              </div>
-            );
-          })}
-        </div>
+    <div class={`bbt-page-read bbt-page-read-${props.status}`}>
+      <span class="bbt-page-read-dot" aria-hidden="true" />
+      <span>{pageReadText(props.status)}</span>
+      {props.duration_ms !== undefined && props.status !== "running" && (
+        <span class="bbt-page-read-time">{props.duration_ms}ms</span>
       )}
+    </div>
+  );
+}
+
+function AssistantParts(props: { parts: MessagePart[]; placeholder?: string }) {
+  if (props.parts.length === 0) {
+    return <MarkdownView text="" placeholder={props.placeholder} />;
+  }
+  return (
+    <div class="bbt-assistant-flow">
+      {props.parts.map((part) => {
+        if (part.type === "text") {
+          return <MarkdownView key={part.id} text={part.text} />;
+        }
+        return (
+          <PageReadInline
+            key={part.id}
+            status={part.status}
+            duration_ms={part.duration_ms}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function PageReadTraceList(props: { tools?: ToolTrace[] }) {
+  const tools = (props.tools ?? []).filter((tool) => isPageReadTool(tool.name, tool.input));
+  if (tools.length === 0) return null;
+  return (
+    <div class="bbt-inline-tools">
+      {tools.map((tool) => (
+        <PageReadInline
+          key={tool.id}
+          status={toolStatus(tool)}
+          duration_ms={tool.duration_ms}
+        />
+      ))}
     </div>
   );
 }
@@ -244,14 +324,7 @@ async function captureCurrentSelection(target?: PinnedTarget | null): Promise<st
     const tab = await tabForTarget(target);
     if (!tab?.id) return "";
     const url = tab.url ?? "";
-    if (
-      !url ||
-      url.startsWith("chrome://") ||
-      url.startsWith("edge://") ||
-      url.startsWith("about:") ||
-      url.startsWith("chrome-extension://") ||
-      url.startsWith("view-source:")
-    ) {
+    if (!isPageUrl(url)) {
       return "";
     }
     const [exec] = await chrome.scripting.executeScript({
@@ -273,26 +346,11 @@ function App() {
   const [selection, setSelection] = useState<string>("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
-  const [showTools, setShowTools] = useState(() => {
-    try {
-      return window.localStorage.getItem("bbt-show-tools") === "1";
-    } catch {
-      return false;
-    }
-  });
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lastSentUrl = useRef<string>("");
   const pinnedTarget = useRef<PinnedTarget | null>(pinnedTargetFromLocation());
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem("bbt-show-tools", showTools ? "1" : "0");
-    } catch {
-      /* ignore storage failures */
-    }
-  }, [showTools]);
 
   useEffect(() => {
     let port: chrome.runtime.Port | null = null;
@@ -436,7 +494,7 @@ function App() {
         const arr = Array.isArray(m.args?.prompts) ? (m.args!.prompts as unknown[]) : [];
         const next: Suggestion[] = arr
           .filter((p): p is string => typeof p === "string" && p.trim().length > 0)
-          .slice(0, 6)
+          .slice(0, 2)
           .map((text, i) => ({ id: `${Date.now()}-${i}`, text: text.trim() }));
         setSuggestions(next);
       } else if (m.action === "clear_suggestions") {
@@ -497,7 +555,7 @@ function App() {
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [msgs, showTools]);
+  }, [msgs]);
 
   async function ingestFile(file: File) {
     if (file.size > 50 * 1024 * 1024) {
@@ -608,17 +666,39 @@ function App() {
     };
     const appendAssistant = (chunk: string) => {
       accum += chunk;
-      updateLastAssistant((last) => ({ ...last, text: accum }));
+      updateLastAssistant((last) => {
+        const parts = [...(last.parts ?? [])];
+        const tail = parts[parts.length - 1];
+        if (tail?.type === "text") {
+          parts[parts.length - 1] = { ...tail, text: tail.text + chunk };
+        } else {
+          parts.push({ type: "text", id: newPartId("text"), text: chunk });
+        }
+        return { ...last, text: accum, parts };
+      });
     };
     const appendToolUse = (ev: Extract<ServerEvent, { type: "tool_use" }>) => {
       const id = ev.trace_id || `live-tool-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const isPageRead = isPageReadTool(ev.name, ev.input);
+      const name = effectiveToolName(ev.name, ev.input);
       updateLastAssistant((last) => ({
         ...last,
+        parts: isPageRead
+          ? [
+              ...(last.parts ?? []),
+              {
+                type: "page_read",
+                id,
+                name,
+                status: "running",
+              },
+            ]
+          : last.parts,
         tools: [
           ...(last.tools ?? []),
           {
             id,
-            name: ev.name,
+            name,
             input: ev.input,
             status: "running",
             started_at: Date.now() / 1000,
@@ -639,9 +719,11 @@ function App() {
           }
         }
         const endedAt = Date.now() / 1000;
+        let resolvedId = ev.trace_id;
         if (idx === -1) {
+          resolvedId = ev.trace_id || `live-result-${Date.now()}`;
           tools.push({
-            id: ev.trace_id || `live-result-${Date.now()}`,
+            id: resolvedId,
             name: "tool_result",
             status: ev.is_error ? "error" : "done",
             is_error: ev.is_error,
@@ -650,6 +732,7 @@ function App() {
           });
         } else {
           const current = tools[idx];
+          resolvedId = current.id;
           const duration =
             typeof current.started_at === "number"
               ? Math.max(0, Math.round((endedAt - current.started_at) * 1000))
@@ -663,7 +746,18 @@ function App() {
             duration_ms: duration,
           };
         }
-        return { ...last, tools };
+        const nextStatus: ToolTraceStatus = ev.is_error ? "error" : "done";
+        const resolvedTool = resolvedId ? tools.find((tool) => tool.id === resolvedId) : undefined;
+        const parts = (last.parts ?? []).map((part) => {
+          if (part.type !== "page_read" || part.id !== resolvedId) return part;
+          return {
+            ...part,
+            status: nextStatus,
+            is_error: ev.is_error,
+            duration_ms: resolvedTool?.duration_ms,
+          };
+        });
+        return { ...last, tools, parts };
       });
     };
 
@@ -865,16 +959,19 @@ function App() {
           }
           return (
             <div key={i} class="flex flex-col items-start group">
-              <MarkdownView
-                text={m.text}
-                placeholder={streaming && i === msgs.length - 1 ? "…" : ""}
-              />
-              {m.tools && m.tools.length > 0 && (
-                <ToolTracePanel
-                  tools={m.tools}
-                  show={showTools}
-                  onToggle={() => setShowTools((v) => !v)}
+              {m.parts ? (
+                <AssistantParts
+                  parts={m.parts}
+                  placeholder={streaming && i === msgs.length - 1 ? "…" : ""}
                 />
+              ) : (
+                <>
+                  <MarkdownView
+                    text={m.text}
+                    placeholder={streaming && i === msgs.length - 1 ? "…" : ""}
+                  />
+                  <PageReadTraceList tools={m.tools} />
+                </>
               )}
               {m.text && (!streaming || i !== msgs.length - 1) && (
                 <div class="flex gap-1 mt-1.5 -ml-1 opacity-0 group-hover:opacity-100 transition-opacity">

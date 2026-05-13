@@ -65,6 +65,67 @@ const snapshotStores = new Map<string, SnapshotStore>();
 const SNAPSHOT_STORE_MAX = 20;
 const SIDEPANEL_PORT = "babata-sidepanel";
 const sidepanelPorts = new Set<chrome.runtime.Port>();
+let lastActivePageContext: {
+  tab_id: number;
+  window_id: number;
+  url: string;
+  title: string;
+} | null = null;
+
+function isPageUrl(url?: string): boolean {
+  if (!url) return false;
+  return !(
+    url.startsWith("chrome://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("about:") ||
+    url.startsWith("chrome-extension://") ||
+    url.startsWith("view-source:")
+  );
+}
+
+function rememberActivePage(tab?: chrome.tabs.Tab | null) {
+  if (!tab?.id || !isPageUrl(tab.url)) return;
+  lastActivePageContext = {
+    tab_id: tab.id,
+    window_id: tab.windowId,
+    url: tab.url ?? "",
+    title: tab.title ?? "",
+  };
+}
+
+async function findActivePageTab(windowId?: number): Promise<chrome.tabs.Tab | null> {
+  const queries: chrome.tabs.QueryInfo[] = windowId !== undefined
+    ? [{ active: true, windowId }]
+    : [
+        { active: true, lastFocusedWindow: true },
+        { active: true, currentWindow: true },
+        { active: true },
+      ];
+  for (const query of queries) {
+    try {
+      const tabs = await chrome.tabs.query(query);
+      const pageTab = tabs.find((tab) => tab.id !== undefined && isPageUrl(tab.url));
+      if (pageTab) {
+        rememberActivePage(pageTab);
+        return pageTab;
+      }
+    } catch {
+      /* try next query */
+    }
+  }
+  if (lastActivePageContext?.tab_id) {
+    try {
+      const tab = await chrome.tabs.get(lastActivePageContext.tab_id);
+      if (tab?.id && isPageUrl(tab.url)) {
+        rememberActivePage(tab);
+        return tab;
+      }
+    } catch {
+      lastActivePageContext = null;
+    }
+  }
+  return null;
+}
 
 async function ensureOffscreen() {
   // chrome.offscreen.hasDocument 在某些版本不存在, 用 getContexts fallback.
@@ -136,6 +197,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       title: tab?.title ?? "",
     });
     return false;
+  }
+
+  if (m.type === "babata.active_page_context") {
+    void (async () => {
+      try {
+        const tab = await findActivePageTab();
+        sendResponse?.({
+          ok: !!tab?.id,
+          tab_id: tab?.id,
+          window_id: tab?.windowId,
+          url: tab?.url ?? "",
+          title: tab?.title ?? "",
+        });
+      } catch (e) {
+        sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
+      }
+    })();
+    return true;
   }
 
   // page-side 推 attention/viewport state → forward 到 server /attention 写 events.jsonl.
@@ -366,18 +445,8 @@ async function targetTab(args: Record<string, unknown> = {}): Promise<chrome.tab
     return tab;
   }
 
-  const query: chrome.tabs.QueryInfo = {
-    active: true,
-  };
   const windowId = intArg(args, "window_id", "windowId");
-  if (windowId !== undefined) {
-    query.windowId = windowId;
-  } else {
-    query.lastFocusedWindow = true;
-  }
-  const [tab] = await chrome.tabs.query({
-    ...query,
-  });
+  const tab = await findActivePageTab(windowId);
   if (!tab?.id) throw new Error("no active tab");
   return tab;
 }
@@ -411,6 +480,8 @@ async function dispatchAction(action: string, args: Record<string, unknown>) {
       return await actDomClick(args);
     case "page_snapshot":
       return await actPageSnapshot(args);
+    case "article_extract":
+      return await actArticleExtract(args);
     case "page_click_ref":
       return await actPageClickRef(args);
     case "tab_navigate":
@@ -878,6 +949,12 @@ async function actTabNavigate(args: Record<string, unknown>) {
   return { ok: true, tab_id: tab.id, url };
 }
 
+async function actArticleExtract(args: Record<string, unknown>) {
+  const tab = await targetTab(args);
+  const result = await extractArticleFromTab(tab.id!);
+  return { ...result, tab_id: tab.id, window_id: tab.windowId };
+}
+
 // ── browser-keeper actions: bookmarks / tabs / history ───────────────
 
 async function actBookmarksSearch(args: Record<string, unknown>) {
@@ -990,8 +1067,12 @@ async function extractArticleFromTab(tabId: number): Promise<ArticleExtractResul
     target: { tabId },
     func: () => {
       type P = { id: string; type: string; text: string };
-      const oneLine = (value: string, max = 280) => {
-        const text = value.replace(/\s+/g, " ").trim();
+      const redact = (value: string) =>
+        value
+          .replace(/\bsk-[A-Za-z0-9._-]{6,}\b/g, "sk-[redacted]")
+          .replace(/\b(id_token|access_token|refresh_token)=([^&\s]+)/gi, "$1=[redacted]");
+      const oneLine = (value: string, max = 1200) => {
+        const text = redact(value).replace(/\s+/g, " ").trim();
         return text.length > max ? `${text.slice(0, max)}...` : text;
       };
       const meta = (...names: string[]) => {
@@ -1004,98 +1085,24 @@ async function extractArticleFromTab(tabId: number): Promise<ArticleExtractResul
         }
         return "";
       };
-      const isHidden = (el: Element) => {
-        if ((el as HTMLElement).hidden || el.getAttribute("aria-hidden") === "true") {
-          return true;
-        }
-        const style = window.getComputedStyle(el);
-        return (
-          style.display === "none" ||
-          style.visibility === "hidden" ||
-          Number(style.opacity) === 0
-        );
-      };
-      const textOf = (el: Element) => (el.textContent || "").replace(/\s+/g, " ").trim();
-      const linkTextLen = (el: Element) =>
-        Array.from(el.querySelectorAll("a")).reduce(
-          (sum, a) => sum + textOf(a).length,
-          0,
-        );
-      const scoreCandidate = (el: Element) => {
-        const text = textOf(el);
-        if (text.length < 300) return 0;
-        const pCount = el.querySelectorAll("p").length;
-        const headingCount = el.querySelectorAll("h1,h2,h3").length;
-        const mediaCount = el.querySelectorAll("img,figure,pre,blockquote").length;
-        const linkRatio = linkTextLen(el) / Math.max(text.length, 1);
-        const chromeCount = el.querySelectorAll(
-          "nav,footer,aside,form,button,input,select,textarea,[role='navigation'],[role='banner'],[role='contentinfo']",
-        ).length;
-        return (
-          text.length +
-          pCount * 220 +
-          headingCount * 80 +
-          mediaCount * 35 -
-          linkRatio * text.length * 0.75 -
-          chromeCount * 120
-        );
-      };
       const candidateSelectors = [
         "article",
         "main",
         "[role='main']",
         "[itemprop='articleBody']",
-        "[class*='article' i]",
-        "[id*='article' i]",
-        "[class*='content' i]",
-        "[id*='content' i]",
         "body",
       ];
-      const candidates = candidateSelectors
-        .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-        .filter((el, i, arr) => arr.indexOf(el) === i && !isHidden(el));
-      const root =
-        candidates
-          .map((el) => ({ el, score: scoreCandidate(el) }))
-          .sort((a, b) => b.score - a.score)[0]?.el || document.body;
-      const clone = root.cloneNode(true) as HTMLElement;
-      clone
-        .querySelectorAll(
-          [
-            "script",
-            "style",
-            "link",
-            "noscript",
-            "svg",
-            "nav",
-            "footer",
-            "aside",
-            "form",
-            "button",
-            "input",
-            "select",
-            "textarea",
-            "iframe",
-            "canvas",
-            "video",
-            "audio",
-            "[hidden]",
-            "[aria-hidden='true']",
-            "[role='navigation']",
-            "[role='banner']",
-            "[role='contentinfo']",
-            "[role='complementary']",
-          ].join(","),
-        )
-        .forEach((el) => el.remove());
-
+      const root = candidateSelectors
+        .map((selector) => document.querySelector(selector))
+        .find((el): el is Element => !!el && (el.textContent || "").trim().length > 80)
+        || document.body;
       const blocks = Array.from(
-        clone.querySelectorAll("h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,figcaption"),
-      );
+        root.querySelectorAll("h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,figcaption"),
+      ).slice(0, 260);
       const paragraphs: P[] = [];
       const seen = new Set<string>();
       const push = (type: string, text: string) => {
-        const cleaned = text.replace(/\s+\n/g, "\n").replace(/\n\s+/g, "\n").trim();
+        const cleaned = redact(text).replace(/\s+\n/g, "\n").replace(/\n\s+/g, "\n").trim();
         if (!cleaned) return;
         if (type !== "heading" && type !== "code" && cleaned.length < 12) return;
         const key = `${type}|${cleaned.slice(0, 180)}`;
@@ -1117,7 +1124,9 @@ async function extractArticleFromTab(tabId: number): Promise<ArticleExtractResul
       }
 
       if (paragraphs.length < 3) {
-        const fallback = textOf(clone || document.body);
+        const fallback = (root.textContent || document.body.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim();
         for (const chunk of fallback.split(/(?<=[。！？.!?])\s+|\n{2,}/).slice(0, 80)) {
           push("paragraph", oneLine(chunk, 1200));
         }
@@ -1149,7 +1158,7 @@ async function extractArticleFromTab(tabId: number): Promise<ArticleExtractResul
         markdown,
         paragraphs,
         char_count: text.length,
-        extraction_method: root === document.body ? "body_score_fallback" : "scored_article_root",
+        extraction_method: root === document.body ? "body_blocks" : "semantic_root_blocks",
       };
     },
   });
@@ -1168,6 +1177,18 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 chrome.runtime.onStartup.addListener(() => ensureOffscreen());
+
+chrome.tabs.onActivated.addListener((info) => {
+  void chrome.tabs.get(info.tabId).then(rememberActivePage).catch(() => {});
+});
+
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+  if (tab.active && (changeInfo.url || changeInfo.title || changeInfo.status === "complete")) {
+    rememberActivePage(tab);
+  }
+});
+
+void findActivePageTab().catch(() => {});
 
 // ── manual proactive trigger ─────────────────────────────────────────
 // Widget 单击打开 chat popup 后 → prompt_suggestions;

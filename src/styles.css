@@ -93,6 +93,68 @@ html, body, #app {
 .bbt-md th { background: rgba(0,0,0,0.04); font-weight: 600; }
 .bbt-md img { max-width: 100%; height: auto; border-radius: 4px; }
 
+.bbt-assistant-flow {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+  width: 100%;
+}
+
+.bbt-inline-tools {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.4rem;
+  margin-top: 0.45rem;
+}
+
+.bbt-page-read {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.42rem;
+  min-height: 1.55rem;
+  padding: 0.18rem 0.58rem;
+  border: 1px solid var(--bbt-border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.58);
+  color: var(--bbt-muted);
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.bbt-page-read-dot {
+  width: 0.42rem;
+  height: 0.42rem;
+  border-radius: 999px;
+  background: var(--bbt-accent);
+  opacity: 0.78;
+}
+
+.bbt-page-read-running .bbt-page-read-dot {
+  animation: bbt-pulse 1s ease-in-out infinite;
+}
+
+.bbt-page-read-done .bbt-page-read-dot {
+  background: #49a36a;
+}
+
+.bbt-page-read-error {
+  color: #9a3f2c;
+  border-color: #e3b5a4;
+  background: #fff7f3;
+}
+
+.bbt-page-read-time {
+  color: var(--bbt-subtle);
+  font-size: 11px;
+}
+
+@keyframes bbt-pulse {
+  0%, 100% { transform: scale(0.82); opacity: 0.42; }
+  50% { transform: scale(1); opacity: 0.88; }
+}
+
 .bbt-tools {
   margin-top: 0.45rem;
   max-width: 100%;
