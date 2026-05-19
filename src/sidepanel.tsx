@@ -63,6 +63,11 @@ type PinnedTarget = { tab_id?: number; window_id?: number };
 
 const SERVER = "http://127.0.0.1:18791";
 const SIDEPANEL_PORT = "babata-sidepanel";
+const CHAT_HISTORY_KEY_PREFIX = "babata.chat.history.v1";
+const CHAT_HISTORY_LATEST_KEY = `${CHAT_HISTORY_KEY_PREFIX}:latest`;
+const CHAT_HISTORY_MAX_MESSAGES = 200;
+const CHAT_TEXT_MAX_CHARS = 120_000;
+const CHAT_TOOL_TEXT_MAX_CHARS = 12_000;
 
 type ServerEvent =
   | { type: "text_delta"; text: string }
@@ -71,6 +76,12 @@ type ServerEvent =
   | { type: "session"; session_id: string }
   | { type: "done" }
   | { type: "error"; text: string };
+
+type SavedChatHistory = {
+  version: 1;
+  updated_at: number;
+  messages: Msg[];
+};
 
 marked.setOptions({ breaks: true, gfm: true });
 
@@ -168,6 +179,184 @@ async function activePageContextFromSw(): Promise<PinnedTarget | null> {
   } catch {
     return null;
   }
+}
+
+function chatHistoryStorageKey(windowId?: number): string {
+  return typeof windowId === "number" && Number.isFinite(windowId)
+    ? `${CHAT_HISTORY_KEY_PREFIX}:window:${windowId}`
+    : `${CHAT_HISTORY_KEY_PREFIX}:global`;
+}
+
+async function resolveChatHistoryStorageKey(
+  target?: PinnedTarget | null,
+): Promise<string> {
+  if (typeof target?.window_id === "number") {
+    return chatHistoryStorageKey(target.window_id);
+  }
+  const active = await activePageContextFromSw();
+  return chatHistoryStorageKey(active?.window_id);
+}
+
+function truncateText(value: unknown, limit: number): string {
+  if (typeof value !== "string") return "";
+  return value.length > limit ? value.slice(0, limit) : value;
+}
+
+function storageSafeUnknown(value: unknown, limit: number): unknown {
+  if (typeof value === "string") return truncateText(value, limit);
+  if (value === null || value === undefined) return value;
+  try {
+    const encoded = JSON.stringify(value);
+    if (!encoded || encoded.length <= limit) return value;
+    return encoded.slice(0, limit);
+  } catch {
+    return truncateText(String(value), limit);
+  }
+}
+
+function normalizeMessagePart(raw: unknown, index: number): MessagePart | null {
+  if (!raw || typeof raw !== "object") return null;
+  const item = raw as Record<string, unknown>;
+  const id = typeof item.id === "string" ? item.id : `stored-part-${index + 1}`;
+  if (item.type === "text") {
+    return {
+      type: "text",
+      id,
+      text: truncateText(item.text, CHAT_TEXT_MAX_CHARS),
+    };
+  }
+  if (item.type === "page_read") {
+    const status =
+      item.status === "running" || item.status === "done" || item.status === "error"
+        ? item.status
+        : "done";
+    return {
+      type: "page_read",
+      id,
+      name: typeof item.name === "string" ? item.name : "page_read",
+      status,
+      is_error: item.is_error === true,
+      duration_ms: typeof item.duration_ms === "number" ? item.duration_ms : undefined,
+    };
+  }
+  return null;
+}
+
+function sanitizeAttachmentForStorage(raw: Attachment): Attachment {
+  return {
+    id: raw.id,
+    kind: raw.kind,
+    name: raw.name,
+    mime: raw.mime,
+    size: raw.size,
+    data_base64: "",
+  };
+}
+
+function sanitizeToolsForStorage(raw: unknown): ToolTrace[] {
+  return normalizeToolTrace(raw).map((tool) => ({
+    ...tool,
+    input: storageSafeUnknown(tool.input, CHAT_TOOL_TEXT_MAX_CHARS),
+    result: truncateText(tool.result, CHAT_TOOL_TEXT_MAX_CHARS) || undefined,
+  }));
+}
+
+function sanitizeMsgsForStorage(messages: Msg[]): Msg[] {
+  return messages.slice(-CHAT_HISTORY_MAX_MESSAGES).map((msg) => {
+    const out: Msg = {
+      role: msg.role,
+      text: truncateText(msg.text, CHAT_TEXT_MAX_CHARS),
+    };
+    const parts = (msg.parts ?? [])
+      .map((part, index) => normalizeMessagePart(part, index))
+      .filter((part): part is MessagePart => part !== null);
+    if (parts.length > 0) out.parts = parts;
+    const attachments = (msg.attachments ?? []).map(sanitizeAttachmentForStorage);
+    if (attachments.length > 0) out.attachments = attachments;
+    const tools = sanitizeToolsForStorage(msg.tools);
+    if (tools.length > 0) out.tools = tools;
+    if (typeof msg.clean_read_id === "string") out.clean_read_id = msg.clean_read_id;
+    if (msg.pending) out.pending = true;
+    return out;
+  });
+}
+
+function normalizeStoredMsgs(raw: unknown): Msg[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+    .filter((item) => item.role === "user" || item.role === "assistant")
+    .map((item) => {
+      const msg: Msg = {
+        role: item.role as "user" | "assistant",
+        text: truncateText(item.text, CHAT_TEXT_MAX_CHARS),
+      };
+      const parts = Array.isArray(item.parts)
+        ? item.parts
+          .map((part, index) => normalizeMessagePart(part, index))
+          .filter((part): part is MessagePart => part !== null)
+        : [];
+      if (parts.length > 0) msg.parts = parts;
+      const attachments = Array.isArray(item.attachments)
+        ? item.attachments
+          .filter((a): a is Record<string, unknown> => !!a && typeof a === "object")
+          .filter((a) => a.kind === "image" || a.kind === "video" || a.kind === "file")
+          .map((a, index) => ({
+            id: typeof a.id === "string" ? a.id : `stored-attachment-${index + 1}`,
+            kind: a.kind as Attachment["kind"],
+            name: typeof a.name === "string" ? a.name : "attachment",
+            mime: typeof a.mime === "string" ? a.mime : "application/octet-stream",
+            size: typeof a.size === "number" ? a.size : 0,
+            data_base64: "",
+          }))
+        : [];
+      if (attachments.length > 0) msg.attachments = attachments;
+      const tools = sanitizeToolsForStorage(item.tools);
+      if (tools.length > 0) msg.tools = tools;
+      if (typeof item.clean_read_id === "string") msg.clean_read_id = item.clean_read_id;
+      if (item.pending === true) msg.pending = true;
+      return msg;
+    });
+}
+
+function normalizeSavedChatHistory(raw: unknown): SavedChatHistory | null {
+  if (!raw || typeof raw !== "object") return null;
+  const item = raw as Record<string, unknown>;
+  if (item.version !== 1 || !Array.isArray(item.messages)) return null;
+  return {
+    version: 1,
+    updated_at: typeof item.updated_at === "number" ? item.updated_at : 0,
+    messages: normalizeStoredMsgs(item.messages),
+  };
+}
+
+async function readSavedChatHistory(key: string): Promise<Msg[]> {
+  try {
+    const got = await chrome.storage.local.get([key, CHAT_HISTORY_LATEST_KEY]);
+    const exact = normalizeSavedChatHistory(got[key]);
+    if (exact) return exact.messages;
+    const latest = normalizeSavedChatHistory(got[CHAT_HISTORY_LATEST_KEY]);
+    return latest?.messages ?? [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeSavedChatHistory(key: string, messages: Msg[]): Promise<void> {
+  const record: SavedChatHistory = {
+    version: 1,
+    updated_at: Date.now(),
+    messages: sanitizeMsgsForStorage(messages),
+  };
+  await chrome.storage.local.set({
+    [key]: record,
+    [CHAT_HISTORY_LATEST_KEY]: record,
+  });
+}
+
+async function clearSavedChatHistory(key: string | null): Promise<void> {
+  const keys = key ? [key, CHAT_HISTORY_LATEST_KEY] : [CHAT_HISTORY_LATEST_KEY];
+  await chrome.storage.local.remove(keys);
 }
 
 async function tabForTarget(target?: PinnedTarget | null): Promise<chrome.tabs.Tab | null> {
@@ -351,6 +540,8 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lastSentUrl = useRef<string>("");
   const pinnedTarget = useRef<PinnedTarget | null>(pinnedTargetFromLocation());
+  const [historyStorageKey, setHistoryStorageKey] = useState<string | null>(null);
+  const [localHistoryLoaded, setLocalHistoryLoaded] = useState(false);
 
   useEffect(() => {
     let port: chrome.runtime.Port | null = null;
@@ -425,11 +616,38 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const key = await resolveChatHistoryStorageKey(pinnedTarget.current);
+      const saved = await readSavedChatHistory(key);
+      if (cancelled) return;
+      setHistoryStorageKey(key);
+      if (saved.length > 0) {
+        setMsgs((prev) => (prev.length === 0 ? saved : prev));
+      }
+      setLocalHistoryLoaded(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!historyStorageKey || !localHistoryLoaded) return;
+    writeSavedChatHistory(historyStorageKey, msgs).catch(() => {});
+  }, [historyStorageKey, localHistoryLoaded, msgs]);
+
   // Mount/refresh 时拉聊天历史 — V 关闭再开 sidebar / 刷新页面 / 切到 chat popup
   // iframe 都能恢复. 服务端 read_since_last_boundary, V 点新对话后只拉空.
   useEffect(() => {
+    if (!localHistoryLoaded) return;
     let cancelled = false;
-    fetch(`${SERVER}/history?limit=200`)
+    fetch(`${SERVER}/history?limit=200`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    })
       .then((r) => r.json())
       .then((data: {
         ok?: boolean;
@@ -450,7 +668,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [localHistoryLoaded]);
 
   useEffect(() => {
     let alive = true;
@@ -630,6 +848,7 @@ function App() {
       });
       return [];
     });
+    void clearSavedChatHistory(historyStorageKey).catch(() => {});
     // 让 server 起新 session: 发 /new 给 cc.py (复用 cc 的 /new 命令路径).
     void fetch(`${SERVER}/chat`, {
       method: "POST",
