@@ -1,5 +1,13 @@
 /// <reference types="chrome" />
 
+import {
+  STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
+  STORAGE_ALWAYS_TRANSLATE_HOSTS,
+  STORAGE_TRANSLATION_MODE,
+  effectiveTranslationModeForUrl,
+  normalizeTranslationRenderMode,
+} from "./translation-settings";
+
 // SW = 极薄 dispatcher.
 //
 // Architecture:
@@ -64,6 +72,8 @@ const lastSnapshotKeysByTab = new Map<number, { url: string; keys: Set<string> }
 const snapshotStores = new Map<string, SnapshotStore>();
 const SNAPSHOT_STORE_MAX = 20;
 const SIDEPANEL_PORT = "babata-sidepanel";
+const CHAT_HISTORY_KEY_PREFIX = "babata.chat.history.v1";
+const CHAT_HISTORY_LATEST_KEY = `${CHAT_HISTORY_KEY_PREFIX}:latest`;
 const sidepanelPorts = new Set<chrome.runtime.Port>();
 let lastActivePageContext: {
   tab_id: number;
@@ -152,6 +162,19 @@ async function ensureOffscreen() {
   }
 }
 
+function chatStorageKeyFromMessage(msg: unknown): string | null {
+  if (!msg || typeof msg !== "object") return null;
+  const key = (msg as Record<string, unknown>).storage_key;
+  return typeof key === "string" && key.startsWith(CHAT_HISTORY_KEY_PREFIX) ? key : null;
+}
+
+function normalizeChatSnapshot(raw: unknown): Record<string, unknown> | null {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw as Record<string, unknown>;
+  if (record.version !== 1 || !Array.isArray(record.messages)) return null;
+  return record;
+}
+
 // ── messages from offscreen / sidepanel ──────────────────────────────
 
 chrome.runtime.onConnect.addListener((port) => {
@@ -210,6 +233,95 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           url: tab?.url ?? "",
           title: tab?.title ?? "",
         });
+      } catch (e) {
+        sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (m.type === "babata.chat.snapshot_write") {
+    void (async () => {
+      try {
+        const key = chatStorageKeyFromMessage(msg);
+        const record = normalizeChatSnapshot((msg as Record<string, unknown>).record);
+        if (!key || !record) {
+          sendResponse?.({ ok: false, error: "invalid chat snapshot" });
+          return;
+        }
+        await chrome.storage.local.set({
+          [key]: record,
+          [CHAT_HISTORY_LATEST_KEY]: record,
+        });
+        sendResponse?.({ ok: true });
+      } catch (e) {
+        sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (m.type === "babata.chat.snapshot_clear") {
+    void (async () => {
+      try {
+        const key = chatStorageKeyFromMessage(msg);
+        if (!key) {
+          sendResponse?.({ ok: false, error: "invalid storage key" });
+          return;
+        }
+        await chrome.storage.local.remove([key, CHAT_HISTORY_LATEST_KEY]);
+        sendResponse?.({ ok: true });
+      } catch (e) {
+        sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (m.type === "babata.chat.snapshot_mark_stopped") {
+    void (async () => {
+      try {
+        const key = chatStorageKeyFromMessage(msg);
+        if (!key) {
+          sendResponse?.({ ok: false, error: "invalid storage key" });
+          return;
+        }
+        const got = await chrome.storage.local.get([key]);
+        const record = normalizeChatSnapshot(got[key]);
+        if (record) {
+          const stopped = { ...record, streaming: false, updated_at: Date.now() };
+          await chrome.storage.local.set({
+            [key]: stopped,
+            [CHAT_HISTORY_LATEST_KEY]: stopped,
+          });
+        }
+        sendResponse?.({ ok: true });
+      } catch (e) {
+        sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (
+    m.type === "babata.chat.start" ||
+    m.type === "babata.chat.abort" ||
+    m.type === "babata.chat.clear"
+  ) {
+    void (async () => {
+      try {
+        await ensureOffscreen();
+        const targetType =
+          m.type === "babata.chat.start"
+            ? "babata.offscreen.chat.start"
+            : m.type === "babata.chat.abort"
+              ? "babata.offscreen.chat.abort"
+              : "babata.offscreen.chat.clear";
+        const resp = await chrome.runtime.sendMessage({
+          ...(msg as Record<string, unknown>),
+          type: targetType,
+        });
+        sendResponse?.(resp ?? { ok: true });
       } catch (e) {
         sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
       }
@@ -429,12 +541,6 @@ function intArg(args: Record<string, unknown>, ...names: string[]): number | und
     if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
   }
   return undefined;
-}
-
-function normalizeTranslationMode(v: unknown): "off" | "bilingual" | "replace" {
-  if (v === "off") return "off";
-  if (v === "auto" || v === "replace") return "replace";
-  return "bilingual";
 }
 
 async function targetTab(args: Record<string, unknown> = {}): Promise<chrome.tabs.Tab> {
@@ -1216,10 +1322,19 @@ async function requestProactive(tabId: number, intent: ProactiveIntent): Promise
   }
 
   // 读 V 当前翻译档位 (chrome.storage.local 由 content widget 设置).
-  let translationMode: "off" | "bilingual" | "replace" = "bilingual";
+  let translationMode: "off" | "bilingual" | "replace" = "replace";
   try {
-    const got = await chrome.storage.local.get("babata.translation_mode");
-    translationMode = normalizeTranslationMode(got["babata.translation_mode"]);
+    const got = await chrome.storage.local.get([
+      STORAGE_TRANSLATION_MODE,
+      STORAGE_ALWAYS_TRANSLATE_HOSTS,
+      STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
+    ]);
+    translationMode = effectiveTranslationModeForUrl(
+      normalizeTranslationRenderMode(got[STORAGE_TRANSLATION_MODE]),
+      got[STORAGE_ALWAYS_TRANSLATE_HOSTS],
+      url,
+      got[STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS],
+    );
   } catch {
     /* default bilingual */
   }

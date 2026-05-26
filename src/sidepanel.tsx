@@ -58,6 +58,19 @@ type LightContext = {
   selection?: string;
 };
 
+type CpuName = "claude" | "codex";
+type CpuChoice = {
+  name: CpuName;
+  label: string;
+  current?: boolean;
+};
+type CpuStatus = {
+  ok: boolean;
+  cpu: CpuName;
+  label: string;
+  choices: CpuChoice[];
+  message?: string;
+};
 type Suggestion = { id: string; text: string };
 type PinnedTarget = { tab_id?: number; window_id?: number };
 
@@ -69,18 +82,22 @@ const CHAT_HISTORY_MAX_MESSAGES = 200;
 const CHAT_TEXT_MAX_CHARS = 120_000;
 const CHAT_TOOL_TEXT_MAX_CHARS = 12_000;
 
-type ServerEvent =
-  | { type: "text_delta"; text: string }
-  | { type: "tool_use"; trace_id?: string; name: string; input?: unknown }
-  | { type: "tool_result"; trace_id?: string; is_error?: boolean; text?: string }
-  | { type: "session"; session_id: string }
-  | { type: "done" }
-  | { type: "error"; text: string };
-
 type SavedChatHistory = {
   version: 1;
   updated_at: number;
   messages: Msg[];
+  streaming?: boolean;
+  active_turn_id?: string;
+};
+
+type SavedChatScrollState = {
+  version: 1;
+  updated_at: number;
+  top: number;
+  height: number;
+  client_height: number;
+  bottom_distance: number;
+  at_bottom: boolean;
 };
 
 marked.setOptions({ breaks: true, gfm: true });
@@ -113,8 +130,37 @@ function isPageReadTool(name: string, input?: unknown): boolean {
   return false;
 }
 
-function newPartId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+function isCpuName(value: unknown): value is CpuName {
+  return value === "claude" || value === "codex";
+}
+
+function normalizeCpuStatus(raw: unknown): CpuStatus | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (!obj.ok || !isCpuName(obj.cpu)) return null;
+  const choicesRaw = Array.isArray(obj.choices) ? obj.choices : [];
+  const choices = choicesRaw
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+    .filter((item) => isCpuName(item.name))
+    .map((item) => ({
+      name: item.name as CpuName,
+      label: typeof item.label === "string" ? item.label : String(item.name),
+      current: Boolean(item.current),
+    }));
+  return {
+    ok: true,
+    cpu: obj.cpu,
+    label: typeof obj.label === "string" ? obj.label : String(obj.cpu),
+    choices: choices.length > 0 ? choices : [
+      { name: "codex", label: "Codex", current: obj.cpu === "codex" },
+      { name: "claude", label: "Claude Code", current: obj.cpu === "claude" },
+    ],
+    message: typeof obj.message === "string" ? obj.message : undefined,
+  };
+}
+
+function cpuShortLabel(choice: CpuChoice): string {
+  return choice.name === "claude" ? "CC" : "Codex";
 }
 
 function renderMarkdown(text: string): string {
@@ -327,26 +373,36 @@ function normalizeSavedChatHistory(raw: unknown): SavedChatHistory | null {
     version: 1,
     updated_at: typeof item.updated_at === "number" ? item.updated_at : 0,
     messages: normalizeStoredMsgs(item.messages),
+    streaming: item.streaming === true,
+    active_turn_id:
+      typeof item.active_turn_id === "string" ? item.active_turn_id : undefined,
   };
 }
 
-async function readSavedChatHistory(key: string): Promise<Msg[]> {
+async function readSavedChatHistory(key: string): Promise<SavedChatHistory | null> {
   try {
     const got = await chrome.storage.local.get([key, CHAT_HISTORY_LATEST_KEY]);
     const exact = normalizeSavedChatHistory(got[key]);
-    if (exact) return exact.messages;
+    if (exact) return exact;
     const latest = normalizeSavedChatHistory(got[CHAT_HISTORY_LATEST_KEY]);
-    return latest?.messages ?? [];
+    return latest;
   } catch {
-    return [];
+    return null;
   }
 }
 
-async function writeSavedChatHistory(key: string, messages: Msg[]): Promise<void> {
+async function writeSavedChatHistory(
+  key: string,
+  messages: Msg[],
+  streaming = false,
+  activeTurnId?: string,
+): Promise<void> {
   const record: SavedChatHistory = {
     version: 1,
     updated_at: Date.now(),
     messages: sanitizeMsgsForStorage(messages),
+    streaming,
+    active_turn_id: activeTurnId,
   };
   await chrome.storage.local.set({
     [key]: record,
@@ -357,6 +413,79 @@ async function writeSavedChatHistory(key: string, messages: Msg[]): Promise<void
 async function clearSavedChatHistory(key: string | null): Promise<void> {
   const keys = key ? [key, CHAT_HISTORY_LATEST_KEY] : [CHAT_HISTORY_LATEST_KEY];
   await chrome.storage.local.remove(keys);
+}
+
+function chatStateSignature(messages: Msg[], streaming: boolean): string {
+  try {
+    return JSON.stringify({ streaming, messages: sanitizeMsgsForStorage(messages) });
+  } catch {
+    return `${streaming}:${messages.length}`;
+  }
+}
+
+function chatScrollStorageKey(historyKey: string): string {
+  return `${historyKey}:scroll`;
+}
+
+function normalizeSavedChatScrollState(raw: unknown): SavedChatScrollState | null {
+  if (!raw || typeof raw !== "object") return null;
+  const item = raw as Record<string, unknown>;
+  if (item.version !== 1) return null;
+  const top = typeof item.top === "number" ? item.top : 0;
+  const height = typeof item.height === "number" ? item.height : 0;
+  const clientHeight = typeof item.client_height === "number" ? item.client_height : 0;
+  const bottomDistance =
+    typeof item.bottom_distance === "number" ? item.bottom_distance : 0;
+  return {
+    version: 1,
+    updated_at: typeof item.updated_at === "number" ? item.updated_at : 0,
+    top: Math.max(0, top),
+    height: Math.max(0, height),
+    client_height: Math.max(0, clientHeight),
+    bottom_distance: Math.max(0, bottomDistance),
+    at_bottom: item.at_bottom === true,
+  };
+}
+
+function captureScrollState(el: HTMLElement): SavedChatScrollState {
+  const bottomDistance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
+  return {
+    version: 1,
+    updated_at: Date.now(),
+    top: Math.max(0, el.scrollTop),
+    height: Math.max(0, el.scrollHeight),
+    client_height: Math.max(0, el.clientHeight),
+    bottom_distance: bottomDistance,
+    at_bottom: bottomDistance <= 24,
+  };
+}
+
+async function readSavedChatScrollState(
+  historyKey: string,
+): Promise<SavedChatScrollState | null> {
+  try {
+    const got = await chrome.storage.local.get([chatScrollStorageKey(historyKey)]);
+    return normalizeSavedChatScrollState(got[chatScrollStorageKey(historyKey)]);
+  } catch {
+    return null;
+  }
+}
+
+async function writeSavedChatScrollState(
+  historyKey: string,
+  state: SavedChatScrollState,
+): Promise<void> {
+  await chrome.storage.local.set({
+    [chatScrollStorageKey(historyKey)]: {
+      ...state,
+      updated_at: Date.now(),
+    },
+  });
+}
+
+async function clearSavedChatScrollState(historyKey: string | null): Promise<void> {
+  if (!historyKey) return;
+  await chrome.storage.local.remove([chatScrollStorageKey(historyKey)]);
 }
 
 async function tabForTarget(target?: PinnedTarget | null): Promise<chrome.tabs.Tab | null> {
@@ -531,17 +660,40 @@ function App() {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [serverOk, setServerOk] = useState<boolean | null>(null);
+  const [cpuStatus, setCpuStatus] = useState<CpuStatus | null>(null);
+  const [cpuSwitching, setCpuSwitching] = useState<CpuName | null>(null);
+  const [cpuError, setCpuError] = useState("");
   const [pageMeta, setPageMeta] = useState<LightContext | null>(null);
   const [selection, setSelection] = useState<string>("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
-  const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lastSentUrl = useRef<string>("");
   const pinnedTarget = useRef<PinnedTarget | null>(pinnedTargetFromLocation());
+  const msgsRef = useRef<Msg[]>([]);
+  const streamingRef = useRef(false);
+  const historyStorageKeyRef = useRef<string | null>(null);
+  const lastStorageSignatureRef = useRef("");
+  const lastWrittenSignatureRef = useRef("");
+  const pendingScrollRestoreRef = useRef<SavedChatScrollState | null>(null);
+  const scrollRestoreDoneRef = useRef(false);
+  const stickToBottomRef = useRef(true);
+  const scrollWriteTimerRef = useRef<number | null>(null);
   const [historyStorageKey, setHistoryStorageKey] = useState<string | null>(null);
   const [localHistoryLoaded, setLocalHistoryLoaded] = useState(false);
+
+  useEffect(() => {
+    msgsRef.current = msgs;
+  }, [msgs]);
+
+  useEffect(() => {
+    streamingRef.current = streaming;
+  }, [streaming]);
+
+  useEffect(() => {
+    historyStorageKeyRef.current = historyStorageKey;
+  }, [historyStorageKey]);
 
   useEffect(() => {
     let port: chrome.runtime.Port | null = null;
@@ -605,8 +757,12 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     fetch(`${SERVER}/health`)
-      .then((r) => {
+      .then(async (r) => {
         if (!cancelled) setServerOk(r.ok);
+        if (!r.ok) return;
+        const data = await r.json();
+        const status = normalizeCpuStatus(data);
+        if (!cancelled && status) setCpuStatus(status);
       })
       .catch(() => {
         if (!cancelled) setServerOk(false);
@@ -620,11 +776,22 @@ function App() {
     let cancelled = false;
     void (async () => {
       const key = await resolveChatHistoryStorageKey(pinnedTarget.current);
-      const saved = await readSavedChatHistory(key);
+      const [saved, savedScroll] = await Promise.all([
+        readSavedChatHistory(key),
+        readSavedChatScrollState(key),
+      ]);
       if (cancelled) return;
       setHistoryStorageKey(key);
-      if (saved.length > 0) {
-        setMsgs((prev) => (prev.length === 0 ? saved : prev));
+      pendingScrollRestoreRef.current = savedScroll;
+      scrollRestoreDoneRef.current = false;
+      stickToBottomRef.current = savedScroll ? savedScroll.at_bottom : true;
+      if (saved && saved.messages.length > 0) {
+        lastStorageSignatureRef.current = chatStateSignature(
+          saved.messages,
+          saved.streaming === true,
+        );
+        setMsgs((prev) => (prev.length === 0 ? saved.messages : prev));
+        setStreaming(saved.streaming === true);
       }
       setLocalHistoryLoaded(true);
     })();
@@ -635,8 +802,37 @@ function App() {
 
   useEffect(() => {
     if (!historyStorageKey || !localHistoryLoaded) return;
-    writeSavedChatHistory(historyStorageKey, msgs).catch(() => {});
-  }, [historyStorageKey, localHistoryLoaded, msgs]);
+    const sig = chatStateSignature(msgs, streaming);
+    if (sig === lastStorageSignatureRef.current || sig === lastWrittenSignatureRef.current) return;
+    lastWrittenSignatureRef.current = sig;
+    writeSavedChatHistory(historyStorageKey, msgs, streaming).catch(() => {});
+  }, [historyStorageKey, localHistoryLoaded, msgs, streaming]);
+
+  useEffect(() => {
+    if (!historyStorageKey) return;
+    const applyRecord = (raw: unknown) => {
+      const record = normalizeSavedChatHistory(raw);
+      if (!record) return;
+      const sig = chatStateSignature(record.messages, record.streaming === true);
+      if (sig === chatStateSignature(msgsRef.current, streamingRef.current)) return;
+      lastStorageSignatureRef.current = sig;
+      setMsgs(record.messages);
+      setStreaming(record.streaming === true);
+    };
+    const listener = (
+      changes: Record<string, chrome.storage.StorageChange>,
+      areaName: string,
+    ) => {
+      if (areaName !== "local") return;
+      const changed = changes[historyStorageKey];
+      if (!changed || changed.newValue === undefined) return;
+      applyRecord(changed.newValue);
+    };
+    chrome.storage.onChanged.addListener(listener);
+    return () => {
+      chrome.storage.onChanged.removeListener(listener);
+    };
+  }, [historyStorageKey]);
 
   // Mount/refresh 时拉聊天历史 — V 关闭再开 sidebar / 刷新页面 / 切到 chat popup
   // iframe 都能恢复. 服务端 read_since_last_boundary, V 点新对话后只拉空.
@@ -772,8 +968,39 @@ function App() {
 
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [msgs]);
+    if (!el || !localHistoryLoaded) return;
+    window.requestAnimationFrame(() => {
+      const current = scrollRef.current;
+      if (!current) return;
+      if (!scrollRestoreDoneRef.current) {
+        const saved = pendingScrollRestoreRef.current;
+        pendingScrollRestoreRef.current = null;
+        scrollRestoreDoneRef.current = true;
+        if (saved) {
+          if (saved.at_bottom) {
+            current.scrollTop = current.scrollHeight;
+          } else {
+            const maxTop = Math.max(0, current.scrollHeight - current.clientHeight);
+            current.scrollTop = Math.min(saved.top, maxTop);
+          }
+          return;
+        }
+      }
+      if (stickToBottomRef.current) {
+        current.scrollTop = current.scrollHeight;
+      }
+    });
+  }, [localHistoryLoaded, msgs]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollWriteTimerRef.current !== null) {
+        window.clearTimeout(scrollWriteTimerRef.current);
+        scrollWriteTimerRef.current = null;
+      }
+      persistScrollStateNow();
+    };
+  }, []);
 
   async function ingestFile(file: File) {
     if (file.size > 50 * 1024 * 1024) {
@@ -836,8 +1063,38 @@ function App() {
     if (files && files.length > 0) await ingestFiles(files);
   }
 
+  function persistScrollStateNow() {
+    const key = historyStorageKeyRef.current;
+    const el = scrollRef.current;
+    if (!key || !el) return;
+    const state = captureScrollState(el);
+    stickToBottomRef.current = state.at_bottom;
+    void writeSavedChatScrollState(key, state).catch(() => {});
+  }
+
+  function schedulePersistScrollState() {
+    if (scrollWriteTimerRef.current !== null) {
+      window.clearTimeout(scrollWriteTimerRef.current);
+    }
+    scrollWriteTimerRef.current = window.setTimeout(() => {
+      scrollWriteTimerRef.current = null;
+      persistScrollStateNow();
+    }, 120);
+  }
+
+  function handleHistoryScroll() {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickToBottomRef.current = captureScrollState(el).at_bottom;
+    schedulePersistScrollState();
+  }
+
   function newSession() {
-    abortRef.current?.abort();
+    if (historyStorageKey) {
+      void chrome.runtime
+        .sendMessage({ type: "babata.chat.clear", storage_key: historyStorageKey })
+        .catch(() => {});
+    }
     setMsgs([]);
     setSuggestions([]);
     setInput("");
@@ -849,6 +1106,7 @@ function App() {
       return [];
     });
     void clearSavedChatHistory(historyStorageKey).catch(() => {});
+    void clearSavedChatScrollState(historyStorageKey).catch(() => {});
     // 让 server 起新 session: 发 /new 给 cc.py (复用 cc 的 /new 命令路径).
     void fetch(`${SERVER}/chat`, {
       method: "POST",
@@ -857,139 +1115,48 @@ function App() {
     }).catch(() => {});
   }
 
+  async function switchCpu(cpu: CpuName) {
+    if (streaming || cpuSwitching || cpu === cpuStatus?.cpu) return;
+    setCpuSwitching(cpu);
+    setCpuError("");
+    try {
+      const resp = await fetch(`${SERVER}/cpu`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cpu }),
+      });
+      const data = await resp.json().catch(() => null);
+      const status = normalizeCpuStatus(data);
+      if (!resp.ok || !status) {
+        const error =
+          data && typeof data === "object" && typeof (data as Record<string, unknown>).error === "string"
+            ? String((data as Record<string, unknown>).error)
+            : `HTTP ${resp.status}`;
+        throw new Error(error);
+      }
+      setCpuStatus(status);
+      setSuggestions([]);
+    } catch (e) {
+      const m = e as { message?: string };
+      setCpuError(m?.message ?? String(e));
+    } finally {
+      setCpuSwitching(null);
+    }
+  }
+
   async function send(textOverride?: string) {
     const text = (textOverride ?? input).trim();
     if ((!text && attachments.length === 0) || streaming) return;
 
     const sentAttachments = attachments;
-    setInput("");
-    setAttachments([]);
-    setSuggestions([]);
-    setMsgs((m) => [
-      ...m,
-      { role: "user", text, attachments: sentAttachments },
-      { role: "assistant", text: "" },
-    ]);
-    setStreaming(true);
-
-    const ctrl = new AbortController();
-    abortRef.current = ctrl;
-
-    let accum = "";
-    const updateLastAssistant = (fn: (msg: Msg) => Msg) => {
-      setMsgs((m) => {
-        const last = m[m.length - 1];
-        if (!last || last.role !== "assistant") return m;
-        return [...m.slice(0, -1), fn(last)];
-      });
-    };
-    const appendAssistant = (chunk: string) => {
-      accum += chunk;
-      updateLastAssistant((last) => {
-        const parts = [...(last.parts ?? [])];
-        const tail = parts[parts.length - 1];
-        if (tail?.type === "text") {
-          parts[parts.length - 1] = { ...tail, text: tail.text + chunk };
-        } else {
-          parts.push({ type: "text", id: newPartId("text"), text: chunk });
-        }
-        return { ...last, text: accum, parts };
-      });
-    };
-    const appendToolUse = (ev: Extract<ServerEvent, { type: "tool_use" }>) => {
-      const id = ev.trace_id || `live-tool-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      const isPageRead = isPageReadTool(ev.name, ev.input);
-      const name = effectiveToolName(ev.name, ev.input);
-      updateLastAssistant((last) => ({
-        ...last,
-        parts: isPageRead
-          ? [
-              ...(last.parts ?? []),
-              {
-                type: "page_read",
-                id,
-                name,
-                status: "running",
-              },
-            ]
-          : last.parts,
-        tools: [
-          ...(last.tools ?? []),
-          {
-            id,
-            name,
-            input: ev.input,
-            status: "running",
-            started_at: Date.now() / 1000,
-          },
-        ],
-      }));
-    };
-    const appendToolResult = (ev: Extract<ServerEvent, { type: "tool_result" }>) => {
-      updateLastAssistant((last) => {
-        const tools = [...(last.tools ?? [])];
-        let idx = ev.trace_id ? tools.findIndex((t) => t.id === ev.trace_id) : -1;
-        if (idx === -1) {
-          for (let i = tools.length - 1; i >= 0; i -= 1) {
-            if (toolStatus(tools[i]) === "running") {
-              idx = i;
-              break;
-            }
-          }
-        }
-        const endedAt = Date.now() / 1000;
-        let resolvedId = ev.trace_id;
-        if (idx === -1) {
-          resolvedId = ev.trace_id || `live-result-${Date.now()}`;
-          tools.push({
-            id: resolvedId,
-            name: "tool_result",
-            status: ev.is_error ? "error" : "done",
-            is_error: ev.is_error,
-            result: ev.text ?? "",
-            ended_at: endedAt,
-          });
-        } else {
-          const current = tools[idx];
-          resolvedId = current.id;
-          const duration =
-            typeof current.started_at === "number"
-              ? Math.max(0, Math.round((endedAt - current.started_at) * 1000))
-              : current.duration_ms;
-          tools[idx] = {
-            ...current,
-            status: ev.is_error ? "error" : "done",
-            is_error: ev.is_error,
-            result: ev.text ?? "",
-            ended_at: endedAt,
-            duration_ms: duration,
-          };
-        }
-        const nextStatus: ToolTraceStatus = ev.is_error ? "error" : "done";
-        const resolvedTool = resolvedId ? tools.find((tool) => tool.id === resolvedId) : undefined;
-        const parts = (last.parts ?? []).map((part) => {
-          if (part.type !== "page_read" || part.id !== resolvedId) return part;
-          return {
-            ...part,
-            status: nextStatus,
-            is_error: ev.is_error,
-            duration_ms: resolvedTool?.duration_ms,
-          };
-        });
-        return { ...last, tools, parts };
-      });
-    };
-
-    const [ctx, liveSelection] = await Promise.all([
-      captureLightContext(lastSentUrl.current, pinnedTarget.current),
-      captureCurrentSelection(pinnedTarget.current),
-    ]);
+    const key = historyStorageKey ?? await resolveChatHistoryStorageKey(pinnedTarget.current);
+    if (!historyStorageKey) setHistoryStorageKey(key);
+    const userMsg: Msg = { role: "user", text, attachments: sentAttachments };
+    const assistantMsg: Msg = { role: "assistant", text: "" };
+    const nextMsgs = [...msgsRef.current, userMsg, assistantMsg];
     const pageContext =
-      ctx && liveSelection ? { ...ctx, selection: liveSelection } : ctx;
-    if (ctx?.url) lastSentUrl.current = ctx.url;
-    setPageMeta(ctx);
-    setSelection(liveSelection);
-
+      pageMeta && selection ? { ...pageMeta, selection } : pageMeta ?? undefined;
+    if (pageContext?.url) lastSentUrl.current = pageContext.url;
     const wireAttachments = sentAttachments.map((a) => ({
       kind: a.kind,
       name: a.name,
@@ -998,68 +1165,54 @@ function App() {
       data_base64: a.data_base64,
     }));
 
-    try {
-      const resp = await fetch(`${SERVER}/chat`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          message: text,
-          page_context: pageContext ?? undefined,
-          attachments: wireAttachments.length > 0 ? wireAttachments : undefined,
-        }),
-        signal: ctrl.signal,
-      });
-      if (!resp.ok || !resp.body) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
+    setInput("");
+    setAttachments([]);
+    setSuggestions([]);
+    setMsgs(nextMsgs);
+    setStreaming(true);
 
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf("\n\n")) !== -1) {
-          const raw = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-          const data = raw
-            .split("\n")
-            .filter((l) => l.startsWith("data:"))
-            .map((l) => l.slice(5).trimStart())
-            .join("\n");
-          if (!data) continue;
-          let ev: ServerEvent | null = null;
-          try {
-            ev = JSON.parse(data) as ServerEvent;
-          } catch {
-            continue;
-          }
-          if (ev.type === "text_delta" && typeof ev.text === "string") {
-            appendAssistant(ev.text);
-          } else if (ev.type === "tool_use" && typeof ev.name === "string") {
-            appendToolUse(ev);
-          } else if (ev.type === "tool_result") {
-            appendToolResult(ev);
-          } else if (ev.type === "error" && typeof ev.text === "string") {
-            appendAssistant(`\n\n[err] ${ev.text}`);
-          }
-        }
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        type: "babata.chat.start",
+        storage_key: key,
+        turn_id: `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        message: text,
+        messages: sanitizeMsgsForStorage(nextMsgs),
+        page_context: pageContext ?? undefined,
+        attachments: wireAttachments.length > 0 ? wireAttachments : undefined,
+      }) as { ok?: boolean; error?: string } | undefined;
+      if (!resp?.ok) {
+        throw new Error(resp?.error || "chat start failed");
       }
     } catch (e) {
-      const m = e as { name?: string; message?: string };
-      if (m?.name !== "AbortError") {
-        appendAssistant(`\n\n[network] ${m?.message ?? String(e)}`);
-      }
-    } finally {
+      const m = e as { message?: string };
+      const errorText = `\n\n[network] ${m?.message ?? String(e)}`;
+      setMsgs((current) => {
+        const last = current[current.length - 1];
+        if (!last || last.role !== "assistant") return current;
+        return [
+          ...current.slice(0, -1),
+          {
+            ...last,
+            text: `${last.text}${errorText}`,
+            parts: [
+              ...(last.parts ?? []),
+              { type: "text", id: `error-${Date.now()}`, text: errorText },
+            ],
+          },
+        ];
+      });
       setStreaming(false);
-      abortRef.current = null;
     }
   }
 
   function abort() {
-    abortRef.current?.abort();
+    if (historyStorageKey) {
+      void chrome.runtime
+        .sendMessage({ type: "babata.chat.abort", storage_key: historyStorageKey })
+        .catch(() => {});
+    }
+    setStreaming(false);
   }
 
   function copyMessage(text: string) {
@@ -1075,6 +1228,10 @@ function App() {
       return pageMeta.url || pageMeta.title || "";
     }
   })();
+  const cpuChoices = cpuStatus?.choices ?? [
+    { name: "codex" as const, label: "Codex", current: false },
+    { name: "claude" as const, label: "Claude Code", current: false },
+  ];
 
   return (
     <div
@@ -1106,6 +1263,25 @@ function App() {
         >
           {headerLine}
         </span>
+        <div
+          class="bbt-cpu-switch shrink-0"
+          title={cpuError || (cpuStatus ? `CPU: ${cpuStatus.label}` : "CPU")}
+        >
+          {cpuChoices.map((choice) => {
+            const active = choice.name === cpuStatus?.cpu;
+            return (
+              <button
+                key={choice.name}
+                class={`bbt-cpu-option ${active ? "bbt-cpu-active" : ""}`}
+                onClick={() => switchCpu(choice.name)}
+                disabled={streaming || Boolean(cpuSwitching)}
+                title={choice.label}
+              >
+                {cpuSwitching === choice.name ? "..." : cpuShortLabel(choice)}
+              </button>
+            );
+          })}
+        </div>
         <button
           class="btn-icon w-6 h-6 rounded-md flex items-center justify-center shrink-0"
           title="新对话"
@@ -1124,9 +1300,19 @@ function App() {
           {selection.length > 80 ? selection.slice(0, 80) + "…" : selection}
         </div>
       )}
+      {cpuError && (
+        <div class="px-3 pb-1 text-[11px] text-[#9a3f2c] truncate" title={cpuError}>
+          CPU: {cpuError}
+        </div>
+      )}
 
       {/* Chat history */}
-      <div ref={scrollRef} class="flex-1 overflow-y-auto px-4 py-2 space-y-4">
+      <div
+        ref={scrollRef}
+        data-bbt-chat-scroll="true"
+        class="flex-1 overflow-y-auto px-4 py-2 space-y-4"
+        onScroll={handleHistoryScroll}
+      >
         {msgs.map((m, i) => {
           if (m.role === "user") {
             return (

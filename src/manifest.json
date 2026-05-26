@@ -51,7 +51,8 @@
       "matches": ["<all_urls>"],
       "js": ["src/content/babata-translate.ts"],
       "run_at": "document_idle",
-      "all_frames": false
+      "all_frames": true,
+      "match_about_blank": true
     }
   ],
   "web_accessible_resources": [

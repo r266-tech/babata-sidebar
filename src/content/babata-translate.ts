@@ -1,6 +1,19 @@
 /// <reference types="chrome" />
 
 import DOMPurify from "dompurify";
+import {
+  STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
+  STORAGE_ALWAYS_TRANSLATE_HOSTS,
+  STORAGE_SELECTION_TRANSLATION,
+  STORAGE_TRANSLATION_MODE as STORAGE_MODE,
+  effectiveTranslationModeForHost,
+  hostnameFromUrl,
+  normalizeHostList,
+  normalizeHostname,
+  normalizeTranslationRenderMode as normalizeMode,
+  type TranslationMode,
+  type TranslationRenderMode,
+} from "../translation-settings";
 
 // page-side translation engine.
 //
@@ -28,19 +41,27 @@ const TR_NATIVE_CLASS = "bbt-tr-native";
 const TR_INPLACE_CLASS = "bbt-tr-inplace";
 const SRC_CLASS = "bbt-src";
 const INPLACE_ATTR = "data-bbt-inplace";
+const SELECTION_SETTING_EVENT = "babata:selection-translation-setting";
 
 const SAFE_HTML_OPTS = {
   ALLOWED_TAGS: ["b", "i", "em", "strong", "a", "code", "br", "span", "mark"],
-  ALLOWED_ATTR: ["href", "title", "class"],
+  ALLOWED_ATTR: ["href", "title", "class", "target", "rel", "referrerpolicy"],
 };
 
 // LLM 翻一次, 永远 sibling .bbt-tr 注入. "替换/双语/不翻" 纯 CSS 切换 0 LLM (V 设计).
 // 老 "auto" innerHTML 替换跟 React reconcile fundamentally 抢 DOM (X 实测同 leaf SPAN
 // 10s 被外部 reconcile 9 次), 5 源 (沉浸式 v1.28.5/read-frog/kiss/fluentread/old-immersive)
 // 全选 sibling 注入, 没人替换原文. 替换观感由 CSS hide leaf 元素实现, DOM 不抢.
-type Mode = "off" | "bilingual" | "replace";
+type Mode = TranslationMode;
 
-let mode: Mode = "bilingual";
+const isSubframe = window.top !== window.self;
+const translationOwnerUrl = isSubframe && document.referrer ? document.referrer : location.href;
+const currentHost = hostnameFromUrl(translationOwnerUrl) || normalizeHostname(location.hostname);
+let baseMode: TranslationRenderMode = "replace";
+let mode: Mode = "replace";
+let selectionTranslationEnabled = false;
+let alwaysTranslateHosts: string[] = [];
+let alwaysTranslateDisabledHosts: string[] = [];
 const cache = new Map<string, string>();
 interface QueueItem {
   el: HTMLElement;
@@ -66,6 +87,7 @@ const TRANSPORT_MAX_RETRIES = 5;
 const TRANSPORT_RETRY_BASE_MS = 1500;
 const TRANSPORT_RETRY_MAX_MS = 30_000;
 const VISIBLE_PRIORITY_MARGIN_PX = 800;
+const CUSTOM_TEXT_SHELL_INPLACE_MAX_TEXT = 1400;
 
 const SELECTION_DEBOUNCE_MS = 220;
 const SELECTION_MAX_TEXT = 1600;
@@ -228,11 +250,24 @@ const EXCLUDE_SELECTOR = [
   "pre", "code", "script", "style", "noscript", "template",
   "svg", "math", "head", "title", "meta", "link",
   "input", "textarea", "select", "button",
+  "nav", '[role="navigation"]', '[role="banner"]', '[role="toolbar"]',
+  '[role="button"]', '[role="menu"]', '[role="menubar"]', '[role="menuitem"]',
+  '[role="option"]', '[role="tab"]', '[role="tablist"]',
+  "details", "summary",
   '[contenteditable="true"]', '[aria-hidden="true"]',
   ...ADDITIONAL_STAY_ORIGINAL_SELECTORS,
   ...YOUTUBE_CAPTION_EXCLUDE_SELECTORS,
   `.${TR_CLASS}`,
 ].join(", ");
+const MAIN_CONTENT_SELECTOR = "article, .markdown-body, [itemprop='articleBody']";
+const AUXILIARY_CONTENT_SELECTOR = [
+  "aside",
+  '[role="complementary"]',
+  ".Layout-sidebar",
+  ".prc-PageLayout-Pane-AyzHK",
+  ".BorderGrid",
+].join(", ");
+const VISUALLY_HIDDEN_CLASS_RE = /(?:^|\s)(?:sr-only|visually-hidden)(?:\s|$)|VisuallyHidden|ScreenReader/i;
 
 // leaf 物理 mark — 写 DOM attr (data-bbt-leaf). page 删该元素 attr 跟随消失, 不像
 // WeakSet 永久 lock. 5 源 (kiss/read-frog/fluentread/old-immersive/沉浸式) 全选物理
@@ -470,6 +505,18 @@ function isInlineDisplay(display: string): boolean {
 
 // inline 判断: fast path → CSS fallback (Q1: cover custom element / display:contents / ruby).
 function isInlineElement(el: HTMLElement): boolean {
+  if (el.tagName === "A") {
+    let cached = inlineCache.get(el);
+    if (cached === undefined) {
+      try {
+        cached = isInlineDisplay(window.getComputedStyle(el).display);
+      } catch {
+        cached = true;
+      }
+      inlineCache.set(el, cached);
+    }
+    return cached;
+  }
   if (INLINE_TAGS.has(el.tagName)) return true;
   if (FORCE_BLOCK_TAGS.has(el.tagName)) return false;
   let cached = inlineCache.get(el);
@@ -500,10 +547,55 @@ function isHidden(el: HTMLElement): boolean {
   return cached;
 }
 
+function isDisplayContentsElement(el: HTMLElement): boolean {
+  try {
+    return window.getComputedStyle(el).display.trim().toLowerCase() === "contents";
+  } catch {
+    return false;
+  }
+}
+
+function isVisuallyHiddenElement(el: HTMLElement): boolean {
+  const cls = el.className?.toString() || "";
+  if (VISUALLY_HIDDEN_CLASS_RE.test(cls)) return true;
+  try {
+    const cs = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return (cs.position === "absolute" || cs.position === "fixed")
+      && rect.width <= 1
+      && rect.height <= 1
+      && (cs.overflow === "hidden" || cs.clip !== "auto" || cs.clipPath !== "none");
+  } catch {
+    return false;
+  }
+}
+
+function isPageChromeElement(el: HTMLElement): boolean {
+  const shell = el.closest(`header, footer, ${AUXILIARY_CONTENT_SELECTOR}`);
+  if (shell instanceof HTMLElement && !shell.closest(MAIN_CONTENT_SELECTOR)) return true;
+  return false;
+}
+
+function isIgnoredElement(el: HTMLElement): boolean {
+  return !!el.closest(EXCLUDE_SELECTOR)
+    || isVisuallyHiddenElement(el)
+    || isPageChromeElement(el);
+}
+
 // el 的 *祖先* (不含 self) 已被标 leaf — 该 ancestor 已整段翻, 不该再切子树重复翻.
 // 用 closest 物理 DOM 遍历, 不用内存 WeakSet. el 被 page 删, 探测自动失效.
 function hasLeafAncestor(el: HTMLElement): boolean {
   return !!el.parentElement?.closest(`[${LEAF_ATTR}]`);
+}
+
+function closestLeafElement(el: HTMLElement): HTMLElement | null {
+  const leaf = el.parentElement?.closest(`[${LEAF_ATTR}]`);
+  if (leaf instanceof HTMLElement) return leaf;
+  return el.hasAttribute(LEAF_ATTR) ? el : null;
+}
+
+function candidateRoot(el: HTMLElement): HTMLElement {
+  return closestLeafElement(el) ?? el;
 }
 
 function isTranslationElement(el: HTMLElement): boolean {
@@ -519,11 +611,64 @@ function isAtomicBlockElement(el: HTMLElement): boolean {
   return el.matches(ATOMIC_BLOCK_SELECTOR);
 }
 
+function isLargeMediaBox(width: number, height: number): boolean {
+  return width >= RICH_MEDIA_MIN_EDGE_PX
+    && height >= RICH_MEDIA_MIN_EDGE_PX
+    && width * height >= RICH_MEDIA_MIN_AREA_PX;
+}
+
 function hasLargeVisualBox(el: HTMLElement): boolean {
   const rect = el.getBoundingClientRect();
-  return rect.width >= RICH_MEDIA_MIN_EDGE_PX
-    && rect.height >= RICH_MEDIA_MIN_EDGE_PX
-    && rect.width * rect.height >= RICH_MEDIA_MIN_AREA_PX;
+  return isLargeMediaBox(rect.width, rect.height);
+}
+
+function hasNaturalMediaBox(el: HTMLElement): boolean {
+  if (el instanceof HTMLImageElement) {
+    return isLargeMediaBox(el.naturalWidth, el.naturalHeight);
+  }
+  if (el instanceof HTMLVideoElement) {
+    return isLargeMediaBox(el.videoWidth, el.videoHeight);
+  }
+  if (el instanceof HTMLCanvasElement) {
+    return isLargeMediaBox(el.width, el.height);
+  }
+  return false;
+}
+
+function hasMediaSource(el: HTMLElement): boolean {
+  if (el instanceof HTMLImageElement) {
+    return !!(el.currentSrc || el.src || el.getAttribute("src") || el.getAttribute("srcset"))
+      || hasNaturalMediaBox(el);
+  }
+  if (el instanceof HTMLPictureElement) {
+    return !!el.querySelector("img, source[srcset]");
+  }
+  if (el instanceof HTMLVideoElement) {
+    return !!(el.currentSrc || el.src || el.poster || el.querySelector("source[src]"))
+      || hasNaturalMediaBox(el);
+  }
+  if (el instanceof HTMLCanvasElement) {
+    return el.width > 1 && el.height > 1;
+  }
+  if (el instanceof HTMLIFrameElement || el instanceof HTMLEmbedElement) {
+    return !!(el.src || el.getAttribute("src"));
+  }
+  if (el instanceof HTMLObjectElement) {
+    return !!el.data;
+  }
+  if (el.getAttribute("role") === "img") {
+    return !!el.getAttribute("aria-label") || hasCssBackgroundImage(el);
+  }
+  return false;
+}
+
+function isBlockRenderedMedia(el: HTMLElement): boolean {
+  try {
+    const cs = window.getComputedStyle(el);
+    return !isInlineDisplay(cs.display) || cs.position === "absolute" || cs.position === "fixed";
+  } catch {
+    return false;
+  }
 }
 
 function hasCssBackgroundImage(el: HTMLElement): boolean {
@@ -540,6 +685,11 @@ function hasRichMediaSurface(el: HTMLElement): boolean {
   for (const node of mediaNodes) {
     if (!(node instanceof HTMLElement)) continue;
     if (isTranslationElement(node) || isHidden(node)) continue;
+    const isRenderedMedia = node.matches(RICH_MEDIA_SELECTOR) && isBlockRenderedMedia(node);
+    if (node !== el && isRenderedMedia && (hasLargeVisualBox(el) || hasMediaSource(node))) {
+      return true;
+    }
+    if (isRenderedMedia && hasNaturalMediaBox(node)) return true;
     if (node.matches(RICH_MEDIA_SELECTOR) && hasLargeVisualBox(node)) return true;
   }
 
@@ -569,6 +719,11 @@ function hasTranslationChild(el: HTMLElement): boolean {
   return false;
 }
 
+function hasTextBlockSemantics(el: HTMLElement): boolean {
+  const dir = el.getAttribute("dir")?.toLowerCase();
+  return !!el.getAttribute("lang") || dir === "auto";
+}
+
 // Read only the page's source text, never our injected sibling/wrapper text.
 // This is the idempotency boundary: hash, language detection, trace text, and
 // outbound LLM payload must all agree on the same source-only string.
@@ -594,7 +749,7 @@ function sourceText(el: HTMLElement): string {
       return;
     }
     if (node !== el) {
-      if (node.getAttribute("aria-hidden") === "true") return;
+      if (isIgnoredElement(node)) return;
       if (!node.classList.contains(SRC_CLASS) && isHidden(node)) return;
     }
     if (node.tagName === "BR") {
@@ -627,17 +782,29 @@ function isLeafTextElement(el: HTMLElement, knownHasRichMedia = hasRichMediaSurf
   if (knownHasRichMedia) return false;
   // 直接子节点必须全是 text 或 inline 元素 + 含可视 text.
   let hasMeaningfulText = false;
-  for (const child of Array.from(el.childNodes)) {
-    if (child.nodeType === Node.TEXT_NODE) {
-      if ((child.textContent || "").trim()) hasMeaningfulText = true;
-    } else if (child.nodeType === Node.ELEMENT_NODE) {
-      const childEl = child as HTMLElement;
-      if (isTranslationElement(childEl) || childEl.querySelector(`.${TR_CLASS}`)) {
-        return false;
-      }
-      if (!isInlineElement(childEl)) return false;
-      if ((childEl.textContent || "").trim()) hasMeaningfulText = true;
+  const scan = (node: Node): boolean => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      if ((node.textContent || "").trim()) hasMeaningfulText = true;
+      return true;
     }
+    if (node.nodeType !== Node.ELEMENT_NODE) return true;
+    const childEl = node as HTMLElement;
+    if (isTranslationElement(childEl) || childEl.querySelector(`.${TR_CLASS}`)) {
+      return false;
+    }
+    if (isIgnoredElement(childEl) || isHidden(childEl)) return true;
+    if (isDisplayContentsElement(childEl)) {
+      for (const child of Array.from(childEl.childNodes)) {
+        if (!scan(child)) return false;
+      }
+      return true;
+    }
+    if (!isInlineElement(childEl)) return false;
+    if ((childEl.textContent || "").trim()) hasMeaningfulText = true;
+    return true;
+  };
+  for (const child of Array.from(el.childNodes)) {
+    if (!scan(child)) return false;
   }
   if (!hasMeaningfulText) return false;
   const text = sourceText(el);
@@ -681,7 +848,7 @@ function collectTranslatable(root: ParentNode): HTMLElement[] {
   const result: HTMLElement[] = [];
 
   function visit(el: HTMLElement) {
-    if (el.matches(EXCLUDE_SELECTOR)) return;
+    if (isIgnoredElement(el)) return;
     // 祖先已 leaf (整段已包翻) → 子树不切. 物理 closest 遍历, 不依赖内存 lock.
     if (hasLeafAncestor(el)) return;
     if (isHidden(el)) return;
@@ -720,7 +887,15 @@ function collectTranslatable(root: ParentNode): HTMLElement[] {
       }
     }
 
-    // block 候选: 多 inline 子且无 text 桥接 → 拆开各翻 (X 推/段落多段 case).
+    // Natural-language containers with lang/dir=auto should stay one leaf even
+    // when a site splits the sentence into many inline spans/mentions.
+    if (!containsTranslation && hasTextBlockSemantics(el) && isLeafTextElement(el)) {
+      el.setAttribute(LEAF_ATTR, "1");
+      result.push(el);
+      return;
+    }
+
+    // block 候选: 多 inline 子且无 text 桥接 → 拆开各翻.
     if (isMultiSegmentInline(el)) {
       // outer SKIP, walker 进子让 inline 各 ACCEPT.
       for (const child of Array.from(el.children)) {
@@ -786,7 +961,12 @@ function shouldTranslate(text: string, minTextCount = DEFAULT_MIN_TEXT_COUNT): b
   if (/^e\.g[.,]?\s+/i.test(text.trim())) return false;
   // X 上计数/倒计时会秒级 mutation；这些不是自然语言，翻译只会制造 stale_result
   // 和重复网络请求。保留含字母的混合文案，跳纯数字/时间/单位/handle/tag。
-  if (/^[@#][\p{L}\p{N}_-]+$/u.test(text)) return false;
+  const trimmed = text.trim();
+  if (/^[@#][\p{L}\p{N}_-]+$/u.test(trimmed)) return false;
+  // File trees and topic chips often expose lowercase identifiers as plain text
+  // nodes. Translating "images", "docs", or "scrapling" damages the UI more
+  // than it helps; sentence-like headings still pass this gate.
+  if (/^[a-z0-9][a-z0-9._/-]{1,39}$/u.test(trimmed)) return false;
   if (!/[\p{L}]/u.test(text)) return false;
   if (/^[\d\s:.,，.%％+\-–—/()（）[\]万亿千百十kKmMbB]+$/u.test(text)) return false;
   return detectLang(text) !== "zh";
@@ -862,6 +1042,7 @@ function selectionRect(sel: Selection): DOMRect | null {
 }
 
 function currentSelectionSnapshot(): SelectionSnapshot | null {
+  if (!selectionTranslationEnabled) return null;
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
   const text = selectableText();
@@ -975,6 +1156,7 @@ function hideSelectionPopup(popup: SelectionPopup) {
 }
 
 async function translateSelectionText(text: string): Promise<string | null> {
+  if (!selectionTranslationEnabled) return null;
   const hash = hashText(normalizeForHash(text), TARGET_LANG);
   const cached = cache.get(hash);
   if (cached) return cached;
@@ -1058,6 +1240,13 @@ function setupSelectionTranslator() {
     hideAndInvalidate();
   };
   const onScrollOrResize = () => hideAndInvalidate();
+  const onSelectionSettingChanged = () => {
+    if (selectionTranslationEnabled) {
+      schedule(80);
+    } else {
+      hideAndInvalidate();
+    }
+  };
 
   document.addEventListener("selectionchange", onSelectionChange);
   window.addEventListener("mouseup", onPointerUp);
@@ -1065,6 +1254,7 @@ function setupSelectionTranslator() {
   window.addEventListener("keyup", onKeyUp);
   document.addEventListener("mousedown", onPointerDown, true);
   document.addEventListener("touchstart", onPointerDown, true);
+  document.addEventListener(SELECTION_SETTING_EVENT, onSelectionSettingChanged);
   window.addEventListener("scroll", onScrollOrResize, true);
   window.addEventListener("resize", onScrollOrResize);
 
@@ -1076,6 +1266,7 @@ function setupSelectionTranslator() {
     window.removeEventListener("keyup", onKeyUp);
     document.removeEventListener("mousedown", onPointerDown, true);
     document.removeEventListener("touchstart", onPointerDown, true);
+    document.removeEventListener(SELECTION_SETTING_EVENT, onSelectionSettingChanged);
     window.removeEventListener("scroll", onScrollOrResize, true);
     window.removeEventListener("resize", onScrollOrResize);
     popup.host.remove();
@@ -1090,6 +1281,16 @@ function clearTranslation(el: HTMLElement) {
   if (next && next.classList.contains(TR_CLASS)) {
     next.remove();
   }
+}
+
+function clearCandidateState(el: HTMLElement) {
+  clearTranslation(el);
+  el.removeAttribute(HASH_ATTR);
+  el.removeAttribute(LEAF_ATTR);
+  el.removeAttribute(INPLACE_ATTR);
+  stableWindowMap.delete(el);
+  inFlightElements.delete(el);
+  io?.unobserve(el);
 }
 
 function clearAllTranslations() {
@@ -1163,6 +1364,8 @@ const INPLACE_TEXT_TAGS = new Set([
   "H1", "H2", "H3", "H4", "H5", "H6", "LABEL", "LEGEND", "SUMMARY", "DT", "DD", "TH", "TD",
 ]);
 
+const CUSTOM_TEXT_SHELL_ID_RE = /(?:^|[-_])(text|title|content|description|snippet|body|message)(?:$|[-_])/i;
+
 const PRESERVED_SOURCE_SHELL_SELECTOR = [
   "svg", "img", "canvas", "video", "audio", "picture", "input", "textarea", "select",
   "button", "a[href]", '[role="button"]', '[role="link"]', '[role="menuitem"]',
@@ -1189,6 +1392,7 @@ function hasLayoutDisplay(el: HTMLElement): boolean {
 
 function shouldRenderInPlace(el: HTMLElement, text: string): boolean {
   if (mode !== "replace") return false;
+  if (shouldPreserveCustomTextShell(el, text)) return true;
   if (text.length > 180) return false;
   // 文章正文/推文仍走 sibling, 避免 React 高频 reconcile 抢子树.
   if (el.closest("article, [role='article']")) return false;
@@ -1198,6 +1402,14 @@ function shouldRenderInPlace(el: HTMLElement, text: string): boolean {
   if (hasLayoutDisplay(el)) return true;
   if (el.parentElement && hasLayoutDisplay(el.parentElement)) return true;
   return false;
+}
+
+function shouldPreserveCustomTextShell(el: HTMLElement, text: string): boolean {
+  if (!el.tagName.includes("-")) return false;
+  if (text.length > CUSTOM_TEXT_SHELL_INPLACE_MAX_TEXT) return false;
+  if (hasRichMediaSurface(el)) return false;
+  if (hasTextBlockSemantics(el)) return true;
+  return !!el.id && CUSTOM_TEXT_SHELL_ID_RE.test(el.id);
 }
 
 function hasPreservedSourceShell(el: HTMLElement): boolean {
@@ -1226,6 +1438,7 @@ function markInPlaceSource(el: HTMLElement): HTMLElement | null {
     }
     if (!(node instanceof HTMLElement)) return;
     if (isTranslationElement(node)) return;
+    if (isIgnoredElement(node)) return;
     if (!node.classList.contains(SRC_CLASS) && isHidden(node)) return;
     if (node.classList.contains(SRC_CLASS)) {
       if (!template) template = node;
@@ -1301,6 +1514,148 @@ function createTranslationElement(el: HTMLElement, safe: string, inlineLeaf: boo
   return font;
 }
 
+interface SourceLink {
+  source: HTMLAnchorElement;
+  tokens: string[];
+  used: boolean;
+}
+
+function collapsedText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function addLinkToken(tokens: string[], value: string | null | undefined) {
+  const text = collapsedText(value ?? "");
+  if (text.length < 2 || tokens.includes(text)) return;
+  tokens.push(text);
+}
+
+function addUrlLikeTokens(tokens: string[], value: string | null | undefined) {
+  const text = collapsedText(value ?? "");
+  if (!text) return;
+  addLinkToken(tokens, text);
+  const withoutProtocol = text.replace(/^https?:\/\//i, "");
+  addLinkToken(tokens, withoutProtocol);
+  addLinkToken(tokens, withoutProtocol.replace(/^www\./i, ""));
+  if (withoutProtocol.endsWith("/")) {
+    addLinkToken(tokens, withoutProtocol.slice(0, -1));
+  } else if (/\.[a-z]{2,}(?:[/:?#]|$)/i.test(withoutProtocol)) {
+    addLinkToken(tokens, `${withoutProtocol}/`);
+  }
+}
+
+function collectSourceLinks(el: HTMLElement): SourceLink[] {
+  const links: SourceLink[] = [];
+  for (const source of Array.from(el.querySelectorAll<HTMLAnchorElement>("a[href]"))) {
+    if (isIgnoredElement(source) || isTranslationElement(source)) continue;
+    const href = source.getAttribute("href") || "";
+    const tokens: string[] = [];
+    const visibleTexts = [sourceText(source), source.innerText, source.textContent ?? ""];
+    for (const visibleText of visibleTexts) {
+      addLinkToken(tokens, visibleText);
+      addUrlLikeTokens(tokens, visibleText);
+    }
+    addUrlLikeTokens(tokens, href);
+    addUrlLikeTokens(tokens, source.href);
+    if (tokens.length === 0) continue;
+    tokens.sort((a, b) => b.length - a.length);
+    links.push({ source, tokens, used: false });
+  }
+  return links;
+}
+
+function copyAnchorAttrs(src: HTMLAnchorElement, dst: HTMLAnchorElement) {
+  for (const attr of Array.from(src.attributes)) {
+    if (["href", "title", "class", "target", "rel", "referrerpolicy"].includes(attr.name.toLowerCase())) {
+      dst.setAttribute(attr.name, attr.value);
+    }
+  }
+  if (dst.target === "_blank" && !dst.rel) dst.rel = "noopener noreferrer";
+}
+
+function tokenIndexOf(text: string, token: string, start: number): number {
+  if (/\.[a-z]{2,}(?:[/:?#]|$)|^https?:\/\//i.test(token)) {
+    return text.toLowerCase().indexOf(token.toLowerCase(), start);
+  }
+  return text.indexOf(token, start);
+}
+
+function nextSourceLinkMatch(
+  text: string,
+  links: SourceLink[],
+  start: number,
+): { index: number; token: string; link: SourceLink } | null {
+  let best: { index: number; token: string; link: SourceLink } | null = null;
+  for (const link of links) {
+    if (link.used) continue;
+    for (const token of link.tokens) {
+      const index = tokenIndexOf(text, token, start);
+      if (index === -1) continue;
+      if (
+        !best
+        || index < best.index
+        || (index === best.index && token.length > best.token.length)
+      ) {
+        best = { index, token, link };
+      }
+    }
+  }
+  return best;
+}
+
+function linkifyPreservedSourceLinks(el: HTMLElement, safe: string): string {
+  const links = collectSourceLinks(el);
+  if (links.length === 0) return safe;
+
+  const template = document.createElement("template");
+  Reflect.set(template, "innerHTML", safe);
+  const walker = document.createTreeWalker(
+    template.content,
+    NodeFilter.SHOW_TEXT,
+    {
+      acceptNode(node) {
+        const parent = node.parentElement;
+        return parent && parent.closest("a")
+          ? NodeFilter.FILTER_REJECT
+          : NodeFilter.FILTER_ACCEPT;
+      },
+    },
+  );
+  const textNodes: Text[] = [];
+  while (walker.nextNode()) {
+    if (walker.currentNode instanceof Text) textNodes.push(walker.currentNode);
+  }
+
+  for (const textNode of textNodes) {
+    const text = textNode.nodeValue ?? "";
+    if (!text) continue;
+    let offset = 0;
+    let match = nextSourceLinkMatch(text, links, offset);
+    if (!match) continue;
+
+    const frag = document.createDocumentFragment();
+    while (match) {
+      if (match.index > offset) {
+        frag.append(document.createTextNode(text.slice(offset, match.index)));
+      }
+      const matchedText = text.slice(match.index, match.index + match.token.length);
+      const a = document.createElement("a");
+      copyAnchorAttrs(match.link.source, a);
+      a.textContent = matchedText;
+      frag.append(a);
+      match.link.used = true;
+      offset = match.index + match.token.length;
+      match = nextSourceLinkMatch(text, links, offset);
+    }
+    if (offset < text.length) {
+      frag.append(document.createTextNode(text.slice(offset)));
+    }
+    textNode.parentNode?.replaceChild(frag, textNode);
+  }
+
+  return DOMPurify.sanitize(template.innerHTML, SAFE_HTML_OPTS);
+}
+
 function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
   clearTranslation(el);
   if (mode === "off" || !raw) return;
@@ -1314,7 +1669,7 @@ function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
     .replace(/\r\n/g, "\n")
     .replace(/\n{2,}/g, "<br><br>")
     .replace(/\n/g, "<br>");
-  const safe = DOMPurify.sanitize(withBreaks, SAFE_HTML_OPTS);
+  const safe = linkifyPreservedSourceLinks(el, DOMPurify.sanitize(withBreaks, SAFE_HTML_OPTS));
   const inlineLeaf = isInlineElement(el);
   if (shouldRenderInPlace(el, original)) {
     const template = markInPlaceSource(el);
@@ -1365,6 +1720,7 @@ function rerenderCachedTranslations() {
 
 function processCandidate(el: HTMLElement, src: TraceSource = "init") {
   if (mode === "off") return;
+  el = candidateRoot(el);
 
   // user-initiated (rerun = mode toggle / init = boot) 立即处理, 不等 stable window.
   // mutation-triggered (io / mo_add / mo_char) 走 trailing stable-window: 每次 mutation
@@ -1384,6 +1740,24 @@ function processCandidate(el: HTMLElement, src: TraceSource = "init") {
 }
 
 function doProcessCandidate(el: HTMLElement, src: TraceSource) {
+  const hasInjected = hasInjectedTranslation(el);
+  if (isIgnoredElement(el)) {
+    clearCandidateState(el);
+    trace(src, el, "", "not_translatable", "");
+    return;
+  }
+  if (hasRichMediaSurface(el)) {
+    clearCandidateState(el);
+    trace(src, el, "", "not_translatable", sourceText(el));
+    observeNew(el, src);
+    return;
+  }
+  if (!hasInjected && isHidden(el)) {
+    clearCandidateState(el);
+    trace(src, el, "", "not_translatable", "");
+    return;
+  }
+
   const text = sourceText(el);
   if (!text) {
     trace(src, el, "", "skip_no_text");
@@ -1399,7 +1773,6 @@ function doProcessCandidate(el: HTMLElement, src: TraceSource) {
 
   // SPA 重 mount 时, 旧 .bbt-tr sibling 可能跟随 hash 节点带过来; 但 text 已变 →
   // hash 不一致 → 旧译文跟新内容不对应, 必须清掉重翻.
-  const hasInjected = hasInjectedTranslation(el);
   if (hasInjected && existing === fresh) {
     trace(src, el, fresh, "already", text);
     return;
@@ -1646,9 +2019,8 @@ function observeMutations(root: ParentNode = document.body) {
             hiddenCache.delete(target);
             inlineCache.delete(target);
             multiCache.delete(target);
-            if (target.hasAttribute(LEAF_ATTR)) {
-              processCandidate(target, "mo_add");
-            }
+            const leaf = closestLeafElement(target);
+            if (leaf) processCandidate(leaf, "mo_add");
             observeNew(target, "mo_add");
           }
           continue;
@@ -1666,12 +2038,12 @@ function observeMutations(root: ParentNode = document.body) {
           }
           continue;
         }
-        // childList mutation: target 内部 children 变了, 但 target 自己 (= 已 leaf 的段落)
-        // 没被显式 reprocess. X "显示更多" 用 React 替换 tweetText.children (整 child list
-        // swap, 不走 characterData), target=tweetText 没动. 之前漏掉这条路径 = 展开后 text
-        // 变了 hash 不变 (旧 hash attr 仍在), 永不 re-translate. 加这条让 leaf target 自检.
-        if (target instanceof HTMLElement && target.hasAttribute(LEAF_ATTR)) {
-          processCandidate(target, "mo_add");
+        // childList mutation: X "显示更多" 可能替换 tweetText 的内层 span，而不是
+        // 直接改 leaf root。mutation 入口必须回到最近的 leaf 根节点，否则会把子 span
+        // 当新段落翻译，旧整段译文仍留在旁边，展开后原文/译文混排。
+        if (target instanceof HTMLElement) {
+          const leaf = closestLeafElement(target);
+          if (leaf) processCandidate(leaf, "mo_add");
         }
 
         for (const node of r.addedNodes) {
@@ -1720,24 +2092,34 @@ function observeMutations(root: ParentNode = document.body) {
 
 // ── boot ──────────────────────────────────────────────────────────────
 
-function normalizeMode(v: unknown): Mode {
-  // 老 "auto" → "replace" (UX 等价: 视觉上替换原文, 但走 sibling+CSS hide 不抢 DOM).
-  if (v === "off") return "off";
-  if (v === "auto" || v === "replace") return "replace";
-  return "bilingual";
+function resolveMode(
+  base = baseMode,
+  hosts = alwaysTranslateHosts,
+  disabledHosts = alwaysTranslateDisabledHosts,
+): Mode {
+  return effectiveTranslationModeForHost(base, hosts, currentHost, disabledHosts);
 }
 
 async function loadMode() {
   try {
-    const got = await chrome.storage.local.get("babata.translation_mode");
-    const stored = got["babata.translation_mode"];
-    mode = normalizeMode(stored);
-    // 老 "auto" 一次性迁移到 "replace" — widget UI radio 才能正确选中.
-    if (stored === "auto") {
-      void chrome.storage.local.set({ "babata.translation_mode": "replace" });
+    const got = await chrome.storage.local.get([
+      STORAGE_MODE,
+      STORAGE_SELECTION_TRANSLATION,
+      STORAGE_ALWAYS_TRANSLATE_HOSTS,
+      STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
+    ]);
+    const stored = got[STORAGE_MODE];
+    baseMode = normalizeMode(stored);
+    alwaysTranslateHosts = normalizeHostList(got[STORAGE_ALWAYS_TRANSLATE_HOSTS]);
+    alwaysTranslateDisabledHosts = normalizeHostList(got[STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS]);
+    mode = resolveMode();
+    selectionTranslationEnabled = got[STORAGE_SELECTION_TRANSLATION] === true;
+    // 老 "auto/off" 一次性迁移到渲染模式: 是否翻译由 host checkbox 决定.
+    if (stored === "auto" || stored === "off" || stored === undefined) {
+      void chrome.storage.local.set({ [STORAGE_MODE]: baseMode });
     }
   } catch {
-    /* default bilingual */
+    /* default replace */
   }
 }
 
@@ -1807,7 +2189,6 @@ function applyModeAttr() {
 }
 
 function boot() {
-  if (window.top !== window.self) return;
   broadcastTeardown();
   const w = window as unknown as { __babataTranslateBooted?: boolean };
   if (w.__babataTranslateBooted) return;
@@ -1829,9 +2210,24 @@ function boot() {
 
   try {
     const onStorageChanged = (changes: Record<string, chrome.storage.StorageChange>) => {
-      if (changes["babata.translation_mode"]) {
+      let modeChanged = false;
+      if (changes[STORAGE_MODE]) {
+        baseMode = normalizeMode(changes[STORAGE_MODE].newValue);
+        modeChanged = true;
+      }
+      if (changes[STORAGE_ALWAYS_TRANSLATE_HOSTS]) {
+        alwaysTranslateHosts = normalizeHostList(changes[STORAGE_ALWAYS_TRANSLATE_HOSTS].newValue);
+        modeChanged = true;
+      }
+      if (changes[STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS]) {
+        alwaysTranslateDisabledHosts = normalizeHostList(
+          changes[STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS].newValue,
+        );
+        modeChanged = true;
+      }
+      if (modeChanged) {
         const prev = mode;
-        mode = normalizeMode(changes["babata.translation_mode"].newValue);
+        mode = resolveMode();
         applyModeAttr();
         // bilingual ↔ replace 需要重绘 wrapper 形态: replace 用 native clone,
         // bilingual 用中性 font sibling; 译文本身仍走 L1 cache, 不重调 LLM.
@@ -1840,6 +2236,10 @@ function boot() {
           // off → bilingual/replace: 之前没翻新内容, 触发 collect 走 cache hit / enqueue.
           observeNew(document.body, "rerun");
         }
+      }
+      if (changes[STORAGE_SELECTION_TRANSLATION]) {
+        selectionTranslationEnabled = changes[STORAGE_SELECTION_TRANSLATION].newValue === true;
+        document.dispatchEvent(new Event(SELECTION_SETTING_EVENT));
       }
     };
     chrome.storage.onChanged.addListener(onStorageChanged);

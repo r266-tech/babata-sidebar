@@ -1,6 +1,19 @@
 /// <reference types="chrome" />
 
 import avatarUrl from "../assets/babata-avatar.png";
+import {
+  STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
+  STORAGE_ALWAYS_TRANSLATE_HOSTS,
+  STORAGE_SELECTION_TRANSLATION,
+  STORAGE_TRANSLATION_MODE as STORAGE_MODE,
+  effectiveTranslationModeForHost,
+  isAlwaysTranslateHost,
+  normalizeHostList,
+  normalizeHostname,
+  normalizeTranslationRenderMode as normalizeMode,
+  type TranslationRenderMode,
+  updateAlwaysTranslateHostState,
+} from "../translation-settings";
 
 // babata 桌宠 floating widget — 可拖拽圆形按钮 + 设置弹窗 + 主动 bubble.
 //
@@ -9,10 +22,9 @@ import avatarUrl from "../assets/babata-avatar.png";
 //
 // V0 元素:
 //   主按钮 (drag-able, 单击 = 打开 page chat popup + prompt chips; 双击 = agent 锐评; 三击 = 净化阅读)
-//   设置按钮 (翻译三档位)
+//   设置按钮 (渲染模式 + 当前站点是否翻译)
 //   bubble (server 推 mascot_speak 时浮起来, 30s auto-dismiss, V 点 X 关掉)
 
-type TranslationMode = "off" | "bilingual" | "replace";
 type OpenChatPopupOptions = { suggest?: boolean };
 type BubbleOptions = {
   tone?: "normal" | "thinking";
@@ -23,10 +35,10 @@ type BubbleOptions = {
 const HOST_ID = "__babata_widget_host__";
 const TEARDOWN_EVENT = "babata:widget-teardown";
 const STORAGE_POS = "babata.widget.pos";
-const STORAGE_MODE = "babata.translation_mode";
 const CLEAN_READ_STYLE_ID = "__babata_clean_read_style__";
 const CLEAN_READ_ROOT_ID = "__babata_clean_read_root__";
-const DEFAULT_MODE: TranslationMode = "bilingual";
+const DEFAULT_MODE: TranslationRenderMode = "replace";
+const DEFAULT_SELECTION_TRANSLATION_ENABLED = false;
 const MAIN_SINGLE_CLICK_DELAY_MS = 500;
 const AGENT_VIEW_THINKING_TEXT = "思考中…";
 const CLEAN_READ_THINKING_TEXT = "正在净读…";
@@ -56,7 +68,11 @@ let widgetState: {
   bubble: HTMLDivElement | null;
   bubbleHideTimer: number | null;
   openChatPopup: ((opts?: OpenChatPopupOptions) => void) | null;
-  mode: TranslationMode;
+  mode: TranslationRenderMode;
+  selectionTranslationEnabled: boolean;
+  alwaysTranslateHosts: string[];
+  alwaysTranslateDisabledHosts: string[];
+  currentHost: string;
   pos: WidgetPos;
 } | null = null;
 let cleanupCurrentWidget: (() => void) | null = null;
@@ -107,17 +123,40 @@ function refreshBubbleMetrics() {
   widgetState.mainAnchor.style.setProperty("--bubble-max-width", `${maxWidth}px`);
 }
 
-function normalizeMode(v: unknown): TranslationMode {
-  if (v === "off") return "off";
-  if (v === "auto" || v === "replace") return "replace";
-  return "bilingual";
-}
-
-async function loadPersisted(): Promise<{ mode: TranslationMode; pos: WidgetPos }> {
-  const got = await safeChromePromise(() => chrome.storage.local.get([STORAGE_MODE, STORAGE_POS]));
-  if (!got) return { mode: DEFAULT_MODE, pos: DEFAULT_POS };
+async function loadPersisted(): Promise<{
+  mode: TranslationRenderMode;
+  selectionTranslationEnabled: boolean;
+  alwaysTranslateHosts: string[];
+  alwaysTranslateDisabledHosts: string[];
+  currentHost: string;
+  pos: WidgetPos;
+}> {
+  const currentHost = normalizeHostname(location.hostname);
+  const got = await safeChromePromise(() =>
+    chrome.storage.local.get([
+      STORAGE_MODE,
+      STORAGE_SELECTION_TRANSLATION,
+      STORAGE_ALWAYS_TRANSLATE_HOSTS,
+      STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
+      STORAGE_POS,
+    ])
+  );
+  if (!got) {
+    return {
+      mode: DEFAULT_MODE,
+      selectionTranslationEnabled: DEFAULT_SELECTION_TRANSLATION_ENABLED,
+      alwaysTranslateHosts: [],
+      alwaysTranslateDisabledHosts: [],
+      currentHost,
+      pos: DEFAULT_POS,
+    };
+  }
   return {
     mode: normalizeMode(got[STORAGE_MODE]),
+    selectionTranslationEnabled: got[STORAGE_SELECTION_TRANSLATION] === true,
+    alwaysTranslateHosts: normalizeHostList(got[STORAGE_ALWAYS_TRANSLATE_HOSTS]),
+    alwaysTranslateDisabledHosts: normalizeHostList(got[STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS]),
+    currentHost,
     pos: (got[STORAGE_POS] as WidgetPos) || DEFAULT_POS,
   };
 }
@@ -325,14 +364,14 @@ function createWidget() {
       padding: 14px 16px;
       min-width: 220px;
     }
-    .popover h4 { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: #1c1c1c; }
-    .popover p { margin: 0 0 10px; font-size: 11.5px; color: #6e6b66; }
+    .popover h4 { margin: 0 0 10px; font-size: 13px; font-weight: 600; color: #1c1c1c; }
     .popover label {
-      display: flex; align-items: flex-start; gap: 8px;
+      display: flex; align-items: center; gap: 8px;
       font-size: 13px; padding: 6px 0; cursor: pointer;
     }
-    .popover label .desc { font-size: 11px; color: #6e6b66; display: block; margin-top: 2px; }
-    .popover input[type=radio] { margin: 4px 0 0 0; accent-color: #c66a4a; }
+    .popover input[type=radio],
+    .popover input[type=checkbox] { margin: 4px 0 0 0; accent-color: #c66a4a; }
+    .popover .divider { height: 1px; background: rgba(0,0,0,.08); margin: 8px 0; }
 
     .stack {
       display: flex;
@@ -598,6 +637,10 @@ function createWidget() {
     bubbleHideTimer: null,
     openChatPopup: null,
     mode: DEFAULT_MODE,
+    selectionTranslationEnabled: DEFAULT_SELECTION_TRANSLATION_ENABLED,
+    alwaysTranslateHosts: [],
+    alwaysTranslateDisabledHosts: [],
+    currentHost: normalizeHostname(location.hostname),
     pos: DEFAULT_POS,
   };
   applyPos(root, DEFAULT_POS);
@@ -638,7 +681,17 @@ function createWidget() {
     }
     if (m.type === "babata.translation_mode") {
       // SW 询问当前 mode (proactive 触发时塞 payload).
-      sendResponse?.({ mode: widgetState?.mode ?? DEFAULT_MODE });
+      const state = widgetState;
+      sendResponse?.({
+        mode: state
+          ? effectiveTranslationModeForHost(
+              state.mode,
+              state.alwaysTranslateHosts,
+              state.currentHost,
+              state.alwaysTranslateDisabledHosts,
+            )
+          : DEFAULT_MODE,
+      });
       return false;
     }
     return false;
@@ -1119,9 +1172,20 @@ function createWidget() {
 
   // ── async load ─────────────────────────────────────────────────────
   void (async () => {
-    const { mode, pos } = await loadPersisted();
+    const {
+      mode,
+      selectionTranslationEnabled,
+      alwaysTranslateHosts,
+      alwaysTranslateDisabledHosts,
+      currentHost,
+      pos,
+    } = await loadPersisted();
     if (!widgetState) return;
     widgetState.mode = mode;
+    widgetState.selectionTranslationEnabled = selectionTranslationEnabled;
+    widgetState.alwaysTranslateHosts = alwaysTranslateHosts;
+    widgetState.alwaysTranslateDisabledHosts = alwaysTranslateDisabledHosts;
+    widgetState.currentHost = currentHost;
     widgetState.pos = pos;
     applyPos(widgetState.root, pos);
     refreshBubbleMetrics();
@@ -1275,16 +1339,12 @@ function renderPopover(): HTMLDivElement {
   const pop = document.createElement("div");
   pop.className = "popover";
   const title = document.createElement("h4");
-  title.textContent = "翻译模式";
+  title.textContent = "翻译设置";
   pop.appendChild(title);
-  const desc = document.createElement("p");
-  desc.textContent = "babata 进入新页面时自动判断要不要翻译.";
-  pop.appendChild(desc);
 
-  const opts: { value: TranslationMode; label: string; desc: string }[] = [
-    { value: "off", label: "不翻译", desc: "隐藏译文, 只看原文" },
-    { value: "bilingual", label: "双语", desc: "原文 + 译文同时显示" },
-    { value: "replace", label: "替换", desc: "隐藏原文, 只看译文 (CSS 切换不重翻)" },
+  const opts: { value: TranslationRenderMode; label: string }[] = [
+    { value: "bilingual", label: "双语" },
+    { value: "replace", label: "替换" },
   ];
 
   for (const o of opts) {
@@ -1304,13 +1364,67 @@ function renderPopover(): HTMLDivElement {
     const head = document.createElement("div");
     head.textContent = o.label;
     labelBlock.appendChild(head);
-    const sub = document.createElement("span");
-    sub.className = "desc";
-    sub.textContent = o.desc;
-    labelBlock.appendChild(sub);
     lab.appendChild(labelBlock);
     pop.appendChild(lab);
   }
+
+  const divider = document.createElement("div");
+  divider.className = "divider";
+  pop.appendChild(divider);
+
+  const alwaysLabel = document.createElement("label");
+  const alwaysCheckbox = document.createElement("input");
+  const currentHost = widgetState?.currentHost ?? normalizeHostname(location.hostname);
+  alwaysCheckbox.type = "checkbox";
+  alwaysCheckbox.checked = isAlwaysTranslateHost(
+    widgetState?.alwaysTranslateHosts ?? [],
+    currentHost,
+    widgetState?.alwaysTranslateDisabledHosts ?? [],
+  );
+  alwaysCheckbox.disabled = !currentHost;
+  alwaysCheckbox.addEventListener("change", () => {
+    if (!widgetState) return;
+    const nextState = updateAlwaysTranslateHostState(
+      widgetState.alwaysTranslateHosts,
+      widgetState.alwaysTranslateDisabledHosts,
+      widgetState.currentHost,
+      alwaysCheckbox.checked,
+    );
+    widgetState.alwaysTranslateHosts = nextState.hosts;
+    widgetState.alwaysTranslateDisabledHosts = nextState.disabledHosts;
+    void safeChromePromise(() =>
+      chrome.storage.local.set({
+        [STORAGE_ALWAYS_TRANSLATE_HOSTS]: nextState.hosts,
+        [STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS]: nextState.disabledHosts,
+      })
+    );
+  });
+  alwaysLabel.appendChild(alwaysCheckbox);
+  const alwaysBlock = document.createElement("div");
+  const alwaysHead = document.createElement("div");
+  alwaysHead.textContent = "总是翻译此页";
+  alwaysBlock.appendChild(alwaysHead);
+  alwaysLabel.appendChild(alwaysBlock);
+  pop.appendChild(alwaysLabel);
+
+  const selectionLabel = document.createElement("label");
+  const selectionCheckbox = document.createElement("input");
+  selectionCheckbox.type = "checkbox";
+  selectionCheckbox.checked = widgetState?.selectionTranslationEnabled ?? DEFAULT_SELECTION_TRANSLATION_ENABLED;
+  selectionCheckbox.addEventListener("change", () => {
+    if (!widgetState) return;
+    widgetState.selectionTranslationEnabled = selectionCheckbox.checked;
+    void safeChromePromise(() =>
+      chrome.storage.local.set({ [STORAGE_SELECTION_TRANSLATION]: selectionCheckbox.checked })
+    );
+  });
+  selectionLabel.appendChild(selectionCheckbox);
+  const selectionBlock = document.createElement("div");
+  const selectionHead = document.createElement("div");
+  selectionHead.textContent = "划词翻译";
+  selectionBlock.appendChild(selectionHead);
+  selectionLabel.appendChild(selectionBlock);
+  pop.appendChild(selectionLabel);
   return pop;
 }
 
