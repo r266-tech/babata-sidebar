@@ -24,6 +24,7 @@ const CHAT_HISTORY_LATEST_KEY = `${CHAT_HISTORY_KEY_PREFIX}:latest`;
 const CHAT_HISTORY_MAX_MESSAGES = 200;
 const CHAT_TEXT_MAX_CHARS = 120_000;
 const CHAT_TOOL_TEXT_MAX_CHARS = 12_000;
+const CHAT_IMAGE_THUMB_MAX_CHARS = 180_000;
 const CHAT_FLUSH_MS = 120;
 
 type Attachment = {
@@ -33,6 +34,7 @@ type Attachment = {
   mime: string;
   size: number;
   data_base64: string;
+  thumbnail_data_url?: string;
 };
 
 type WireAttachment = {
@@ -232,8 +234,14 @@ function normalizeToolTrace(raw: unknown): ToolTrace[] {
     }));
 }
 
+function safeThumbnailDataUrl(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  if (!value.startsWith("data:image/")) return undefined;
+  return value.length <= CHAT_IMAGE_THUMB_MAX_CHARS ? value : undefined;
+}
+
 function sanitizeAttachmentForStorage(raw: Attachment): Attachment {
-  return {
+  const out: Attachment = {
     id: raw.id,
     kind: raw.kind,
     name: raw.name,
@@ -241,6 +249,9 @@ function sanitizeAttachmentForStorage(raw: Attachment): Attachment {
     size: raw.size,
     data_base64: "",
   };
+  const thumbnail = safeThumbnailDataUrl(raw.thumbnail_data_url);
+  if (thumbnail) out.thumbnail_data_url = thumbnail;
+  return out;
 }
 
 function sanitizeToolsForStorage(raw: unknown): ToolTrace[] {
@@ -291,14 +302,19 @@ function normalizeStoredMsgs(raw: unknown): Msg[] {
         ? item.attachments
           .filter((a): a is Record<string, unknown> => !!a && typeof a === "object")
           .filter((a) => a.kind === "image" || a.kind === "video" || a.kind === "file")
-          .map((a, index) => ({
-            id: typeof a.id === "string" ? a.id : `stored-attachment-${index + 1}`,
-            kind: a.kind as Attachment["kind"],
-            name: typeof a.name === "string" ? a.name : "attachment",
-            mime: typeof a.mime === "string" ? a.mime : "application/octet-stream",
-            size: typeof a.size === "number" ? a.size : 0,
-            data_base64: "",
-          }))
+          .map((a, index) => {
+            const att: Attachment = {
+              id: typeof a.id === "string" ? a.id : `stored-attachment-${index + 1}`,
+              kind: a.kind as Attachment["kind"],
+              name: typeof a.name === "string" ? a.name : "attachment",
+              mime: typeof a.mime === "string" ? a.mime : "application/octet-stream",
+              size: typeof a.size === "number" ? a.size : 0,
+              data_base64: "",
+            };
+            const thumbnail = safeThumbnailDataUrl(a.thumbnail_data_url);
+            if (thumbnail) att.thumbnail_data_url = thumbnail;
+            return att;
+          })
         : [];
       if (attachments.length > 0) msg.attachments = attachments;
       const tools = sanitizeToolsForStorage(item.tools);

@@ -19,6 +19,7 @@ type Attachment = {
   size: number;
   data_base64: string;
   preview_url?: string;
+  thumbnail_data_url?: string;
 };
 
 type ToolTraceStatus = "running" | "done" | "error";
@@ -88,6 +89,8 @@ const CHAT_HISTORY_LATEST_KEY = `${CHAT_HISTORY_KEY_PREFIX}:latest`;
 const CHAT_HISTORY_MAX_MESSAGES = 200;
 const CHAT_TEXT_MAX_CHARS = 120_000;
 const CHAT_TOOL_TEXT_MAX_CHARS = 12_000;
+const CHAT_IMAGE_THUMB_MAX_EDGE = 360;
+const CHAT_IMAGE_THUMB_MAX_CHARS = 180_000;
 
 type SavedChatHistory = {
   version: 1;
@@ -296,8 +299,14 @@ function normalizeMessagePart(raw: unknown, index: number): MessagePart | null {
   return null;
 }
 
+function safeThumbnailDataUrl(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  if (!value.startsWith("data:image/")) return undefined;
+  return value.length <= CHAT_IMAGE_THUMB_MAX_CHARS ? value : undefined;
+}
+
 function sanitizeAttachmentForStorage(raw: Attachment): Attachment {
-  return {
+  const out: Attachment = {
     id: raw.id,
     kind: raw.kind,
     name: raw.name,
@@ -305,6 +314,9 @@ function sanitizeAttachmentForStorage(raw: Attachment): Attachment {
     size: raw.size,
     data_base64: "",
   };
+  const thumbnail = safeThumbnailDataUrl(raw.thumbnail_data_url);
+  if (thumbnail) out.thumbnail_data_url = thumbnail;
+  return out;
 }
 
 function sanitizeToolsForStorage(raw: unknown): ToolTrace[] {
@@ -355,14 +367,19 @@ function normalizeStoredMsgs(raw: unknown): Msg[] {
         ? item.attachments
           .filter((a): a is Record<string, unknown> => !!a && typeof a === "object")
           .filter((a) => a.kind === "image" || a.kind === "video" || a.kind === "file")
-          .map((a, index) => ({
-            id: typeof a.id === "string" ? a.id : `stored-attachment-${index + 1}`,
-            kind: a.kind as Attachment["kind"],
-            name: typeof a.name === "string" ? a.name : "attachment",
-            mime: typeof a.mime === "string" ? a.mime : "application/octet-stream",
-            size: typeof a.size === "number" ? a.size : 0,
-            data_base64: "",
-          }))
+          .map((a, index) => {
+            const att: Attachment = {
+              id: typeof a.id === "string" ? a.id : `stored-attachment-${index + 1}`,
+              kind: a.kind as Attachment["kind"],
+              name: typeof a.name === "string" ? a.name : "attachment",
+              mime: typeof a.mime === "string" ? a.mime : "application/octet-stream",
+              size: typeof a.size === "number" ? a.size : 0,
+              data_base64: "",
+            };
+            const thumbnail = safeThumbnailDataUrl(a.thumbnail_data_url);
+            if (thumbnail) att.thumbnail_data_url = thumbnail;
+            return att;
+          })
         : [];
       if (attachments.length > 0) msg.attachments = attachments;
       const tools = sanitizeToolsForStorage(item.tools);
@@ -622,6 +639,65 @@ function readAsBase64(file: File): Promise<string> {
     };
     reader.readAsDataURL(file);
   });
+}
+
+function createImageThumbnail(file: File): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    if (!file.type.startsWith("image/")) {
+      resolve(undefined);
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    const cleanup = () => URL.revokeObjectURL(url);
+    img.onload = () => {
+      try {
+        const sourceWidth = img.naturalWidth || img.width;
+        const sourceHeight = img.naturalHeight || img.height;
+        if (sourceWidth <= 0 || sourceHeight <= 0) {
+          cleanup();
+          resolve(undefined);
+          return;
+        }
+        const scale = Math.min(
+          1,
+          CHAT_IMAGE_THUMB_MAX_EDGE / Math.max(sourceWidth, sourceHeight),
+        );
+        const width = Math.max(1, Math.round(sourceWidth * scale));
+        const height = Math.max(1, Math.round(sourceHeight * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          cleanup();
+          resolve(undefined);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, width, height);
+        const dataUrl = canvas.toDataURL("image/webp", 0.82);
+        cleanup();
+        resolve(safeThumbnailDataUrl(dataUrl));
+      } catch {
+        cleanup();
+        resolve(undefined);
+      }
+    };
+    img.onerror = () => {
+      cleanup();
+      resolve(undefined);
+    };
+    img.src = url;
+  });
+}
+
+function attachmentImageSrc(att: Attachment): string {
+  if (att.preview_url) return att.preview_url;
+  if (att.thumbnail_data_url) return att.thumbnail_data_url;
+  if (att.kind === "image" && att.mime.startsWith("image/") && att.data_base64) {
+    return `data:${att.mime};base64,${att.data_base64}`;
+  }
+  return "";
 }
 
 async function captureLightContext(
@@ -1038,8 +1114,11 @@ function App() {
       return;
     }
     try {
-      const data_base64 = await readAsBase64(file);
       const kind = classifyAttachment(file);
+      const [data_base64, thumbnail_data_url] = await Promise.all([
+        readAsBase64(file),
+        kind === "image" ? createImageThumbnail(file) : Promise.resolve(undefined),
+      ]);
       const att: Attachment = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         kind,
@@ -1047,6 +1126,7 @@ function App() {
         mime: file.type || "application/octet-stream",
         size: file.size,
         data_base64,
+        thumbnail_data_url,
         preview_url:
           kind === "image" || kind === "video" ? URL.createObjectURL(file) : undefined,
       };
@@ -1249,10 +1329,6 @@ function App() {
     void navigator.clipboard.writeText(text).catch(() => {});
   }
 
-  function openSettings() {
-    void chrome.runtime.openOptionsPage().catch(() => {});
-  }
-
   const headerLine = (() => {
     if (!pageMeta) return "";
     try {
@@ -1319,25 +1395,6 @@ function App() {
         </div>
         <button
           class="btn-icon w-6 h-6 rounded-md flex items-center justify-center shrink-0"
-          title="设置"
-          onClick={openSettings}
-        >
-          <svg width="14" height="14" viewBox="0 0 15 15" fill="none" aria-hidden="true">
-            <path
-              d="M7.5 5.1a2.4 2.4 0 1 1 0 4.8a2.4 2.4 0 0 1 0-4.8Z"
-              stroke="currentColor"
-              stroke-width="1.2"
-            />
-            <path
-              d="M7.5 1.8v1.5M7.5 11.7v1.5M2.6 4.2l1.3.75M11.1 10.05l1.3.75M2.6 10.8l1.3-.75M11.1 4.95l1.3-.75"
-              stroke="currentColor"
-              stroke-width="1.2"
-              stroke-linecap="round"
-            />
-          </svg>
-        </button>
-        <button
-          class="btn-icon w-6 h-6 rounded-md flex items-center justify-center shrink-0"
           title="新对话"
           onClick={newSession}
         >
@@ -1379,11 +1436,12 @@ function App() {
                 {m.attachments && m.attachments.length > 0 && (
                   <div class="flex flex-col gap-1.5 mt-1.5 items-end max-w-[88%]">
                     {m.attachments.map((a) => {
-                      if (a.kind === "image" && a.preview_url) {
+                      const imageSrc = attachmentImageSrc(a);
+                      if (a.kind === "image" && imageSrc) {
                         return (
                           <img
                             key={a.id}
-                            src={a.preview_url}
+                            src={imageSrc}
                             alt={a.name}
                             class="max-w-[260px] max-h-[260px] rounded-xl border border-bbt object-contain"
                           />
@@ -1475,8 +1533,8 @@ function App() {
                 key={a.id}
                 class="relative bg-bbt-input border border-bbt rounded-xl text-[12px] flex items-center gap-1.5 pr-6 pl-1.5 py-1"
               >
-                {a.kind === "image" && a.preview_url ? (
-                  <img src={a.preview_url} alt="" class="w-7 h-7 object-cover rounded-md" />
+                {a.kind === "image" && attachmentImageSrc(a) ? (
+                  <img src={attachmentImageSrc(a)} alt="" class="w-7 h-7 object-cover rounded-md" />
                 ) : (
                   <span class="text-base leading-none w-7 h-7 flex items-center justify-center">
                     {a.kind === "video" ? "🎬" : "📎"}

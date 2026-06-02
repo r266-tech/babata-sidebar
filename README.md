@@ -47,8 +47,8 @@ Then load the extension:
 2. Enable Developer mode.
 3. Click `Load unpacked`.
 4. Select the `dist/` directory created by `npm run build`.
-5. Open the extension options page from the extension details page, or click the
-   gear button in the babata side panel.
+5. Open the extension options page from the browser extension details page or
+   the extension menu.
 6. Keep the companion URL as `http://127.0.0.1:18791` unless you changed the
    port.
 7. Enter your translation provider `base_url` and `api_key`.
