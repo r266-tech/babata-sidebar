@@ -23,7 +23,8 @@ import {
 //   L1 cache (page-side Map<hash,html>) — 同 page 内重 mount 命中
 //   L2 cache (server-side sqlite) — 跨 tab/session, 24h TTL (server 端处理)
 //
-// 解决 V 推特"拉下没翻 / 拉回上消失"两大坑.
+// Fixes the common SPA timeline failure mode: scroll down misses text, scroll
+// back up loses previously injected translations.
 //
 // 安全: 译文来自 LLM (untrusted), 走 DOMPurify 白名单 (inline format only).
 
@@ -34,7 +35,7 @@ const TEARDOWN_EVENT = "babata:translate-teardown";
 // inline-leaf (X span/a/strong) 跟 block-leaf (P/DIV/blockquote) 的 sibling 译文
 // 视觉应跟 leaf 一致 — block-leaf 后 block 占行, inline-leaf 后 inline 流畅. 用 marker
 // class 区分, 让 CSS rule (mode-aware) 控制装饰. inline TR_STYLE 的 border-left+block
-// 装饰在 replace 模式下 = 噪声 (V 实测 X 推文每段加左 border 大字号堆叠 broken).
+// Heavy decoration in replace mode becomes visual noise on dense feeds.
 const TR_INLINE_CLASS = "bbt-tr-inline";
 const TR_BLOCK_CLASS = "bbt-tr-block";
 const TR_NATIVE_CLASS = "bbt-tr-native";
@@ -47,11 +48,14 @@ const SAFE_HTML_OPTS = {
   ALLOWED_TAGS: ["b", "i", "em", "strong", "a", "code", "br", "span", "mark"],
   ALLOWED_ATTR: ["href", "title", "class", "target", "rel", "referrerpolicy"],
 };
+const LINKIFIED_HTML_OPTS = {
+  ...SAFE_HTML_OPTS,
+  ALLOWED_ATTR: [...SAFE_HTML_OPTS.ALLOWED_ATTR, "style"],
+};
 
-// LLM 翻一次, 永远 sibling .bbt-tr 注入. "替换/双语/不翻" 纯 CSS 切换 0 LLM (V 设计).
-// 老 "auto" innerHTML 替换跟 React reconcile fundamentally 抢 DOM (X 实测同 leaf SPAN
-// 10s 被外部 reconcile 9 次), 5 源 (沉浸式 v1.28.5/read-frog/kiss/fluentread/old-immersive)
-// 全选 sibling 注入, 没人替换原文. 替换观感由 CSS hide leaf 元素实现, DOM 不抢.
+// Translate once, inject sibling .bbt-tr forever. Replace/bilingual/off modes
+// are CSS-only after the first model call. Direct innerHTML replacement fights
+// React-style reconciliation, so the original DOM is left intact.
 type Mode = TranslationMode;
 
 const isSubframe = window.top !== window.self;
@@ -74,13 +78,13 @@ let flushTimer: number | null = null;
 let flushInProgress = false;
 
 const TARGET_LANG = "zh";
-// 24/batch sonnet 一次接 ~5KB prompt 不慢, 减少 V 视口内段先后翻顺序差
-// (V 反馈"右侧名字先翻 / 正文后翻"). 进一步要降到 1 batch cover 视口内全部
-// 需要 IO viewport-priority + immediateBudget (deep agent Q5).
+// Batch enough visible text together so nearby page content translates in a
+// coherent order instead of one small leaf at a time.
 const BATCH_SIZE = 24;
+const TRANSLATION_BATCH_CHAR_BUDGET = 12_000;
 const FLUSH_DEBOUNCE_MS = 300;
-// queue cap 兜底防 V 滚万段时内存爆 — 实际 V 滚 timeline 千段也到不了.
-// 不再按 viewport drop scroll-out: V 明确 "DOM 里能读到的尽量都翻".
+// Queue cap prevents runaway memory use on long timelines. Do not drop items
+// only because they scrolled out; if the DOM exposes readable text, translate it.
 const QUEUE_MAX = 5000;
 const MISSING_RESULT_MAX_RETRIES = 2;
 const TRANSPORT_MAX_RETRIES = 5;
@@ -103,9 +107,9 @@ let idleTimer: number | null = null;
 const IDLE_THRESHOLD_MS = 30_000;
 const VIEWPORT_PUSH_DEBOUNCE_MS = 1000;
 
-// Extension reload 时, 老 content script 仍在 page 上, chrome.runtime API 同步抛
-// "Extension context invalidated" — `.catch()` 接不到 sync throw. 一次 set true
-// 后所有 chrome.* 调用 short-circuit, 静默直到 V 刷 page reload 我.
+// After extension reload, old content scripts remain on the page and
+// chrome.runtime APIs can throw synchronously. `.catch()` cannot catch that, so
+// one invalidation flips a local guard until the page reloads.
 let extInvalidated = false;
 let transportFailures = 0;
 let nextFlushNotBefore = 0;
@@ -185,9 +189,9 @@ function setupAttentionWatchers() {
   onInteract();
 }
 
-// ── universal leaf-text walk (V 反 site-specific: 通用, 翻肉眼可见所有) ─
+// ── universal leaf-text walk ───────────────────────────────────────────
 
-// 段内 inline 标签 (沉浸式 generalRule.inlineTags 同源 + babata 补).
+// Inline tags that should stay in the same translated visual line.
 // fast path: 99% 命中 (DIV/SPAN/A/P 这种常见 tag). 不命中走 CSS fallback (Q1).
 const INLINE_TAGS = new Set([
   "A", "ABBR", "B", "BDO", "BIG", "CITE", "CODE", "DEL", "DFN", "EM",
@@ -205,12 +209,16 @@ const FORCE_BLOCK_TAGS = new Set([
   "H1", "H2", "H3", "H4", "H5", "H6",
 ]);
 
-// Immersive generalRule core subset: 阈值/保留标签/数学选择器/原子块/断句缩写.
-// 原始配置见 Edge 沉浸式 v1.28.5 default_config.content.json generalRule.
+// Core translation gates: thresholds, preserved tags, math selectors, atomic
+// blocks, and line-break abbreviations.
 const PARAGRAPH_MIN_TEXT_COUNT = 4;
 const BLOCK_MIN_TEXT_COUNT = 24;
 const MAIN_FRAME_MIN_TEXT_COUNT = 50;
 const LONG_BUILD_DOM_LENGTH = 3000;
+// X long-form Articles / DraftJS can pack the whole body into one inline span.
+// Keep the per-leaf cap high enough for those natural-language documents, and
+// control transport size separately with TRANSLATION_BATCH_CHAR_BUDGET.
+const LONGFORM_MAX_TEXT_COUNT = 12_000;
 const STAY_ORIGINAL_TAGS = new Set([
   "CODE", "TT", "IMG", "SUP", "SUB", "SAMP", "MATH", "SEMANTICS", "MROW",
   "MO", "MFRAC", "MSUP", "MI", "MN", "MSQRT", "D-MATH", "KBD",
@@ -242,7 +250,7 @@ const RICH_MEDIA_MIN_EDGE_PX = 32;
 const RICH_MEDIA_MIN_AREA_PX = 2048;
 const RICH_MEDIA_SCAN_LIMIT = 160;
 const DEFAULT_MIN_TEXT_COUNT = Math.min(PARAGRAPH_MIN_TEXT_COUNT, MAIN_FRAME_MIN_TEXT_COUNT);
-const MAX_TRANSLATABLE_TEXT_COUNT = Math.max(4000, LONG_BUILD_DOM_LENGTH);
+const MAX_TRANSLATABLE_TEXT_COUNT = Math.max(LONGFORM_MAX_TEXT_COUNT, LONG_BUILD_DOM_LENGTH);
 const LINE_BREAK_ABBREVIATION_RE = /(?:etc\.|Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.|Sr\.|Jr\.|U\.S\.|U\.K\.|Co\.|Inc\.|Ltd\.|St\.)$/i;
 
 // 子树根本不该进 (REJECT — TreeWalker 不再深入). 含已注入译文.
@@ -270,26 +278,23 @@ const AUXILIARY_CONTENT_SELECTOR = [
 const VISUALLY_HIDDEN_CLASS_RE = /(?:^|\s)(?:sr-only|visually-hidden)(?:\s|$)|VisuallyHidden|ScreenReader/i;
 
 // leaf 物理 mark — 写 DOM attr (data-bbt-leaf). page 删该元素 attr 跟随消失, 不像
-// WeakSet 永久 lock. 5 源 (kiss/read-frog/fluentread/old-immersive/沉浸式) 全选物理
-// 探测, 没人用逻辑 lock. babata 老的 claimed: WeakSet 是反模式 — 已 leaf 的子树新加
-// 节点 (展开更多场景) 走 collectTranslatable 被 hasClaimedAncestor 挡死, 漏翻;
-// 另已 inject 被外力清 .bbt-tr 后, claimed 仍 lock 永远不能 reinject.
+// Physical leaf mark written to the DOM. A permanent WeakSet lock is brittle:
+// if new text appears inside an already-claimed subtree, collection can miss it;
+// if injected translations are removed externally, reinjection is blocked.
 const multiCache = new WeakMap<HTMLElement, boolean>();
 // inline 判断缓存 — getComputedStyle 同步 reflow, 同元素重复调贵.
 const inlineCache = new WeakMap<HTMLElement, boolean>();
 const hiddenCache = new WeakMap<HTMLElement, boolean>();
 // MO sentinel — 自己 inject 的 .bbt-tr font 加进, MO addedNodes 跳 (kiss translator.js:319,711).
 const skipMoNodes = new WeakSet<Node>();
-// X SPA reconcile race debounce — 同 hash inject 后 N ms 内 MO 触发 processCandidate skip,
-// 让 X reconcile 完成稳态. V 实测 800ms 仍闪 (events.jsonl 同 hash 1 秒 4 hit), codex F1
-// 警告"X 可能 900-1500ms 周期", 调 1500ms 给 X reconcile burst 留余地.
+// SPA reconciliation debounce. After injecting the same hash, skip immediate
+// MutationObserver echoes long enough for bursty feed updates to settle.
 const recentlyInjected = new Map<string, number>();
 const INJECT_DEBOUNCE_MS = 1500;
-// 抄沉浸式 v1.28.5 `Js` Map (content_main_beauty.js:45580-45596) — TRAILING stable-window.
-// 之前用 leading throttle (first-wins) 错: X reconcile 第一次 mutation 拿 unstable text
-// 就 process, 后续 1.5s 内全拦, "显示更多" 展开后新内容 fall in throttle window 漏翻.
-// trailing 正解: 每次 mutation 更新 ts, 1100ms 静默无新 mutation 才真 process. 拿到的
-// 是 X reconcile 完成后的稳定 text, 1 次 process inject 不闪. tick interval 200ms 扫.
+// Trailing stable-window scanner. A leading throttle can capture unstable text
+// from the first mutation and then suppress the later settled content. Here
+// every mutation refreshes the timestamp, and processing only happens after a
+// quiet window.
 const STABLE_WINDOW_MS = 1100;
 const stableWindowMap = new Map<HTMLElement, { ts: number; src: TraceSource }>();
 let stableWindowTimer: number | null = null;
@@ -298,14 +303,14 @@ const inFlightElements = new WeakSet<HTMLElement>();
 // hash in-flight 锁 — 跨 element instance 同 text. X swap SPAN 时新 instance 不在
 // inFlightElements (WeakSet 是 element 级), 重新走 doProcessCandidate, cache 还没 set
 // (flush async 在 server roundtrip 中), 又 enqueue 触发并发 flush. 两次 server 调用同
-// text 返不同 LLM 译文, cache.set 覆盖. V 实测 hash 535d6390 4 次 add 不同译文铁证.
+// text can receive different model outputs and overwrite the cache.
 // hash 锁让同 text 跨 instance 串行: 第一次 enqueue 锁, flush 完返结果再解锁.
 const inFlightHashes = new Set<string>();
 
-// ── client trace instrumentation (V "开发要收集数据方便调试") ─
+// ── client trace instrumentation ───────────────────────────────────────
 // 每次 processCandidate 在每个 decision 点记一条 trace. batch flush 经 SW POST
-// /translate_trace, server 写 events.jsonl client_trace kind. V tail 直接看
-// 每个 decision 不再 hypothesize 闪烁/漏翻 root cause.
+// /translate_trace lets the companion record decision points for debugging
+// flicker and missing-translation reports with data instead of guesses.
 type TraceSource = "io" | "mo_add" | "mo_char" | "rerun" | "init";
 type TraceDecision = "throttle" | "not_translatable" | "already" | "debounce"
   | "cache_inject" | "enqueue" | "in_flight_defer" | "stable_pending"
@@ -416,7 +421,6 @@ function startCleanupTimer() {
   }, INJECT_DEBOUNCE_MS * 8);
 }
 
-// 抄沉浸式 v1.28.5 C() function (45578-45605) — trailing stable-window scanner.
 // 每 200ms 扫 stableWindowMap, 静默 1100ms+ 的 element 提升到 doProcessCandidate.
 function startStableWindowTimer() {
   if (stableWindowTimer !== null) return;
@@ -531,7 +535,7 @@ function isInlineElement(el: HTMLElement): boolean {
   return cached;
 }
 
-// 元素自身/视觉隐藏 — 跳整子树 (V "肉眼可见全翻" 反义).
+// Skip visually hidden subtrees.
 // display:none 子无 layout, visibility:hidden 子有占位但用户看不到.
 function isHidden(el: HTMLElement): boolean {
   let cached = hiddenCache.get(el);
@@ -974,9 +978,8 @@ function shouldTranslate(text: string, minTextCount = DEFAULT_MIN_TEXT_COUNT): b
 
 // ── hash (FNV-1a-ish 64bit, 16 hex chars) ─────────────────────────────
 
-// X 反复 swap SPAN 时 textContent 含微妙空白差异 (trailing space / zero-width
-// space / nbsp / 双空格) → 每次新 hash → cache miss → 反复调 server 翻不同译文 →
-// V 视觉"反复变". 实测 "Hello..." 5 种空白形式 → 5 完全不同 hash. normalize:
+// When feeds repeatedly swap SPAN nodes, subtle whitespace differences can
+// create different hashes for visually identical text. Normalize:
 //   ZWSP (U+200B-200F) / BOM (U+FEFF) / nbsp (U+00A0) → ASCII space
 //   多空白 → 单 space, 头尾 strip.
 // 同英文 text 不同空白形式同 hash, cache 100% 命中.
@@ -1487,6 +1490,9 @@ function createNativeTranslationElement(el: HTMLElement, inlineLeaf: boolean): H
   }
   node.classList.add(TR_CLASS, inlineLeaf ? TR_INLINE_CLASS : TR_BLOCK_CLASS, TR_NATIVE_CLASS);
   node.setAttribute("lang", TARGET_LANG);
+  if (el instanceof HTMLAnchorElement && node instanceof HTMLAnchorElement) {
+    copyAnchorPresentation(el, node);
+  }
   return node;
 }
 
@@ -1571,6 +1577,28 @@ function copyAnchorAttrs(src: HTMLAnchorElement, dst: HTMLAnchorElement) {
     }
   }
   if (dst.target === "_blank" && !dst.rel) dst.rel = "noopener noreferrer";
+  copyAnchorPresentation(src, dst);
+}
+
+function copyAnchorPresentation(src: HTMLAnchorElement, dst: HTMLAnchorElement) {
+  try {
+    const cs = window.getComputedStyle(src);
+    if (cs.color && cs.color !== "rgba(0, 0, 0, 0)" && cs.color !== "transparent") {
+      dst.style.color = cs.color;
+    }
+    if (cs.textDecorationLine) {
+      dst.style.textDecorationLine = cs.textDecorationLine;
+    }
+    if (cs.textDecorationStyle) {
+      dst.style.textDecorationStyle = cs.textDecorationStyle;
+    }
+    if (cs.textDecorationColor) {
+      dst.style.textDecorationColor = cs.textDecorationColor;
+    }
+    dst.style.cursor = "pointer";
+  } catch {
+    dst.style.cursor = "pointer";
+  }
 }
 
 function tokenIndexOf(text: string, token: string, start: number): number {
@@ -1653,14 +1681,14 @@ function linkifyPreservedSourceLinks(el: HTMLElement, safe: string): string {
     textNode.parentNode?.replaceChild(frag, textNode);
   }
 
-  return DOMPurify.sanitize(template.innerHTML, SAFE_HTML_OPTS);
+  return DOMPurify.sanitize(template.innerHTML, LINKIFIED_HTML_OPTS);
 }
 
 function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
   clearTranslation(el);
   if (mode === "off" || !raw) return;
   // 译文等于原文 (模型决定不翻 — 专有名词 / handle / 版本号等) → 不 inject sibling,
-  // 否则视觉上原文显示 2 遍 (V 截图 #8 user info 重复 3 次的 root cause).
+  // Otherwise the original appears twice for names, handles, and version text.
   const original = sourceText(el);
   if (raw.trim() === original) return;
   // server 返 plain text with \n\n 段分隔. 浏览器把 \n 当 whitespace 渲染,
@@ -1687,10 +1715,8 @@ function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
   const tr = createTranslationElement(el, safe, inlineLeaf);
   // MO sentinel: 自己 inject 的 node 加进 skipMoNodes, MO addedNodes 看到跳 (防自触发).
   skipMoNodes.add(tr);
-  // sibling 注入 — 5 源共识 (kiss translator.js:1359 .after / 沉浸式 Zs insertBefore /
-  // read-frog page-translation.ts insertBefore / old-immersive). 防死循环靠"不处理
-  // removedNodes" (F6 已删), 不靠 appendChild 进 leaf. appendChild 实测在 X 上 React
-  // 仍 swap 整 SPAN, 加上 getComputedStyle reflow = 整页 layout thrashing 闪.
+  // Sibling injection avoids mutating the source leaf. Infinite-loop prevention
+  // comes from ignoring removedNodes, not from appending inside the source leaf.
   el.insertAdjacentElement("afterend", tr);
   if (hash) recentlyInjected.set(hash, Date.now());
 }
@@ -1815,7 +1841,7 @@ function doProcessCandidate(el: HTMLElement, src: TraceSource) {
     visible: isElementNearViewport(el),
     attempts: 0,
   });
-  // queue cap — V 快速滚时 evict 最老 (FIFO insertion order).
+  // Queue cap: evict the oldest item by FIFO insertion order.
   if (queue.size > QUEUE_MAX) {
     const oldest = queue.keys().next().value as string | undefined;
     if (oldest && oldest !== fresh) {
@@ -1855,6 +1881,7 @@ async function flushOnce() {
   // 可见优先取 BATCH_SIZE, 但不丢 scroll-out: 队列里的后台段落继续补翻.
   // slice 暂不删, 等 round-trip 完按 result 状态决定.
   const slice: { hash: string; el: HTMLElement; text: string }[] = [];
+  let sliceChars = 0;
   const candidates = Array.from(queue.entries()).sort((a, b) => {
     const av = a[1].visible || isElementNearViewport(a[1].el);
     const bv = b[1].visible || isElementNearViewport(b[1].el);
@@ -1862,9 +1889,13 @@ async function flushOnce() {
     return a[1].attempts - b[1].attempts;
   });
   for (const [h, item] of candidates) {
-    item.visible = item.visible || isElementNearViewport(item.el);
-    slice.push({ hash: h, el: item.el, text: item.text });
     if (slice.length >= BATCH_SIZE) break;
+    item.visible = item.visible || isElementNearViewport(item.el);
+    if (slice.length > 0 && sliceChars + item.text.length > TRANSLATION_BATCH_CHAR_BUDGET) {
+      continue;
+    }
+    slice.push({ hash: h, el: item.el, text: item.text });
+    sliceChars += item.text.length;
   }
   if (slice.length === 0) return;
 
@@ -2025,14 +2056,14 @@ function observeMutations(root: ParentNode = document.body) {
           }
           continue;
         }
-        // F-V-display-more: X "显示更多" 点开后, X 用 React 替换 tweetText nodeValue
-        // (characterData mutation 不是 childList). 抄 kiss translator.js:718-723 模式:
+        // display-more: some feeds replace text nodeValue directly
+        // (characterData mutation, not childList). Only oldValue changes matter:
         // oldValue !== nodeValue 才触发 (filter noop), processCandidate parent 重 enqueue.
         if (r.type === "characterData") {
           if (r.oldValue === r.target.nodeValue) continue;
           const parent = r.target.parentElement;
           if (parent && parent instanceof HTMLElement) {
-            // 父元素 inside .bbt-tr 跳 (我们译文 text node 改不算用户内容变化).
+            // Ignore text changes inside injected translations.
             if (parent.closest && parent.closest(`.${TR_CLASS}`)) continue;
             processCandidate(parent, "mo_char");
           }
@@ -2047,10 +2078,10 @@ function observeMutations(root: ParentNode = document.body) {
         }
 
         for (const node of r.addedNodes) {
-          // 自己 inject 的 .bbt-tr font 跳 (kiss translator.js:711 同模式) — 防自触发 loop.
+          // Skip nodes injected by this script to avoid self-trigger loops.
           if (skipMoNodes.has(node)) continue;
-          // 结构性 sentinel: addedNode 自己是 .bbt-tr (即使 skipMoNodes WeakSet 没 cover —
-          // 比如 SPA clone / 第三方扩展插同 class 元素) 跳 (kiss translator.js:730-732).
+          // Structural sentinel: skip .bbt-tr even if WeakSet did not cover it,
+          // for example after SPA cloning or another extension inserting it.
           if (node instanceof HTMLElement && node.classList.contains(TR_CLASS)) continue;
           if (!(node instanceof HTMLElement)) continue;
 
@@ -2067,14 +2098,10 @@ function observeMutations(root: ParentNode = document.body) {
           observeNew(node, "mo_add");
         }
 
-        // 故意不处理 r.removedNodes — 5 源对照 (agent 反编译铁证):
-        //   kiss translator.js:707-749 / read-frog page-translation.ts:516-532 /
-        //   old-immersive pageTranslator.js:284 全部 only addedNodes 不动 removedNodes;
-        //   沉浸式 v1.28.5 content_main_beauty.js:45687 `I$()` 检 mutation 整段
-        //   self-induced 时整条 skip (默认 checkSelfUpdate=true).
-        // 老 F6 200ms reinject 是反应式补丁, 实测在 X 上跟 React reconcile 形成死循环
-        // (V 12s 89 次 add/rm 实测铁证). 删之. React 删 .bbt-tr 后 babata 不反应,
-        // 下次 mutation cycle 通过 addedNodes 路径自然 reprocess.
+        // Intentionally ignore removedNodes. React-style pages can remove
+        // injected siblings during reconciliation; reprocessing on removal
+        // causes add/remove loops. Later added/characterData mutations naturally
+        // re-enter the stable-window path.
       }
     });
   }
@@ -2126,7 +2153,7 @@ async function loadMode() {
 // CSS rules — mode 切换不重调 LLM, 只重绘 page-side cached translation nodes.
 // 关键设计:
 //   replace 用 `:has(+ .${TR_CLASS})` 避免空窗 — leaf 只在 sibling 译文已 inject 时
-//   才隐藏, 翻译没回来前 leaf 仍显示原文 (V 反馈 "少了一大堆" = 之前无条件 hide).
+//   only after a translation exists, so text is not hidden while waiting.
 //   replace 的 .bbt-tr-native 复制原 leaf tag/class/style/data state, 让站点原 CSS 决定
 //   字号/间距/布局; bilingual 才用额外 display + border-left / 字号 / margin 装饰区分.
 const MODE_STYLE_ID = "bbt-mode-style";
@@ -2245,7 +2272,7 @@ function boot() {
     chrome.storage.onChanged.addListener(onStorageChanged);
     registerCleanup(() => chrome.storage.onChanged.removeListener(onStorageChanged));
   } catch {
-    /* extension context invalidated — 老 content script 不 re-bind, V 刷 page 后新 SC 接手 */
+    /* extension context invalidated: wait for the next page load */
   }
 
   // F8: page unload / extension reload 时清 timer + MO, 防老 content script leak.

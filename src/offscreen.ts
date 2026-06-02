@@ -1,5 +1,13 @@
 /// <reference types="chrome" />
 
+import {
+  DEFAULT_SERVER_ORIGIN,
+  STORAGE_SERVER_ORIGIN,
+  getServerOrigin,
+  serverUrlFromOrigin,
+  wsUrlFromOrigin,
+} from "./runtime-config";
+
 // Offscreen document — 持久 ws 通道 (MV3 SW idle 30s kill 不杀这).
 //
 // 哲学: SW 是 dispatcher (chrome.scripting.executeScript 等只能 SW 跑),
@@ -7,12 +15,8 @@
 //   server WS  ──→ offscreen ──→ SW (handle, 跑 chrome.scripting) ──→ offscreen ──→ server WS
 //   server WS notification ──→ offscreen ──→ SW ──→ sidepanel (通知 chip 等)
 //
-// 抄 Anthropic Claude in Chrome 1.0.70 同手法 (research/01 finding 3).
+// This keeps the long-lived channel outside the service worker idle lifecycle.
 
-const SERVER_HOST = "127.0.0.1";
-const SERVER_PORT = 18791;
-const SERVER = `http://${SERVER_HOST}:${SERVER_PORT}`;
-const WS_URL = `ws://${SERVER_HOST}:${SERVER_PORT}/ws`;
 const RECONNECT_BASE_MS = 1500;
 const RECONNECT_MAX_MS = 30_000;
 const SW_KEEPALIVE_MS = 20_000;
@@ -121,6 +125,7 @@ type ActiveChatRun = {
 let ws: WebSocket | null = null;
 let reconnectAttempt = 0;
 let reconnectTimer: number | null = null;
+let activeServerOrigin = DEFAULT_SERVER_ORIGIN;
 const activeChatRuns = new Map<string, ActiveChatRun>();
 
 const PAGE_READ_TOOLS = new Set(["tab_metadata", "page_snapshot", "dom_query", "article_extract"]);
@@ -579,7 +584,7 @@ async function startChat(req: ChatStartMessage): Promise<void> {
   await writeSavedChatHistory(key, run.messages, true, turnId);
 
   try {
-    const resp = await fetch(`${SERVER}/chat`, {
+    const resp = await fetch(serverUrlFromOrigin(activeServerOrigin, "/chat"), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -673,25 +678,28 @@ function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
-  try {
-    ws = new WebSocket(WS_URL);
-  } catch {
-    scheduleReconnect();
-    return;
-  }
-  ws.addEventListener("open", () => {
+  void (async () => {
+    activeServerOrigin = await getServerOrigin();
+    const socket = new WebSocket(wsUrlFromOrigin(activeServerOrigin));
+    ws = socket;
+    attachWsHandlers(socket);
+  })().catch(() => scheduleReconnect());
+}
+
+function attachWsHandlers(socket: WebSocket) {
+  socket.addEventListener("open", () => {
     reconnectAttempt = 0;
     console.log("[babata-offscreen] ws connected");
   });
-  ws.addEventListener("close", () => {
+  socket.addEventListener("close", () => {
     console.log("[babata-offscreen] ws closed");
-    ws = null;
+    if (ws === socket) ws = null;
     scheduleReconnect();
   });
-  ws.addEventListener("error", () => {
+  socket.addEventListener("error", () => {
     /* close handler 触发 reconnect */
   });
-  ws.addEventListener("message", (ev) => {
+  socket.addEventListener("message", (ev) => {
     // forward 到 SW. SW cold-start 时 sendMessage reject (no receiver), 100ms
     // 后重试一次 — 不重试就 server 等 30s timeout, request 白丢.
     const payload = typeof ev.data === "string" ? ev.data : "";
@@ -712,6 +720,24 @@ function connect() {
     });
   });
 }
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local" || !changes[STORAGE_SERVER_ORIGIN]) return;
+  activeServerOrigin = DEFAULT_SERVER_ORIGIN;
+  reconnectAttempt = 0;
+  if (reconnectTimer !== null) {
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  const socket = ws;
+  ws = null;
+  try {
+    socket?.close();
+  } catch {
+    /* already closed */
+  }
+  connect();
+});
 
 // SW 想发消息出去, 通过 chrome.runtime.sendMessage with type babata.ws.outbound
 // 转给我 — 我 ws.send. SW 没 ws 引用, 必须经我.

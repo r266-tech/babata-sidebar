@@ -2,6 +2,13 @@ import { render } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
+import {
+  DEFAULT_SERVER_ORIGIN,
+  STORAGE_SERVER_ORIGIN,
+  getServerOrigin,
+  normalizeServerOrigin,
+  serverUrlFromOrigin,
+} from "./runtime-config";
 import "./styles.css";
 
 type Attachment = {
@@ -63,6 +70,7 @@ type CpuChoice = {
   name: CpuName;
   label: string;
   current?: boolean;
+  available?: boolean;
 };
 type CpuStatus = {
   ok: boolean;
@@ -74,7 +82,6 @@ type CpuStatus = {
 type Suggestion = { id: string; text: string };
 type PinnedTarget = { tab_id?: number; window_id?: number };
 
-const SERVER = "http://127.0.0.1:18791";
 const SIDEPANEL_PORT = "babata-sidepanel";
 const CHAT_HISTORY_KEY_PREFIX = "babata.chat.history.v1";
 const CHAT_HISTORY_LATEST_KEY = `${CHAT_HISTORY_KEY_PREFIX}:latest`;
@@ -146,14 +153,15 @@ function normalizeCpuStatus(raw: unknown): CpuStatus | null {
       name: item.name as CpuName,
       label: typeof item.label === "string" ? item.label : String(item.name),
       current: Boolean(item.current),
+      available: item.available !== false,
     }));
   return {
     ok: true,
     cpu: obj.cpu,
     label: typeof obj.label === "string" ? obj.label : String(obj.cpu),
     choices: choices.length > 0 ? choices : [
-      { name: "codex", label: "Codex", current: obj.cpu === "codex" },
-      { name: "claude", label: "Claude Code", current: obj.cpu === "claude" },
+      { name: "codex", label: "Codex", current: obj.cpu === "codex", available: true },
+      { name: "claude", label: "Claude Code", current: obj.cpu === "claude", available: true },
     ],
     message: typeof obj.message === "string" ? obj.message : undefined,
   };
@@ -659,6 +667,7 @@ function App() {
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
+  const [serverOrigin, setServerOrigin] = useState(DEFAULT_SERVER_ORIGIN);
   const [serverOk, setServerOk] = useState<boolean | null>(null);
   const [cpuStatus, setCpuStatus] = useState<CpuStatus | null>(null);
   const [cpuSwitching, setCpuSwitching] = useState<CpuName | null>(null);
@@ -756,7 +765,28 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`${SERVER}/health`)
+    void getServerOrigin()
+      .then((origin) => {
+        if (!cancelled) setServerOrigin(origin);
+      })
+      .catch(() => {});
+    const listener = (
+      changes: Record<string, chrome.storage.StorageChange>,
+      areaName: string,
+    ) => {
+      if (areaName !== "local" || !changes[STORAGE_SERVER_ORIGIN]) return;
+      setServerOrigin(normalizeServerOrigin(changes[STORAGE_SERVER_ORIGIN].newValue));
+    };
+    chrome.storage.onChanged.addListener(listener);
+    return () => {
+      cancelled = true;
+      chrome.storage.onChanged.removeListener(listener);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(serverUrlFromOrigin(serverOrigin, "/health"))
       .then(async (r) => {
         if (!cancelled) setServerOk(r.ok);
         if (!r.ok) return;
@@ -770,7 +800,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [serverOrigin]);
 
   useEffect(() => {
     let cancelled = false;
@@ -834,12 +864,12 @@ function App() {
     };
   }, [historyStorageKey]);
 
-  // Mount/refresh 时拉聊天历史 — V 关闭再开 sidebar / 刷新页面 / 切到 chat popup
-  // iframe 都能恢复. 服务端 read_since_last_boundary, V 点新对话后只拉空.
+  // Restore chat history on mount/refresh so side panel and popup surfaces stay
+  // in sync.
   useEffect(() => {
     if (!localHistoryLoaded) return;
     let cancelled = false;
-    fetch(`${SERVER}/history?limit=200`, {
+    fetch(serverUrlFromOrigin(serverOrigin, "/history?limit=200"), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: "{}",
@@ -864,7 +894,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [localHistoryLoaded]);
+  }, [localHistoryLoaded, serverOrigin]);
 
   useEffect(() => {
     let alive = true;
@@ -1108,7 +1138,7 @@ function App() {
     void clearSavedChatHistory(historyStorageKey).catch(() => {});
     void clearSavedChatScrollState(historyStorageKey).catch(() => {});
     // 让 server 起新 session: 发 /new 给 cc.py (复用 cc 的 /new 命令路径).
-    void fetch(`${SERVER}/chat`, {
+    void fetch(serverUrlFromOrigin(serverOrigin, "/chat"), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ message: "/new" }),
@@ -1120,7 +1150,7 @@ function App() {
     setCpuSwitching(cpu);
     setCpuError("");
     try {
-      const resp = await fetch(`${SERVER}/cpu`, {
+      const resp = await fetch(serverUrlFromOrigin(serverOrigin, "/cpu"), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ cpu }),
@@ -1229,8 +1259,8 @@ function App() {
     }
   })();
   const cpuChoices = cpuStatus?.choices ?? [
-    { name: "codex" as const, label: "Codex", current: false },
-    { name: "claude" as const, label: "Claude Code", current: false },
+    { name: "codex" as const, label: "Codex", current: false, available: true },
+    { name: "claude" as const, label: "Claude Code", current: false, available: true },
   ];
 
   return (
@@ -1250,11 +1280,11 @@ function App() {
               serverOk === null ? "#ccc" : serverOk ? "#4ca36b" : "#c66a4a",
           }}
           title={
-            serverOk === null
-              ? "连接中"
-              : serverOk
-                ? "已连接 babata server"
-                : "server 未运行 (127.0.0.1:18791)"
+              serverOk === null
+                ? "连接中"
+                : serverOk
+                  ? "已连接 babata server"
+                : `server 未运行 (${serverOrigin})`
           }
         />
         <span
@@ -1269,13 +1299,14 @@ function App() {
         >
           {cpuChoices.map((choice) => {
             const active = choice.name === cpuStatus?.cpu;
+            const available = choice.available !== false;
             return (
               <button
                 key={choice.name}
                 class={`bbt-cpu-option ${active ? "bbt-cpu-active" : ""}`}
                 onClick={() => switchCpu(choice.name)}
-                disabled={streaming || Boolean(cpuSwitching)}
-                title={choice.label}
+                disabled={streaming || Boolean(cpuSwitching) || !available}
+                title={available ? choice.label : `${choice.label} not found`}
               >
                 {cpuSwitching === choice.name ? "..." : cpuShortLabel(choice)}
               </button>

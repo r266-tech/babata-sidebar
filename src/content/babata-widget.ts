@@ -20,10 +20,10 @@ import {
 // 哲学: 内容物 LLM 决定 (bubble 文本 / 翻译要不要做), widget 只是容器.
 // Shadow DOM 物理隔离站点 CSS, all:initial 防 site reset 干扰.
 //
-// V0 元素:
+// Page widget elements:
 //   主按钮 (drag-able, 单击 = 打开 page chat popup + prompt chips; 双击 = agent 锐评; 三击 = 净化阅读)
 //   设置按钮 (渲染模式 + 当前站点是否翻译)
-//   bubble (server 推 mascot_speak 时浮起来, 30s auto-dismiss, V 点 X 关掉)
+//   bubble (shown for mascot_speak, 30s auto-dismiss, closable)
 
 type OpenChatPopupOptions = { suggest?: boolean };
 type BubbleOptions = {
@@ -31,6 +31,7 @@ type BubbleOptions = {
   dismissible?: boolean;
   interactive?: boolean;
 };
+type PageTargetContext = { tab_id?: number; window_id?: number };
 
 const HOST_ID = "__babata_widget_host__";
 const TEARDOWN_EVENT = "babata:widget-teardown";
@@ -77,6 +78,7 @@ let widgetState: {
 } | null = null;
 let cleanupCurrentWidget: (() => void) | null = null;
 let extInvalidated = false;
+let lastPageTargetContext: PageTargetContext | null = null;
 
 function isInvalidatedError(e: unknown): boolean {
   return /Extension context invalidated/.test((e as Error)?.message ?? String(e));
@@ -121,6 +123,32 @@ function refreshBubbleMetrics() {
   const availableLeft = anchorRect.left - BUBBLE_GAP_PX - BUBBLE_VIEWPORT_PADDING_PX;
   const maxWidth = Math.max(80, Math.min(BUBBLE_MAX_WIDTH_PX, Math.floor(availableLeft)));
   widgetState.mainAnchor.style.setProperty("--bubble-max-width", `${maxWidth}px`);
+}
+
+function normalizePageTargetContext(ctx: unknown): PageTargetContext | null {
+  if (!ctx || typeof ctx !== "object") return null;
+  const record = ctx as Record<string, unknown>;
+  const tabId = record.tab_id;
+  const windowId = record.window_id;
+  const out: PageTargetContext = {};
+  if (typeof tabId === "number" && Number.isInteger(tabId) && tabId > 0) out.tab_id = tabId;
+  if (
+    typeof windowId === "number" &&
+    Number.isInteger(windowId) &&
+    windowId >= 0
+  ) {
+    out.window_id = windowId;
+  }
+  return out.tab_id !== undefined || out.window_id !== undefined ? out : null;
+}
+
+async function currentPageTargetContext(): Promise<PageTargetContext | null> {
+  const ctx = await safeChromePromise(() =>
+    chrome.runtime.sendMessage({ type: "babata.current_tab_context" }),
+  );
+  const normalized = normalizePageTargetContext(ctx);
+  if (normalized) lastPageTargetContext = normalized;
+  return normalized;
 }
 
 async function loadPersisted(): Promise<{
@@ -1005,7 +1033,12 @@ function createWidget() {
   btnStack.appendChild(settingsBtn);
 
   const openSidebar = () => {
-    void safeChromePromise(() => chrome.runtime.sendMessage({ type: "babata.toggle_sidebar" }));
+    void safeChromePromise(() =>
+      chrome.runtime.sendMessage({
+        type: "babata.toggle_sidebar",
+        ...(lastPageTargetContext ?? {}),
+      }),
+    );
   };
 
   const requestPromptSuggestions = () => {
@@ -1161,7 +1194,8 @@ function createWidget() {
   const onDocumentClick = (e: MouseEvent) => {
     if (!popover) return;
     // closed shadow root 的 composedPath 不暴露内部 nodes — 之前 path.includes(popover)
-    // 永远 false, 导致 V 点 popover 内 radio 时 popover 被误关 (radio 切换看似失败).
+    // When false, clicking radio controls inside the popover closes the popover
+    // before the selection appears to apply.
     // 改用 host 判断: 点击发生在我们的 host 内 (popover/settings/任意 widget 位置) 就不关.
     const path = e.composedPath();
     if (path.includes(host)) return;
@@ -1262,9 +1296,7 @@ function renderChatPopup(
     }
   };
   if (sidepanelUrl) {
-    void safeChromePromise(() =>
-      chrome.runtime.sendMessage({ type: "babata.current_tab_context" }),
-    ).then((ctx) => setIframeSrc(ctx));
+    void currentPageTargetContext().then((ctx) => setIframeSrc(ctx));
     window.setTimeout(() => {
       if (!iframe.getAttribute("src")) setIframeSrc();
     }, 150);

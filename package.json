@@ -1,18 +1,34 @@
 {
   "name": "babata-sidebar",
-  "private": true,
+  "private": false,
   "version": "0.0.1",
   "type": "module",
-  "description": "babata 浏览器扩展 — chat sidebar / 整页双语 / 划词 / page agent / 浏览器管家",
+  "description": "Local-first AI browser sidebar with page translation and Codex/Claude Code companion support.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/r266-tech/babata-sidebar.git"
+  },
+  "bugs": {
+    "url": "https://github.com/r266-tech/babata-sidebar/issues"
+  },
+  "homepage": "https://github.com/r266-tech/babata-sidebar#readme",
+  "overrides": {
+    "@crxjs/vite-plugin": {
+      "rollup": "2.80.0"
+    }
+  },
   "scripts": {
+    "companion": "node companion/server.mjs",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "smoke:companion": "node scripts/smoke-companion.mjs",
     "smoke:sidebar": "node scripts/smoke-sidebar.mjs",
     "smoke:rich-card": "node scripts/smoke-rich-card.mjs",
     "smoke:llm": "node scripts/smoke-llm.mjs",
-    "smoke": "npm run smoke:sidebar && npm run smoke:rich-card"
+    "smoke": "npm run smoke:companion && npm run smoke:sidebar && npm run smoke:rich-card"
   },
   "dependencies": {
     "@types/dompurify": "^3.0.5",

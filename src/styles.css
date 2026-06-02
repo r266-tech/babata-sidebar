@@ -2,8 +2,7 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Anthropic Claude in Chrome 风格的米白主题. 用 CSS variable 让浅/深主题
-   切换简单 (后续 V 想夜间模式只改 var). */
+/* Warm neutral theme. CSS variables keep future light/dark changes local. */
 :root {
   --bbt-bg: #faf9f7;
   --bbt-fg: #1c1c1c;
@@ -13,7 +12,7 @@
   --bbt-bubble: #f0ece4;
   --bbt-bubble-user: #efeae0;
   --bbt-input-bg: #ffffff;
-  --bbt-accent: #c66a4a; /* 暖橘色, 跟 babata main repo 视觉一致 */
+  --bbt-accent: #c66a4a;
   --bbt-accent-fg: #ffffff;
   --bbt-warn-bg: #fbf1d9;
   --bbt-warn-fg: #6b5210;

@@ -7,6 +7,7 @@ import {
   effectiveTranslationModeForUrl,
   normalizeTranslationRenderMode,
 } from "./translation-settings";
+import { serverFetch } from "./runtime-config";
 
 // SW = 极薄 dispatcher.
 //
@@ -16,10 +17,9 @@ import {
 //   SW result ──[chrome.runtime.sendMessage]──→ offscreen.ts ──→ ws.send ──→ server
 //
 // 为什么不让 SW 直接持 ws?  MV3 SW 30s idle kill, ws 跟着断, setTimeout 不
-// fire reconnect — V 实测 babata-sidebar V0 第一次装上 ws 30s 后死掉. Anthropic
-// Claude in Chrome 1.0.70 也踩, 用 offscreen document 解 (research/01 finding 3).
+// fire reconnect. Use an offscreen document for the long-lived connection.
 //
-// V0 暴露的 raw primitive (LLM 在 server 端 reason 完调):
+// Raw browser primitives exposed to the companion:
 //   tab_metadata / dom_query / dom_inject / dom_set / dom_click / tab_navigate
 //   page_snapshot / page_click_ref
 // 后续按需加, 但每加一个都重新审视: LLM compose 现有 primitive 真做不到这事吗?
@@ -81,6 +81,11 @@ let lastActivePageContext: {
   url: string;
   title: string;
 } | null = null;
+let lastSidePanelOpenTarget: {
+  tab_id?: number;
+  window_id?: number;
+  ts: number;
+} | null = null;
 
 function isPageUrl(url?: string): boolean {
   if (!url) return false;
@@ -135,6 +140,74 @@ async function findActivePageTab(windowId?: number): Promise<chrome.tabs.Tab | n
     }
   }
   return null;
+}
+
+function intMessageField(source: Record<string, unknown>, ...names: string[]): number | undefined {
+  for (const name of names) {
+    const value = source[name];
+    if (typeof value === "number" && Number.isInteger(value)) return value;
+    if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
+  }
+  return undefined;
+}
+
+function sidePanelTargetFromMessage(
+  msg: unknown,
+  sender: chrome.runtime.MessageSender,
+): { tabId?: number; windowId?: number } {
+  const record = msg && typeof msg === "object" ? msg as Record<string, unknown> : {};
+  let tabId = intMessageField(record, "tab_id", "tabId");
+  let windowId = intMessageField(record, "window_id", "windowId");
+
+  if (sender.tab?.id !== undefined && tabId === undefined) tabId = sender.tab.id;
+  if (sender.tab?.windowId !== undefined && windowId === undefined) windowId = sender.tab.windowId;
+  rememberActivePage(sender.tab);
+
+  if (tabId !== undefined && tabId <= 0) tabId = undefined;
+  if (windowId !== undefined && windowId < 0) windowId = undefined;
+  return { tabId, windowId };
+}
+
+function rememberSidePanelOpenTarget(target: { tabId?: number; windowId?: number }) {
+  if (target.tabId === undefined && target.windowId === undefined) return;
+  lastSidePanelOpenTarget = {
+    tab_id: target.tabId,
+    window_id: target.windowId,
+    ts: Date.now(),
+  };
+}
+
+async function recentSidePanelOpenTab(): Promise<chrome.tabs.Tab | null> {
+  const target = lastSidePanelOpenTarget;
+  if (!target || Date.now() - target.ts > 10_000) return null;
+  if (target.tab_id !== undefined) {
+    try {
+      const tab = await chrome.tabs.get(target.tab_id);
+      if (tab?.id && isPageUrl(tab.url)) {
+        rememberActivePage(tab);
+        return tab;
+      }
+    } catch {
+      lastSidePanelOpenTarget = null;
+      return null;
+    }
+  }
+  if (target.window_id !== undefined) {
+    return await findActivePageTab(target.window_id);
+  }
+  return null;
+}
+
+async function openSidePanelForTarget(target: { tabId?: number; windowId?: number }) {
+  const { tabId, windowId } = target;
+  rememberSidePanelOpenTarget(target);
+  if (windowId !== undefined) {
+    await chrome.sidePanel.open({ windowId });
+    return;
+  }
+  if (tabId !== undefined) {
+    await chrome.sidePanel.open({ tabId });
+  }
 }
 
 async function ensureOffscreen() {
@@ -225,7 +298,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (m.type === "babata.active_page_context") {
     void (async () => {
       try {
-        const tab = await findActivePageTab();
+        const tab = await recentSidePanelOpenTab() ?? await findActivePageTab();
         sendResponse?.({
           ok: !!tab?.id,
           tab_id: tab?.id,
@@ -333,7 +406,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (m.type === "babata.attention") {
     void (async () => {
       try {
-        await fetch("http://127.0.0.1:18791/attention", {
+        await serverFetch("/attention", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(m),
@@ -346,12 +419,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // page-side 翻译 trace instrumentation (V "开发要收集数据方便调试") →
+  // page-side translation trace instrumentation →
   // server /translate_trace 写 events.jsonl client_trace kind. fire-and-forget.
   if (m.type === "babata.translate_trace") {
     void (async () => {
       try {
-        await fetch("http://127.0.0.1:18791/translate_trace", {
+        await serverFetch("/translate_trace", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
@@ -371,7 +444,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (m.type === "babata.translate") {
     void (async () => {
       try {
-        const resp = await fetch("http://127.0.0.1:18791/translate", {
+        const resp = await serverFetch("/translate", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
@@ -397,14 +470,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // 浮按钮点击 — 打开 sidebar 在 V 当前 window.
+  // Widget click: open sidebar in the current window.
   if (m.type === "babata.toggle_sidebar") {
     void (async () => {
       try {
-        const winId = sender.tab?.windowId;
-        if (winId !== undefined) {
-          await chrome.sidePanel.open({ windowId: winId });
-        }
+        await openSidePanelForTarget(sidePanelTargetFromMessage(msg, sender));
       } catch {
         /* 静默 */
       }
@@ -1321,7 +1391,7 @@ async function requestProactive(tabId: number, intent: ProactiveIntent): Promise
     return false;
   }
 
-  // 读 V 当前翻译档位 (chrome.storage.local 由 content widget 设置).
+  // Read the current translation mode from chrome.storage.local.
   let translationMode: "off" | "bilingual" | "replace" = "replace";
   try {
     const got = await chrome.storage.local.get([
@@ -1340,7 +1410,7 @@ async function requestProactive(tabId: number, intent: ProactiveIntent): Promise
   }
 
   try {
-    await fetch("http://127.0.0.1:18791/proactive", {
+    await serverFetch("/proactive", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -1395,7 +1465,7 @@ async function requestCleanRead(tabId: number): Promise<boolean> {
     if (!article.text.trim() || article.char_count < 200) {
       throw new Error("没抽到足够正文");
     }
-    const resp = await fetch("http://127.0.0.1:18791/clean_read", {
+    const resp = await serverFetch("/clean_read", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -1432,7 +1502,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.commands.onCommand.addListener(async (command, tab) => {
   if (command === "open-sidebar" && tab?.windowId !== undefined) {
     try {
-      await chrome.sidePanel.open({ windowId: tab.windowId });
+      await openSidePanelForTarget({ tabId: tab.id, windowId: tab.windowId });
     } catch {
       /* 静默 */
     }
