@@ -87,12 +87,17 @@ try {
   const saved = await save.json();
   assert(save.ok && saved.ok === true, "settings save failed", saved);
   assert(saved.translation_provider.api_key_set === true, "settings did not persist key flag", saved);
+  assert(saved.translation_provider.api_key === fakeProviderKey, "settings save did not return saved key", saved);
   assert(saved.translation_provider.model === "test-model", "settings did not persist model", saved);
 
   const read = await request("/settings");
   const got = await read.json();
   assert(got.translation_provider.api_key_set === true, "settings read lost key flag", got);
-  assert(!JSON.stringify(got).includes(fakeProviderKey), "public settings leaked API key", got);
+  assert(got.translation_provider.api_key === fakeProviderKey, "settings read did not return saved key", got);
+
+  const healthAfterSave = await request("/health");
+  const gotHealth = await healthAfterSave.json();
+  assert(!JSON.stringify(gotHealth).includes(fakeProviderKey), "health leaked API key", gotHealth);
 
   const chat = await request("/chat", {
     method: "POST",

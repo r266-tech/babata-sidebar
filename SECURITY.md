@@ -28,8 +28,9 @@ Translation provider keys are stored in the companion config file:
 ```
 
 The extension options page sends keys to the local companion over loopback. The
-extension stores the companion URL in `chrome.storage.local`, but it does not
-store provider API keys.
+options page can read the saved key back from `/settings` so users can review
+or edit their configuration. The extension stores the companion URL in
+`chrome.storage.local`, but it does not store provider API keys.
 
 ## Browser Permissions
 

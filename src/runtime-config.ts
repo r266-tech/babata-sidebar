@@ -4,6 +4,7 @@ export const STORAGE_SERVER_ORIGIN = "babata.server_origin";
 export type TranslationProviderSettings = {
   base_url: string;
   model: string;
+  api_key?: string;
   api_key_set?: boolean;
 };
 

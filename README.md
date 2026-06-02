@@ -17,7 +17,8 @@ users can find it faster.
 - Dynamic local companion URL in the extension options page.
 - Dynamic translation provider settings: fetch model list, select a model, type
   a custom model, test, and save.
-- API keys stay in the local companion config file, not in extension storage.
+- API keys stay in the local companion config file, not in extension storage;
+  the options page reads them back so users can review or edit saved settings.
 - Companion listens on loopback by default: `http://127.0.0.1:18791`.
 
 ## Requirements

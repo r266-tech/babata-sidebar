@@ -30,9 +30,11 @@ function textField(obj: unknown, key: string): string {
 
 function normalizeProvider(value: unknown): TranslationProviderSettings {
   if (!value || typeof value !== "object") return DEFAULT_PROVIDER;
+  const apiKey = textField(value, "api_key");
   return {
     base_url: textField(value, "base_url") || DEFAULT_PROVIDER.base_url,
     model: textField(value, "model"),
+    ...(apiKey ? { api_key: apiKey } : {}),
     api_key_set: (value as Record<string, unknown>).api_key_set === true,
   };
 }
@@ -66,6 +68,7 @@ function App() {
     if (!resp.ok || data.ok !== true) throw new Error(textField(data, "error") || `HTTP ${resp.status}`);
     const nextProvider = normalizeProvider(data.translation_provider);
     setProvider(nextProvider);
+    setApiKey(nextProvider.api_key || "");
     setModelInput(nextProvider.model);
     setProviderStatus(nextProvider.api_key_set ? "已保存 API key" : "未配置 API key");
   }
@@ -110,7 +113,7 @@ function App() {
     const model = modelInput.trim();
     return {
       base_url: provider.base_url.trim(),
-      ...(includeKey && apiKey.trim() ? { api_key: apiKey.trim() } : {}),
+      ...(includeKey ? { api_key: apiKey.trim() } : {}),
       ...(model ? { model } : {}),
     };
   }
@@ -182,7 +185,7 @@ function App() {
       const nextProvider = normalizeProvider(data.translation_provider);
       setProvider(nextProvider);
       setModelInput(nextProvider.model);
-      setApiKey("");
+      setApiKey(nextProvider.api_key || apiKey);
       setProviderStatus(`已保存并测试通过: ${translated || "ok"}`);
     } catch (e) {
       setProviderStatus((e as Error).message || String(e));
@@ -244,7 +247,7 @@ function App() {
             type="password"
             value={apiKey}
             onInput={(e) => setApiKey((e.currentTarget as HTMLInputElement).value)}
-            placeholder={provider.api_key_set ? "Saved. Enter a new key to replace." : "sk-..."}
+            placeholder="sk-..."
           />
         </label>
         <label>

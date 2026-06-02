@@ -81,6 +81,18 @@ function publicConfig(config) {
   };
 }
 
+function settingsConfig(config) {
+  const normalized = normalizeConfig(config);
+  const visible = publicConfig(normalized);
+  return {
+    ...visible,
+    translation_provider: {
+      ...visible.translation_provider,
+      api_key: normalized.translation_provider.api_key,
+    },
+  };
+}
+
 function text(value) {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -564,7 +576,7 @@ async function route(req, res) {
     return;
   }
   if (req.method === "GET" && url.pathname === "/settings") {
-    json(res, 200, { ok: true, ...publicConfig(config) });
+    json(res, 200, { ok: true, ...settingsConfig(config) });
     return;
   }
   if (req.method === "POST" && url.pathname === "/settings") {
@@ -581,7 +593,7 @@ async function route(req, res) {
       };
     }
     await writeConfig(next);
-    json(res, 200, { ok: true, ...publicConfig(next) });
+    json(res, 200, { ok: true, ...settingsConfig(next) });
     return;
   }
   if (req.method === "POST" && url.pathname === "/cpu") {
