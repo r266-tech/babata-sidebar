@@ -1249,6 +1249,10 @@ function App() {
     void navigator.clipboard.writeText(text).catch(() => {});
   }
 
+  function openSettings() {
+    void chrome.runtime.openOptionsPage().catch(() => {});
+  }
+
   const headerLine = (() => {
     if (!pageMeta) return "";
     try {
@@ -1313,6 +1317,25 @@ function App() {
             );
           })}
         </div>
+        <button
+          class="btn-icon w-6 h-6 rounded-md flex items-center justify-center shrink-0"
+          title="设置"
+          onClick={openSettings}
+        >
+          <svg width="14" height="14" viewBox="0 0 15 15" fill="none" aria-hidden="true">
+            <path
+              d="M7.5 5.1a2.4 2.4 0 1 1 0 4.8a2.4 2.4 0 0 1 0-4.8Z"
+              stroke="currentColor"
+              stroke-width="1.2"
+            />
+            <path
+              d="M7.5 1.8v1.5M7.5 11.7v1.5M2.6 4.2l1.3.75M11.1 10.05l1.3.75M2.6 10.8l1.3-.75M11.1 4.95l1.3-.75"
+              stroke="currentColor"
+              stroke-width="1.2"
+              stroke-linecap="round"
+            />
+          </svg>
+        </button>
         <button
           class="btn-icon w-6 h-6 rounded-md flex items-center justify-center shrink-0"
           title="新对话"

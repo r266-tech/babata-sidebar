@@ -7,7 +7,12 @@ import {
   effectiveTranslationModeForUrl,
   normalizeTranslationRenderMode,
 } from "./translation-settings";
-import { serverFetch } from "./runtime-config";
+import {
+  STORAGE_SERVER_ORIGIN,
+  getServerOrigin,
+  normalizeServerOrigin,
+  serverFetch,
+} from "./runtime-config";
 
 // SW = 极薄 dispatcher.
 //
@@ -278,6 +283,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
 
+  if (m.type === "babata.server_origin.get") {
+    void (async () => {
+      try {
+        sendResponse?.({ ok: true, origin: await getServerOrigin() });
+      } catch (e) {
+        sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
+      }
+    })();
+    return true;
+  }
+
   if (m.type === "babata.ws.inbound" && typeof m.payload === "string") {
     handleWsInbound(m.payload).then(() => sendResponse?.({ ok: true }));
     return true;
@@ -524,6 +540,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   return false;
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local" || !changes[STORAGE_SERVER_ORIGIN]) return;
+  const origin = normalizeServerOrigin(changes[STORAGE_SERVER_ORIGIN].newValue);
+  chrome.runtime
+    .sendMessage({ type: "babata.server_origin.changed", origin })
+    .catch(() => {});
 });
 
 async function handleWsInbound(raw: string) {

@@ -2,8 +2,7 @@
 
 import {
   DEFAULT_SERVER_ORIGIN,
-  STORAGE_SERVER_ORIGIN,
-  getServerOrigin,
+  normalizeServerOrigin,
   serverUrlFromOrigin,
   wsUrlFromOrigin,
 } from "./runtime-config";
@@ -674,12 +673,23 @@ function scheduleReconnect() {
   }, delay);
 }
 
+async function readServerOriginFromSw(): Promise<string> {
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: "babata.server_origin.get" }) as
+      | { ok?: boolean; origin?: string }
+      | undefined;
+    return normalizeServerOrigin(resp?.origin);
+  } catch {
+    return DEFAULT_SERVER_ORIGIN;
+  }
+}
+
 function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
   void (async () => {
-    activeServerOrigin = await getServerOrigin();
+    activeServerOrigin = await readServerOriginFromSw();
     const socket = new WebSocket(wsUrlFromOrigin(activeServerOrigin));
     ws = socket;
     attachWsHandlers(socket);
@@ -721,9 +731,8 @@ function attachWsHandlers(socket: WebSocket) {
   });
 }
 
-chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== "local" || !changes[STORAGE_SERVER_ORIGIN]) return;
-  activeServerOrigin = DEFAULT_SERVER_ORIGIN;
+function reconnectToServerOrigin(origin: string) {
+  activeServerOrigin = normalizeServerOrigin(origin);
   reconnectAttempt = 0;
   if (reconnectTimer !== null) {
     window.clearTimeout(reconnectTimer);
@@ -737,13 +746,18 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     /* already closed */
   }
   connect();
-});
+}
 
 // SW 想发消息出去, 通过 chrome.runtime.sendMessage with type babata.ws.outbound
 // 转给我 — 我 ws.send. SW 没 ws 引用, 必须经我.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg || typeof msg !== "object") return;
-  const m = msg as { type?: string; payload?: string };
+  const m = msg as { type?: string; payload?: string; origin?: string };
+  if (m.type === "babata.server_origin.changed") {
+    reconnectToServerOrigin(m.origin ?? DEFAULT_SERVER_ORIGIN);
+    sendResponse?.({ ok: true });
+    return false;
+  }
   if (m.type === "babata.ws.outbound" && typeof m.payload === "string") {
     if (ws && ws.readyState === WebSocket.OPEN) {
       try {
