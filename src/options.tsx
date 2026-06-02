@@ -51,6 +51,7 @@ function App() {
   const [serverStatus, setServerStatus] = useState("未检测");
   const [provider, setProvider] = useState<TranslationProviderSettings>(DEFAULT_PROVIDER);
   const [apiKey, setApiKey] = useState("");
+  const [showApiKey, setShowApiKey] = useState(false);
   const [models, setModels] = useState<TranslationModelOption[]>([]);
   const [modelInput, setModelInput] = useState("");
   const [providerStatus, setProviderStatus] = useState("未检测");
@@ -243,12 +244,21 @@ function App() {
         </label>
         <label>
           <span>API key</span>
-          <input
-            type="password"
-            value={apiKey}
-            onInput={(e) => setApiKey((e.currentTarget as HTMLInputElement).value)}
-            placeholder="sk-..."
-          />
+          <div class="secret-row">
+            <input
+              type={showApiKey ? "text" : "password"}
+              value={apiKey}
+              onInput={(e) => setApiKey((e.currentTarget as HTMLInputElement).value)}
+              placeholder="sk-..."
+            />
+            <button
+              aria-label={showApiKey ? "Hide API key" : "Show API key"}
+              onClick={() => setShowApiKey(!showApiKey)}
+              disabled={!apiKey}
+            >
+              {showApiKey ? "Hide" : "Show"}
+            </button>
+          </div>
         </label>
         <label>
           <span>Model</span>
@@ -325,6 +335,9 @@ style.textContent = `
     background: #fff;
   }
   input:focus { outline: 2px solid rgba(198,106,74,.28); border-color: #c66a4a; }
+  .secret-row { display: flex; gap: 8px; }
+  .secret-row input { flex: 1; min-width: 0; }
+  .secret-row button { width: 76px; height: 36px; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
   button {
     height: 34px;
