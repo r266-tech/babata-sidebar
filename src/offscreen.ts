@@ -81,9 +81,10 @@ type Msg = {
 };
 
 type LightContext = {
-  url: string;
-  title: string;
+  url?: string;
+  title?: string;
   url_changed: boolean;
+  same_page?: boolean;
   tab_id?: number;
   window_id?: number;
   selection?: string;

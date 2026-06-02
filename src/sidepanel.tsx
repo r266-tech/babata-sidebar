@@ -58,9 +58,10 @@ type Msg = {
 };
 
 type LightContext = {
-  url: string;
-  title: string;
+  url?: string;
+  title?: string;
   url_changed: boolean;
+  same_page?: boolean;
   tab_id?: number;
   window_id?: number;
   selection?: string;
@@ -721,6 +722,32 @@ async function captureLightContext(
   }
 }
 
+function contextNeedsFullPage(meta: LightContext | null, lastUrl: string, lastTitle: string): boolean {
+  if (!meta?.url) return false;
+  if (!lastUrl) return true;
+  if (meta.url !== lastUrl) return true;
+  return (meta.title ?? "") !== lastTitle;
+}
+
+function contextForTurn(
+  meta: LightContext | null,
+  selection: string,
+  lastUrl: string,
+  lastTitle: string,
+): LightContext | undefined {
+  if (!meta) return undefined;
+  const selected = selection.trim();
+  const base = contextNeedsFullPage(meta, lastUrl, lastTitle)
+    ? meta
+    : {
+        same_page: true,
+        url_changed: false,
+        tab_id: meta.tab_id,
+        window_id: meta.window_id,
+      };
+  return selected ? { ...base, selection: selected } : base;
+}
+
 async function captureCurrentSelection(target?: PinnedTarget | null): Promise<string> {
   try {
     const tab = await tabForTarget(target);
@@ -755,6 +782,7 @@ function App() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lastSentUrl = useRef<string>("");
+  const lastSentTitle = useRef<string>("");
   const pinnedTarget = useRef<PinnedTarget | null>(pinnedTargetFromLocation());
   const msgsRef = useRef<Msg[]>([]);
   const streamingRef = useRef(false);
@@ -1209,6 +1237,8 @@ function App() {
     setSuggestions([]);
     setInput("");
     setStreaming(false);
+    lastSentUrl.current = "";
+    lastSentTitle.current = "";
     setAttachments((prev) => {
       prev.forEach((a) => {
         if (a.preview_url) URL.revokeObjectURL(a.preview_url);
@@ -1264,9 +1294,16 @@ function App() {
     const userMsg: Msg = { role: "user", text, attachments: sentAttachments };
     const assistantMsg: Msg = { role: "assistant", text: "" };
     const nextMsgs = [...msgsRef.current, userMsg, assistantMsg];
-    const pageContext =
-      pageMeta && selection ? { ...pageMeta, selection } : pageMeta ?? undefined;
-    if (pageContext?.url) lastSentUrl.current = pageContext.url;
+    const pageContext = contextForTurn(
+      pageMeta,
+      selection,
+      lastSentUrl.current,
+      lastSentTitle.current,
+    );
+    if (pageMeta?.url) {
+      lastSentUrl.current = pageMeta.url;
+      lastSentTitle.current = pageMeta.title ?? "";
+    }
     const wireAttachments = sentAttachments.map((a) => ({
       kind: a.kind,
       name: a.name,
@@ -1332,7 +1369,7 @@ function App() {
   const headerLine = (() => {
     if (!pageMeta) return "";
     try {
-      const host = new URL(pageMeta.url).host;
+      const host = new URL(pageMeta.url ?? "").host;
       return host.replace(/^www\./, "");
     } catch {
       return pageMeta.url || pageMeta.title || "";
