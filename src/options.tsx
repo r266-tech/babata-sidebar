@@ -146,14 +146,8 @@ function App() {
     setBusy("test");
     setProviderStatus("测试翻译中...");
     try {
-      const resp = await serverRequest("/translate/test", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(providerPayload(true)),
-      });
-      const data = await readJson(resp);
-      if (!resp.ok || data.ok !== true) throw new Error(textField(data, "error") || `HTTP ${resp.status}`);
-      setProviderStatus(`测试通过: ${textField(data, "translated") || "ok"}`);
+      const translated = await runProviderTest();
+      setProviderStatus(`测试通过: ${translated || "ok"}`);
     } catch (e) {
       setProviderStatus((e as Error).message || String(e));
     } finally {
@@ -161,10 +155,23 @@ function App() {
     }
   }
 
+  async function runProviderTest(): Promise<string> {
+    const resp = await serverRequest("/translate/test", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(providerPayload(true)),
+    });
+    const data = await readJson(resp);
+    if (!resp.ok || data.ok !== true) throw new Error(textField(data, "error") || `HTTP ${resp.status}`);
+    return textField(data, "translated");
+  }
+
   async function saveProvider() {
     setBusy("save");
-    setProviderStatus("保存中...");
+    setProviderStatus("保存前测试中...");
     try {
+      const translated = await runProviderTest();
+      setProviderStatus("保存中...");
       const resp = await serverRequest("/settings", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -176,7 +183,7 @@ function App() {
       setProvider(nextProvider);
       setModelInput(nextProvider.model);
       setApiKey("");
-      setProviderStatus("已保存");
+      setProviderStatus(`已保存并测试通过: ${translated || "ok"}`);
     } catch (e) {
       setProviderStatus((e as Error).message || String(e));
     } finally {
@@ -219,7 +226,7 @@ function App() {
       <section>
         <div class="section-head">
           <h2>Translation Provider</h2>
-          <span class={providerStatus.startsWith("测试通过") || providerStatus === "已保存" ? "ok" : "warn"}>
+          <span class={providerStatus.startsWith("测试通过") || providerStatus.startsWith("已保存并测试通过") ? "ok" : "warn"}>
             {providerStatus}
           </span>
         </div>
