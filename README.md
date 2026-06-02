@@ -33,11 +33,23 @@ users can find it faster.
 
 ## Quick Start
 
+If you use Codex or Claude Code, you can hand the repository URL to your agent
+and ask it to run the local setup:
+
+```text
+Clone https://github.com/r266-tech/babata-sidebar, run `npm run setup:local`,
+start `npm run companion`, then help me load the built `dist/` extension in my
+Chromium browser. Do not ask for my provider API key in chat; I will enter it in
+the extension options page.
+```
+
+The setup script installs dependencies, typechecks, builds the unpacked
+extension, and smoke-tests the local companion.
+
 ```bash
 git clone https://github.com/r266-tech/babata-sidebar.git
 cd babata-sidebar
-npm install
-npm run build
+npm run setup:local
 npm run companion
 ```
 

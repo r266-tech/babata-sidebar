@@ -19,6 +19,7 @@
     }
   },
   "scripts": {
+    "setup:local": "node scripts/setup-local.mjs",
     "companion": "node companion/server.mjs",
     "dev": "vite",
     "build": "vite build",
