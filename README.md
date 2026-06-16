@@ -14,6 +14,14 @@ extension with a loopback companion server so users can bring their own:
 ## Features
 
 - Browser side panel chat backed by local Codex or Claude Code.
+- Multi-turn sidebar context: the companion sends a bounded recent chat window,
+  current page metadata, selected text, and metadata-only attachments to the
+  local model.
+- Read-only browser tool bridge: the extension forwards page/browser primitives
+  and shows traces; the local Codex/Claude-side runtime decides when and how
+  often to use them.
+- Optional prompt debug mode that shows the exact assembled chat prompt before
+  each local model invocation.
 - Inline page translation and selection translation.
 - Dynamic local companion URL in the extension options page.
 - Dynamic translation provider settings: fetch model list, select a model, type
@@ -92,9 +100,23 @@ Useful environment variables:
 | `OPENROUTER_API_KEY` | empty | Optional default provider key. |
 | `OPENAI_API_KEY` | empty | Optional default provider key. |
 | `BABATA_TRANSLATION_MODEL` | empty | Optional default translation model. |
+| `BABATA_CHAT_TOOL_ACTIONS` | read-only page/browser tools | Comma-separated browser actions the chat model may request. |
+| `BABATA_CHAT_TOOL_LOOP_MAX` | `4` | Node companion runaway guard for browser-tool round trips; loop policy belongs to the local model runtime. |
+| `BABATA_CHAT_DEBUG_PROMPT` | empty | Set to `1` or `true` to emit assembled chat prompts for every turn. |
 
 The extension options page can change the companion URL and translation
 provider without rebuilding the extension.
+
+The side panel also has a prompt debug toggle. When enabled, each assistant turn
+stores collapsible `LLM prompt` blocks containing the prompt assembled
+immediately before the local model call. Debug prompts may include recent chat
+context, page metadata, selected text, and browser tool results.
+
+The default browser bridge exposes read-only actions: `tab_metadata`,
+`page_snapshot`, `article_extract`, `dom_query`, `tabs_query`,
+`history_search`, `bookmarks_search`, and `bookmarks_tree`. Write actions should
+only be enabled when you trust the local model runtime and understand the
+browser-permission impact.
 
 ## Translation Provider API
 

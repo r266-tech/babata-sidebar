@@ -283,6 +283,84 @@ html, body, #app {
   background: rgba(0, 0, 0, 0.035);
 }
 
+.bbt-debug-toggle-active {
+  color: var(--bbt-accent-fg);
+  background: var(--bbt-accent);
+}
+
+.bbt-debug-toggle-active:hover {
+  color: var(--bbt-accent-fg);
+  background: #b85d40;
+}
+
+.bbt-debug-prompts {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  width: min(100%, 680px);
+  margin-bottom: 0.55rem;
+}
+
+.bbt-debug-prompt {
+  width: 100%;
+  border: 1px solid #d8d2c5;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.64);
+  overflow: hidden;
+}
+
+.bbt-debug-prompt summary {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-height: 1.85rem;
+  padding: 0.25rem 0.55rem;
+  color: #4b4740;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  list-style: none;
+}
+
+.bbt-debug-prompt summary::-webkit-details-marker {
+  display: none;
+}
+
+.bbt-debug-prompt summary::before {
+  content: ">";
+  color: var(--bbt-subtle);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  transition: transform .12s;
+}
+
+.bbt-debug-prompt[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.bbt-debug-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--bbt-subtle);
+  font-weight: 400;
+}
+
+.bbt-debug-prompt pre {
+  margin: 0;
+  max-height: 360px;
+  padding: 0.65rem 0.75rem;
+  overflow: auto;
+  border-top: 1px solid var(--bbt-border);
+  background: rgba(0, 0, 0, 0.028);
+  color: #242321;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
 /* Scrollbar — 跟 Anthropic 一样几乎隐形. */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 3px; }

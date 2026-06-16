@@ -36,12 +36,25 @@ type ToolTrace = {
   duration_ms?: number;
 };
 
+type DebugPromptTrace = {
+  id: string;
+  sequence: number;
+  cpu?: string;
+  allow_tools?: boolean;
+  tool_results_count?: number;
+  chars: number;
+  prompt: string;
+  truncated?: boolean;
+  created_at: number;
+};
+
 type MessagePart =
   | { type: "text"; id: string; text: string }
   | {
       type: "page_read";
       id: string;
       name: string;
+      input?: unknown;
       status: ToolTraceStatus;
       is_error?: boolean;
       duration_ms?: number;
@@ -53,6 +66,7 @@ type Msg = {
   parts?: MessagePart[];
   attachments?: Attachment[];
   tools?: ToolTrace[];
+  debug_prompts?: DebugPromptTrace[];
   clean_read_id?: string;
   pending?: boolean;
 };
@@ -80,6 +94,7 @@ type CpuStatus = {
   label: string;
   choices: CpuChoice[];
   message?: string;
+  busy?: boolean;
 };
 type Suggestion = { id: string; text: string };
 type PinnedTarget = { tab_id?: number; window_id?: number };
@@ -92,6 +107,9 @@ const CHAT_TEXT_MAX_CHARS = 120_000;
 const CHAT_TOOL_TEXT_MAX_CHARS = 12_000;
 const CHAT_IMAGE_THUMB_MAX_EDGE = 360;
 const CHAT_IMAGE_THUMB_MAX_CHARS = 180_000;
+const CHAT_DEBUG_PROMPT_MAX_CHARS = 240_000;
+const CHAT_DEBUG_PROMPT_MAX_ITEMS = 8;
+const STORAGE_DEBUG_PROMPT_ENABLED = "babata.chat.debug_prompt.enabled.v1";
 
 type SavedChatHistory = {
   version: 1;
@@ -114,6 +132,8 @@ type SavedChatScrollState = {
 marked.setOptions({ breaks: true, gfm: true });
 
 const PAGE_READ_TOOLS = new Set(["tab_metadata", "page_snapshot", "dom_query", "article_extract"]);
+const SAFE_MARKDOWN_LINK_PROTOCOLS = new Set(["http:", "https:", "mailto:", "tel:"]);
+const BARE_DOMAIN_RE = /^[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?(?:[/?#].*)?$/i;
 
 function objectField(value: unknown, key: string): unknown {
   if (!value || typeof value !== "object") return undefined;
@@ -123,6 +143,13 @@ function objectField(value: unknown, key: string): unknown {
 function textField(value: unknown, key: string): string {
   const found = objectField(value, key);
   return typeof found === "string" ? found : "";
+}
+
+function nestedObjectField(value: unknown, key: string): Record<string, unknown> | undefined {
+  const found = objectField(value, key);
+  return found && typeof found === "object" && !Array.isArray(found)
+    ? found as Record<string, unknown>
+    : undefined;
 }
 
 function effectiveToolName(name: string, input?: unknown): string {
@@ -163,6 +190,7 @@ function normalizeCpuStatus(raw: unknown): CpuStatus | null {
     ok: true,
     cpu: obj.cpu,
     label: typeof obj.label === "string" ? obj.label : String(obj.cpu),
+    busy: obj.busy === true,
     choices: choices.length > 0 ? choices : [
       { name: "codex", label: "Codex", current: obj.cpu === "codex", available: true },
       { name: "claude", label: "Claude Code", current: obj.cpu === "claude", available: true },
@@ -178,7 +206,61 @@ function cpuShortLabel(choice: CpuChoice): string {
 function renderMarkdown(text: string): string {
   if (!text) return "";
   const html = marked.parse(text, { async: false }) as string;
-  return DOMPurify.sanitize(html, { ADD_ATTR: ["target", "rel"] });
+  const clean = DOMPurify.sanitize(html, { ADD_ATTR: ["target", "rel"] });
+  const template = document.createElement("template");
+  template.innerHTML = clean;
+  for (const anchor of Array.from(template.content.querySelectorAll("a[href]"))) {
+    const url = externalMarkdownUrl(anchor.getAttribute("href"));
+    if (!url) {
+      anchor.removeAttribute("href");
+      anchor.removeAttribute("target");
+      anchor.removeAttribute("rel");
+      continue;
+    }
+    anchor.setAttribute("href", url);
+    anchor.setAttribute("target", "_blank");
+    anchor.setAttribute("rel", "noopener noreferrer");
+  }
+  return template.innerHTML;
+}
+
+function externalMarkdownUrl(rawHref: string | null): string | null {
+  const raw = rawHref?.trim() ?? "";
+  if (!raw || raw.startsWith("#")) return null;
+
+  try {
+    const url = raw.startsWith("//") ? new URL(`https:${raw}`) : new URL(raw);
+    return SAFE_MARKDOWN_LINK_PROTOCOLS.has(url.protocol) ? url.href : null;
+  } catch {
+    // Continue to bare-domain normalization below.
+  }
+
+  if (!BARE_DOMAIN_RE.test(raw)) return null;
+  try {
+    return new URL(`https://${raw}`).href;
+  } catch {
+    return null;
+  }
+}
+
+async function openExternalMarkdownUrl(url: string) {
+  try {
+    await chrome.tabs.create({ url, active: true });
+  } catch {
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+}
+
+function onMarkdownClick(event: MouseEvent) {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const anchor = target.closest("a[href]");
+  if (!(anchor instanceof HTMLAnchorElement)) return;
+  const url = externalMarkdownUrl(anchor.getAttribute("href") || anchor.href);
+  if (!url) return;
+  event.preventDefault();
+  event.stopPropagation();
+  void openExternalMarkdownUrl(url);
 }
 
 function MarkdownView(props: { text: string; placeholder?: string }) {
@@ -194,7 +276,7 @@ function MarkdownView(props: { text: string; placeholder?: string }) {
       el.textContent = "";
     }
   }, [props.text, props.placeholder]);
-  return <div ref={ref} class="bbt-md" />;
+  return <div ref={ref} class="bbt-md" onClick={onMarkdownClick} />;
 }
 
 function toolStatus(t: ToolTrace): ToolTraceStatus {
@@ -207,6 +289,17 @@ function pinnedTargetFromLocation(): PinnedTarget | null {
   const params = new URLSearchParams(window.location.search);
   const tab = Number(params.get("tab_id") ?? "");
   const win = Number(params.get("window_id") ?? "");
+  const target: PinnedTarget = {};
+  if (Number.isInteger(tab) && tab > 0) target.tab_id = tab;
+  if (Number.isInteger(win) && win >= 0) target.window_id = win;
+  return target.tab_id !== undefined || target.window_id !== undefined ? target : null;
+}
+
+function pinnedTargetFromUnknown(raw: unknown): PinnedTarget | null {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw as Record<string, unknown>;
+  const tab = Number(record.tab_id ?? record.tabId ?? "");
+  const win = Number(record.window_id ?? record.windowId ?? "");
   const target: PinnedTarget = {};
   if (Number.isInteger(tab) && tab > 0) target.tab_id = tab;
   if (Number.isInteger(win) && win >= 0) target.window_id = win;
@@ -292,6 +385,7 @@ function normalizeMessagePart(raw: unknown, index: number): MessagePart | null {
       type: "page_read",
       id,
       name: typeof item.name === "string" ? item.name : "page_read",
+      input: storageSafeUnknown(item.input, CHAT_TOOL_TEXT_MAX_CHARS),
       status,
       is_error: item.is_error === true,
       duration_ms: typeof item.duration_ms === "number" ? item.duration_ms : undefined,
@@ -328,6 +422,44 @@ function sanitizeToolsForStorage(raw: unknown): ToolTrace[] {
   }));
 }
 
+function normalizeDebugPromptTrace(raw: unknown, index: number): DebugPromptTrace | null {
+  if (!raw || typeof raw !== "object") return null;
+  const item = raw as Record<string, unknown>;
+  const prompt = truncateText(item.prompt, CHAT_DEBUG_PROMPT_MAX_CHARS);
+  if (!prompt) return null;
+  const chars = typeof item.chars === "number" && Number.isFinite(item.chars)
+    ? item.chars
+    : prompt.length;
+  const sequence = typeof item.sequence === "number" && Number.isFinite(item.sequence)
+    ? item.sequence
+    : index + 1;
+  const createdAt = typeof item.created_at === "number" && Number.isFinite(item.created_at)
+    ? item.created_at
+    : Date.now();
+  return {
+    id: typeof item.id === "string" ? item.id : `debug-prompt-${sequence}-${createdAt}`,
+    sequence,
+    cpu: typeof item.cpu === "string" ? item.cpu : undefined,
+    allow_tools: typeof item.allow_tools === "boolean" ? item.allow_tools : undefined,
+    tool_results_count:
+      typeof item.tool_results_count === "number" && Number.isFinite(item.tool_results_count)
+        ? item.tool_results_count
+        : undefined,
+    chars,
+    prompt,
+    truncated: item.truncated === true || chars > prompt.length,
+    created_at: createdAt,
+  };
+}
+
+function sanitizeDebugPromptsForStorage(raw: unknown): DebugPromptTrace[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item, index) => normalizeDebugPromptTrace(item, index))
+    .filter((item): item is DebugPromptTrace => item !== null)
+    .slice(-CHAT_DEBUG_PROMPT_MAX_ITEMS);
+}
+
 function sanitizeMsgsForStorage(messages: Msg[]): Msg[] {
   return messages.slice(-CHAT_HISTORY_MAX_MESSAGES).map((msg) => {
     const out: Msg = {
@@ -342,6 +474,8 @@ function sanitizeMsgsForStorage(messages: Msg[]): Msg[] {
     if (attachments.length > 0) out.attachments = attachments;
     const tools = sanitizeToolsForStorage(msg.tools);
     if (tools.length > 0) out.tools = tools;
+    const debugPrompts = sanitizeDebugPromptsForStorage(msg.debug_prompts);
+    if (debugPrompts.length > 0) out.debug_prompts = debugPrompts;
     if (typeof msg.clean_read_id === "string") out.clean_read_id = msg.clean_read_id;
     if (msg.pending) out.pending = true;
     return out;
@@ -385,6 +519,8 @@ function normalizeStoredMsgs(raw: unknown): Msg[] {
       if (attachments.length > 0) msg.attachments = attachments;
       const tools = sanitizeToolsForStorage(item.tools);
       if (tools.length > 0) msg.tools = tools;
+      const debugPrompts = sanitizeDebugPromptsForStorage(item.debug_prompts);
+      if (debugPrompts.length > 0) msg.debug_prompts = debugPrompts;
       if (typeof item.clean_read_id === "string") msg.clean_read_id = item.clean_read_id;
       if (item.pending === true) msg.pending = true;
       return msg;
@@ -407,11 +543,8 @@ function normalizeSavedChatHistory(raw: unknown): SavedChatHistory | null {
 
 async function readSavedChatHistory(key: string): Promise<SavedChatHistory | null> {
   try {
-    const got = await chrome.storage.local.get([key, CHAT_HISTORY_LATEST_KEY]);
-    const exact = normalizeSavedChatHistory(got[key]);
-    if (exact) return exact;
-    const latest = normalizeSavedChatHistory(got[CHAT_HISTORY_LATEST_KEY]);
-    return latest;
+    const got = await chrome.storage.local.get([key]);
+    return normalizeSavedChatHistory(got[key]);
   } catch {
     return null;
   }
@@ -563,20 +696,56 @@ function normalizeToolTrace(raw: unknown): ToolTrace[] {
     }));
 }
 
-function pageReadText(status: ToolTraceStatus): string {
-  if (status === "running") return "正在读取当前网页";
-  if (status === "error") return "读取网页失败";
-  return "已读取当前网页";
+function baseToolName(name: string, input?: unknown): string {
+  const effective = effectiveToolName(name, input);
+  const parts = effective.split(/[./]/).filter(Boolean);
+  return parts[parts.length - 1] || effective;
+}
+
+function toolArgs(input?: unknown): Record<string, unknown> | undefined {
+  return nestedObjectField(input, "args") ?? nestedObjectField(input, "arguments");
+}
+
+function pageReadLabel(name: string, input?: unknown): string {
+  const tool = baseToolName(name, input);
+  if (tool === "article_extract") return "提取文章";
+  if (tool === "page_snapshot") return "扫描页面";
+  if (tool === "tab_metadata") return "读取标签页";
+  if (tool === "dom_query") {
+    const selector = textField(toolArgs(input), "selector");
+    if (/article\[data-testid=["']tweet["']\]\s+div\[dir=["']auto["']\]/.test(selector)) {
+      return "读取文本节点";
+    }
+    if (/article\[data-testid=["']tweet["']\]/.test(selector)) return "读取主推文";
+    if (selector) return "查询 DOM";
+    return "读取页面文本";
+  }
+  return "读取网页";
+}
+
+function pageReadTitle(name: string, input?: unknown): string {
+  const label = pageReadLabel(name, input);
+  const selector = textField(toolArgs(input), "selector");
+  return selector ? `${label}: ${selector}` : `${label}: ${effectiveToolName(name, input)}`;
+}
+
+function pageReadText(status: ToolTraceStatus, name: string, input?: unknown): string {
+  const label = pageReadLabel(name, input);
+  if (status === "running") return `正在${label}`;
+  if (status === "error") return `${label}失败`;
+  return `已${label}`;
 }
 
 function PageReadInline(props: {
+  name: string;
+  input?: unknown;
   status: ToolTraceStatus;
   duration_ms?: number;
 }) {
   return (
-    <div class={`bbt-page-read bbt-page-read-${props.status}`}>
+    <div class={`bbt-page-read bbt-page-read-${props.status}`} title={pageReadTitle(props.name, props.input)}>
       <span class="bbt-page-read-dot" aria-hidden="true" />
-      <span>{pageReadText(props.status)}</span>
+      <span>{pageReadText(props.status, props.name, props.input)}</span>
       {props.duration_ms !== undefined && props.status !== "running" && (
         <span class="bbt-page-read-time">{props.duration_ms}ms</span>
       )}
@@ -584,7 +753,7 @@ function PageReadInline(props: {
   );
 }
 
-function AssistantParts(props: { parts: MessagePart[]; placeholder?: string }) {
+function AssistantParts(props: { parts: MessagePart[]; tools?: ToolTrace[]; placeholder?: string }) {
   if (props.parts.length === 0) {
     return <MarkdownView text="" placeholder={props.placeholder} />;
   }
@@ -594,9 +763,12 @@ function AssistantParts(props: { parts: MessagePart[]; placeholder?: string }) {
         if (part.type === "text") {
           return <MarkdownView key={part.id} text={part.text} />;
         }
+        const matchingTool = props.tools?.find((tool) => tool.id === part.id);
         return (
           <PageReadInline
             key={part.id}
+            name={part.name}
+            input={part.input ?? matchingTool?.input}
             status={part.status}
             duration_ms={part.duration_ms}
           />
@@ -614,10 +786,42 @@ function PageReadTraceList(props: { tools?: ToolTrace[] }) {
       {tools.map((tool) => (
         <PageReadInline
           key={tool.id}
+          name={tool.name}
+          input={tool.input}
           status={toolStatus(tool)}
           duration_ms={tool.duration_ms}
         />
       ))}
+    </div>
+  );
+}
+
+function DebugPromptList(props: { prompts?: DebugPromptTrace[] }) {
+  const prompts = props.prompts ?? [];
+  if (prompts.length === 0) return null;
+  return (
+    <div class="bbt-debug-prompts">
+      {prompts.map((prompt) => {
+        const parts = [
+          `#${prompt.sequence}`,
+          prompt.cpu,
+          prompt.allow_tools === undefined
+            ? ""
+            : prompt.allow_tools
+              ? "tools on"
+              : "tools off",
+          `${prompt.chars.toLocaleString()} chars`,
+        ].filter(Boolean);
+        return (
+          <details key={prompt.id} class="bbt-debug-prompt">
+            <summary>
+              <span>LLM prompt</span>
+              <span class="bbt-debug-meta">{parts.join(" · ")}</span>
+            </summary>
+            <pre>{prompt.prompt}{prompt.truncated ? `\n\n[truncated: original ${prompt.chars.toLocaleString()} chars]` : ""}</pre>
+          </details>
+        );
+      })}
     </div>
   );
 }
@@ -795,6 +999,7 @@ function App() {
   const scrollWriteTimerRef = useRef<number | null>(null);
   const [historyStorageKey, setHistoryStorageKey] = useState<string | null>(null);
   const [localHistoryLoaded, setLocalHistoryLoaded] = useState(false);
+  const [debugPromptEnabled, setDebugPromptEnabled] = useState(false);
 
   useEffect(() => {
     msgsRef.current = msgs;
@@ -807,6 +1012,28 @@ function App() {
   useEffect(() => {
     historyStorageKeyRef.current = historyStorageKey;
   }, [historyStorageKey]);
+
+  useEffect(() => {
+    let cancelled = false;
+    chrome.storage.local
+      .get([STORAGE_DEBUG_PROMPT_ENABLED])
+      .then((got) => {
+        if (!cancelled) setDebugPromptEnabled(got[STORAGE_DEBUG_PROMPT_ENABLED] === true);
+      })
+      .catch(() => {});
+    const listener = (
+      changes: Record<string, chrome.storage.StorageChange>,
+      areaName: string,
+    ) => {
+      if (areaName !== "local" || !changes[STORAGE_DEBUG_PROMPT_ENABLED]) return;
+      setDebugPromptEnabled(changes[STORAGE_DEBUG_PROMPT_ENABLED].newValue === true);
+    };
+    chrome.storage.onChanged.addListener(listener);
+    return () => {
+      cancelled = true;
+      chrome.storage.onChanged.removeListener(listener);
+    };
+  }, []);
 
   useEffect(() => {
     let port: chrome.runtime.Port | null = null;
@@ -896,7 +1123,10 @@ function App() {
         if (!r.ok) return;
         const data = await r.json();
         const status = normalizeCpuStatus(data);
-        if (!cancelled && status) setCpuStatus(status);
+        if (!cancelled && status) {
+          setCpuStatus(status);
+          if (!status.busy) setCpuError("");
+        }
       })
       .catch(() => {
         if (!cancelled) setServerOk(false);
@@ -905,6 +1135,42 @@ function App() {
       cancelled = true;
     };
   }, [serverOrigin]);
+
+  useEffect(() => {
+    if (!cpuError) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    const poll = () => {
+      timer = null;
+      fetch(serverUrlFromOrigin(serverOrigin, "/health"))
+        .then(async (r) => {
+          if (cancelled) return;
+          setServerOk(r.ok);
+          if (!r.ok) {
+            timer = window.setTimeout(poll, 2500);
+            return;
+          }
+          const data = await r.json();
+          if (cancelled) return;
+          const status = normalizeCpuStatus(data);
+          if (!status) return;
+          setCpuStatus(status);
+          if (!status.busy) {
+            setCpuError("");
+            return;
+          }
+          timer = window.setTimeout(poll, 1500);
+        })
+        .catch(() => {
+          if (!cancelled) timer = window.setTimeout(poll, 2500);
+        });
+    };
+    timer = window.setTimeout(poll, 1200);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [cpuError, serverOrigin]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1033,8 +1299,39 @@ function App() {
   useEffect(() => {
     const listener = (msg: unknown) => {
       const m = msg as
-        | { type?: string; action?: string; args?: Record<string, unknown> }
+        | { type?: string; action?: string; args?: Record<string, unknown>; tab_id?: number; window_id?: number }
         | undefined;
+      if (m?.type === "babata.sidepanel_target") {
+        void (async () => {
+          const target = pinnedTargetFromUnknown(m);
+          if (!target) return;
+          const key = await resolveChatHistoryStorageKey(target);
+          if (key === historyStorageKeyRef.current) return;
+          const [saved, savedScroll] = await Promise.all([
+            readSavedChatHistory(key),
+            readSavedChatScrollState(key),
+          ]);
+          pinnedTarget.current = target;
+          setHistoryStorageKey(key);
+          pendingScrollRestoreRef.current = savedScroll;
+          scrollRestoreDoneRef.current = false;
+          stickToBottomRef.current = savedScroll ? savedScroll.at_bottom : true;
+          if (saved) {
+            lastStorageSignatureRef.current = chatStateSignature(
+              saved.messages,
+              saved.streaming === true,
+            );
+            setMsgs(saved.messages);
+            setStreaming(saved.streaming === true);
+          } else {
+            lastStorageSignatureRef.current = chatStateSignature([], false);
+            setMsgs([]);
+            setStreaming(false);
+          }
+          setLocalHistoryLoaded(true);
+        })();
+        return;
+      }
       if (m?.type !== "babata.notification") return;
       const argText = (key: string) =>
         typeof m.args?.[key] === "string" ? (m.args[key] as string) : "";
@@ -1227,6 +1524,12 @@ function App() {
     schedulePersistScrollState();
   }
 
+  function toggleDebugPrompt() {
+    const next = !debugPromptEnabled;
+    setDebugPromptEnabled(next);
+    void chrome.storage.local.set({ [STORAGE_DEBUG_PROMPT_ENABLED]: next }).catch(() => {});
+  }
+
   function newSession() {
     if (historyStorageKey) {
       void chrome.runtime
@@ -1236,6 +1539,7 @@ function App() {
     setMsgs([]);
     setSuggestions([]);
     setInput("");
+    setCpuError("");
     setStreaming(false);
     lastSentUrl.current = "";
     lastSentTitle.current = "";
@@ -1256,7 +1560,15 @@ function App() {
   }
 
   async function switchCpu(cpu: CpuName) {
-    if (streaming || cpuSwitching || cpu === cpuStatus?.cpu) return;
+    if (cpuSwitching) return;
+    if (streaming || cpuStatus?.busy) {
+      setCpuError("当前还有 sidebar turn 在跑，等结束后再切 CPU");
+      return;
+    }
+    if (cpu === cpuStatus?.cpu) {
+      setCpuError("");
+      return;
+    }
     setCpuSwitching(cpu);
     setCpuError("");
     try {
@@ -1316,6 +1628,7 @@ function App() {
     setAttachments([]);
     setSuggestions([]);
     setMsgs(nextMsgs);
+    setCpuError("");
     setStreaming(true);
 
     try {
@@ -1327,6 +1640,7 @@ function App() {
         messages: sanitizeMsgsForStorage(nextMsgs),
         page_context: pageContext ?? undefined,
         attachments: wireAttachments.length > 0 ? wireAttachments : undefined,
+        debug_prompt: debugPromptEnabled,
       }) as { ok?: boolean; error?: string } | undefined;
       if (!resp?.ok) {
         throw new Error(resp?.error || "chat start failed");
@@ -1359,6 +1673,7 @@ function App() {
         .sendMessage({ type: "babata.chat.abort", storage_key: historyStorageKey })
         .catch(() => {});
     }
+    setCpuError("");
     setStreaming(false);
   }
 
@@ -1379,6 +1694,14 @@ function App() {
     { name: "codex" as const, label: "Codex", current: false, available: true },
     { name: "claude" as const, label: "Claude Code", current: false, available: true },
   ];
+  const cpuBusy = cpuStatus?.busy === true;
+  const cpuSwitchTitle = cpuError || (
+    cpuBusy
+      ? "当前还有 sidebar turn 在跑，等结束后再切 CPU"
+      : cpuStatus
+        ? `CPU: ${cpuStatus.label}`
+        : "CPU"
+  );
 
   return (
     <div
@@ -1412,7 +1735,7 @@ function App() {
         </span>
         <div
           class="bbt-cpu-switch shrink-0"
-          title={cpuError || (cpuStatus ? `CPU: ${cpuStatus.label}` : "CPU")}
+          title={cpuSwitchTitle}
         >
           {cpuChoices.map((choice) => {
             const active = choice.name === cpuStatus?.cpu;
@@ -1422,7 +1745,7 @@ function App() {
                 key={choice.name}
                 class={`bbt-cpu-option ${active ? "bbt-cpu-active" : ""}`}
                 onClick={() => switchCpu(choice.name)}
-                disabled={streaming || Boolean(cpuSwitching) || !available}
+                disabled={streaming || cpuBusy || Boolean(cpuSwitching) || !available}
                 title={available ? choice.label : `${choice.label} not found`}
               >
                 {cpuSwitching === choice.name ? "..." : cpuShortLabel(choice)}
@@ -1430,6 +1753,18 @@ function App() {
             );
           })}
         </div>
+        <button
+          class={`btn-icon bbt-debug-toggle w-6 h-6 rounded-md flex items-center justify-center shrink-0 ${
+            debugPromptEnabled ? "bbt-debug-toggle-active" : ""
+          }`}
+          title={debugPromptEnabled ? "Prompt 调试已开" : "Prompt 调试"}
+          onClick={toggleDebugPrompt}
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <path d="M5.2 3.2 2.4 6.5l2.8 3.3M8.8 3.2l2.8 3.3-2.8 3.3" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="m7.7 2.8-1.4 7.4" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" />
+          </svg>
+        </button>
         <button
           class="btn-icon w-6 h-6 rounded-md flex items-center justify-center shrink-0"
           title="新对话"
@@ -1513,9 +1848,11 @@ function App() {
           }
           return (
             <div key={i} class="flex flex-col items-start group">
+              <DebugPromptList prompts={m.debug_prompts} />
               {m.parts ? (
                 <AssistantParts
                   parts={m.parts}
+                  tools={m.tools}
                   placeholder={streaming && i === msgs.length - 1 ? "…" : ""}
                 />
               ) : (

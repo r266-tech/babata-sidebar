@@ -36,5 +36,45 @@ The companion exposes:
 - `GET /ws` via WebSocket upgrade
 
 The public companion keeps the common path self-contained: Codex or Claude Code
-for chat, and an OpenAI-compatible provider for translation. Advanced agent
-tool loops can build on the existing WebSocket request/response bridge.
+for chat, and an OpenAI-compatible provider for translation.
+
+## Chat Context Contract
+
+Each chat turn is sent to the companion as a bounded context envelope:
+
+- recent `user` / `assistant` messages, trimmed before they reach the model
+- current page URL/title/tab/window metadata
+- selected text when available
+- attachment metadata only; binary contents are not passed to the model
+- browser tool results returned through the WebSocket bridge
+
+The local model is run without hidden session persistence, so the envelope is
+the complete context for the turn.
+
+When prompt debug mode is enabled from the side panel, or
+`BABATA_CHAT_DEBUG_PROMPT=1` is set on the companion, `POST /chat` emits a
+`debug_prompt` stream event immediately before each local model invocation. A
+single user turn can have multiple debug prompts when the companion or local CPU
+runtime decides to call browser tools and rerun with their results.
+
+## Browser Tool Bridge
+
+The offscreen document keeps a persistent `/ws` connection to the companion. The
+extension is a transport and permission boundary: it forwards browser
+primitives, returns results, and records traces for the side panel. It does not
+decide whether to call tools, how many calls are enough, or how to compose them;
+that loop belongs to the companion and the local Codex/Claude-side runtime.
+
+The default browser bridge allow-list is read-only:
+
+- `tab_metadata`
+- `page_snapshot`
+- `article_extract`
+- `dom_query`
+- `tabs_query`
+- `history_search`
+- `bookmarks_search`
+- `bookmarks_tree`
+
+Set `BABATA_CHAT_TOOL_ACTIONS` to change the companion-side allow-list. Write
+actions should be enabled only with an explicit trust boundary.

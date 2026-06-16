@@ -26,6 +26,10 @@ const CHAT_TEXT_MAX_CHARS = 120_000;
 const CHAT_TOOL_TEXT_MAX_CHARS = 12_000;
 const CHAT_IMAGE_THUMB_MAX_CHARS = 180_000;
 const CHAT_FLUSH_MS = 120;
+const CHAT_MODEL_MAX_MESSAGES = 24;
+const CHAT_MODEL_TEXT_MAX_CHARS = 8_000;
+const CHAT_DEBUG_PROMPT_MAX_CHARS = 240_000;
+const CHAT_DEBUG_PROMPT_MAX_ITEMS = 8;
 
 type Attachment = {
   id: string;
@@ -59,12 +63,25 @@ type ToolTrace = {
   duration_ms?: number;
 };
 
+type DebugPromptTrace = {
+  id: string;
+  sequence: number;
+  cpu?: string;
+  allow_tools?: boolean;
+  tool_results_count?: number;
+  chars: number;
+  prompt: string;
+  truncated?: boolean;
+  created_at: number;
+};
+
 type MessagePart =
   | { type: "text"; id: string; text: string }
   | {
       type: "page_read";
       id: string;
       name: string;
+      input?: unknown;
       status: ToolTraceStatus;
       is_error?: boolean;
       duration_ms?: number;
@@ -76,6 +93,7 @@ type Msg = {
   parts?: MessagePart[];
   attachments?: Attachment[];
   tools?: ToolTrace[];
+  debug_prompts?: DebugPromptTrace[];
   clean_read_id?: string;
   pending?: boolean;
 };
@@ -92,6 +110,15 @@ type LightContext = {
 
 type ServerEvent =
   | { type: "text_delta"; text: string }
+  | {
+      type: "debug_prompt";
+      sequence?: number;
+      cpu?: string;
+      allow_tools?: boolean;
+      tool_results_count?: number;
+      chars?: number;
+      prompt: string;
+    }
   | { type: "tool_use"; trace_id?: string; name: string; input?: unknown }
   | { type: "tool_result"; trace_id?: string; is_error?: boolean; text?: string }
   | { type: "session"; session_id: string }
@@ -114,6 +141,7 @@ type ChatStartMessage = {
   messages?: unknown;
   page_context?: LightContext;
   attachments?: WireAttachment[];
+  debug_prompt?: boolean;
 };
 
 type ActiveChatRun = {
@@ -205,6 +233,7 @@ function normalizeMessagePart(raw: unknown, index: number): MessagePart | null {
       type: "page_read",
       id,
       name: typeof item.name === "string" ? item.name : "page_read",
+      input: storageSafeUnknown(item.input, CHAT_TOOL_TEXT_MAX_CHARS),
       status,
       is_error: item.is_error === true,
       duration_ms: typeof item.duration_ms === "number" ? item.duration_ms : undefined,
@@ -263,6 +292,44 @@ function sanitizeToolsForStorage(raw: unknown): ToolTrace[] {
   }));
 }
 
+function normalizeDebugPromptTrace(raw: unknown, index: number): DebugPromptTrace | null {
+  if (!raw || typeof raw !== "object") return null;
+  const item = raw as Record<string, unknown>;
+  const prompt = truncateText(item.prompt, CHAT_DEBUG_PROMPT_MAX_CHARS);
+  if (!prompt) return null;
+  const chars = typeof item.chars === "number" && Number.isFinite(item.chars)
+    ? item.chars
+    : prompt.length;
+  const sequence = typeof item.sequence === "number" && Number.isFinite(item.sequence)
+    ? item.sequence
+    : index + 1;
+  const createdAt = typeof item.created_at === "number" && Number.isFinite(item.created_at)
+    ? item.created_at
+    : Date.now();
+  return {
+    id: typeof item.id === "string" ? item.id : `debug-prompt-${sequence}-${createdAt}`,
+    sequence,
+    cpu: typeof item.cpu === "string" ? item.cpu : undefined,
+    allow_tools: typeof item.allow_tools === "boolean" ? item.allow_tools : undefined,
+    tool_results_count:
+      typeof item.tool_results_count === "number" && Number.isFinite(item.tool_results_count)
+        ? item.tool_results_count
+        : undefined,
+    chars,
+    prompt,
+    truncated: item.truncated === true || chars > prompt.length,
+    created_at: createdAt,
+  };
+}
+
+function sanitizeDebugPromptsForStorage(raw: unknown): DebugPromptTrace[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item, index) => normalizeDebugPromptTrace(item, index))
+    .filter((item): item is DebugPromptTrace => item !== null)
+    .slice(-CHAT_DEBUG_PROMPT_MAX_ITEMS);
+}
+
 function sanitizeMsgsForStorage(messages: Msg[]): Msg[] {
   return messages.slice(-CHAT_HISTORY_MAX_MESSAGES).map((msg) => {
     const out: Msg = {
@@ -277,10 +344,22 @@ function sanitizeMsgsForStorage(messages: Msg[]): Msg[] {
     if (attachments.length > 0) out.attachments = attachments;
     const tools = sanitizeToolsForStorage(msg.tools);
     if (tools.length > 0) out.tools = tools;
+    const debugPrompts = sanitizeDebugPromptsForStorage(msg.debug_prompts);
+    if (debugPrompts.length > 0) out.debug_prompts = debugPrompts;
     if (typeof msg.clean_read_id === "string") out.clean_read_id = msg.clean_read_id;
     if (msg.pending) out.pending = true;
     return out;
   });
+}
+
+function msgsForModelWire(messages: Msg[]): Array<{ role: Msg["role"]; text: string }> {
+  return messages
+    .slice(-CHAT_MODEL_MAX_MESSAGES)
+    .map((msg) => ({
+      role: msg.role,
+      text: truncateText(msg.text, CHAT_MODEL_TEXT_MAX_CHARS),
+    }))
+    .filter((msg) => msg.text.trim().length > 0);
 }
 
 function normalizeStoredMsgs(raw: unknown): Msg[] {
@@ -320,6 +399,8 @@ function normalizeStoredMsgs(raw: unknown): Msg[] {
       if (attachments.length > 0) msg.attachments = attachments;
       const tools = sanitizeToolsForStorage(item.tools);
       if (tools.length > 0) msg.tools = tools;
+      const debugPrompts = sanitizeDebugPromptsForStorage(item.debug_prompts);
+      if (debugPrompts.length > 0) msg.debug_prompts = debugPrompts;
       if (typeof item.clean_read_id === "string") msg.clean_read_id = item.clean_read_id;
       if (item.pending === true) msg.pending = true;
       return msg;
@@ -392,6 +473,7 @@ function appendToolUse(
             type: "page_read",
             id,
             name,
+            input: ev.input,
             status: "running",
           },
         ]
@@ -467,6 +549,42 @@ function appendToolResult(
   });
 }
 
+function appendDebugPrompt(
+  messages: Msg[],
+  ev: Extract<ServerEvent, { type: "debug_prompt" }>,
+): Msg[] {
+  const prompt = truncateText(ev.prompt, CHAT_DEBUG_PROMPT_MAX_CHARS);
+  if (!prompt) return messages;
+  const chars = typeof ev.chars === "number" && Number.isFinite(ev.chars)
+    ? ev.chars
+    : ev.prompt.length;
+  const sequence = typeof ev.sequence === "number" && Number.isFinite(ev.sequence)
+    ? ev.sequence
+    : 1;
+  const createdAt = Date.now();
+  const trace: DebugPromptTrace = {
+    id: `debug-prompt-${sequence}-${createdAt}`,
+    sequence,
+    cpu: typeof ev.cpu === "string" ? ev.cpu : undefined,
+    allow_tools: typeof ev.allow_tools === "boolean" ? ev.allow_tools : undefined,
+    tool_results_count:
+      typeof ev.tool_results_count === "number" && Number.isFinite(ev.tool_results_count)
+        ? ev.tool_results_count
+        : undefined,
+    chars,
+    prompt,
+    truncated: chars > prompt.length,
+    created_at: createdAt,
+  };
+  return updateLastAssistant(messages, (last) => ({
+    ...last,
+    debug_prompts: [
+      ...(last.debug_prompts ?? []),
+      trace,
+    ].slice(-CHAT_DEBUG_PROMPT_MAX_ITEMS),
+  }));
+}
+
 function normalizeChatStartMessage(msg: unknown): ChatStartMessage | null {
   if (!msg || typeof msg !== "object") return null;
   const item = msg as Record<string, unknown>;
@@ -501,6 +619,7 @@ function normalizeChatStartMessage(msg: unknown): ChatStartMessage | null {
     messages: item.messages,
     page_context: pageContext,
     attachments,
+    debug_prompt: item.debug_prompt === true,
   };
 }
 
@@ -605,8 +724,10 @@ async function startChat(req: ChatStartMessage): Promise<void> {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         message: req.message,
+        messages: msgsForModelWire(run.messages),
         page_context: req.page_context ?? undefined,
         attachments: req.attachments && req.attachments.length > 0 ? req.attachments : undefined,
+        debug_prompt: req.debug_prompt === true,
       }),
       signal: run.controller.signal,
     });
@@ -641,6 +762,9 @@ async function startChat(req: ChatStartMessage): Promise<void> {
         if (ev.type === "text_delta" && typeof ev.text === "string") {
           run.messages = appendAssistant(run.messages, ev.text);
           flush();
+        } else if (ev.type === "debug_prompt" && typeof ev.prompt === "string") {
+          run.messages = appendDebugPrompt(run.messages, ev);
+          flush(true);
         } else if (ev.type === "tool_use" && typeof ev.name === "string") {
           run.messages = appendToolUse(run.messages, ev);
           flush(true);

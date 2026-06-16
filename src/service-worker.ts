@@ -203,15 +203,53 @@ async function recentSidePanelOpenTab(): Promise<chrome.tabs.Tab | null> {
   return null;
 }
 
+function sidePanelPathForTarget(target: { tabId?: number; windowId?: number }) {
+  const params = new URLSearchParams();
+  if (target.tabId !== undefined) params.set("tab_id", String(target.tabId));
+  if (target.windowId !== undefined) params.set("window_id", String(target.windowId));
+  const query = params.toString();
+  return query ? `src/sidepanel.html?${query}` : "src/sidepanel.html";
+}
+
+async function configureSidePanelForTarget(target: { tabId?: number; windowId?: number }) {
+  if (target.tabId === undefined && target.windowId === undefined) return;
+  const path = sidePanelPathForTarget(target);
+  try {
+    if (target.tabId !== undefined) {
+      await chrome.sidePanel.setOptions({ tabId: target.tabId, path, enabled: true });
+      return;
+    }
+    await chrome.sidePanel.setOptions({ path, enabled: true });
+  } catch (e) {
+    console.debug("[babata-sw] sidePanel.setOptions failed:", (e as Error)?.message ?? e);
+  }
+}
+
+function notifySidePanelTarget(target: { tabId?: number; windowId?: number }) {
+  if (target.tabId === undefined && target.windowId === undefined) return;
+  chrome.runtime
+    .sendMessage({
+      type: "babata.sidepanel_target",
+      tab_id: target.tabId,
+      window_id: target.windowId,
+    })
+    .catch(() => {});
+}
+
 async function openSidePanelForTarget(target: { tabId?: number; windowId?: number }) {
   const { tabId, windowId } = target;
   rememberSidePanelOpenTarget(target);
-  if (windowId !== undefined) {
-    await chrome.sidePanel.open({ windowId });
+  notifySidePanelTarget(target);
+  if (tabId !== undefined) {
+    await chrome.sidePanel.open(
+      windowId !== undefined ? { tabId, windowId } : { tabId },
+    );
+    void configureSidePanelForTarget(target);
     return;
   }
-  if (tabId !== undefined) {
-    await chrome.sidePanel.open({ tabId });
+  if (windowId !== undefined) {
+    await chrome.sidePanel.open({ windowId });
+    void configureSidePanelForTarget(target);
   }
 }
 
@@ -495,6 +533,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         /* 静默 */
       }
       sendResponse?.({ ok: true });
+    })();
+    return true;
+  }
+
+  if (m.type === "babata.prepare_sidebar") {
+    void (async () => {
+      try {
+        await configureSidePanelForTarget(sidePanelTargetFromMessage(msg, sender));
+        sendResponse?.({ ok: true });
+      } catch (e) {
+        sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
+      }
     })();
     return true;
   }

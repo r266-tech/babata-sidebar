@@ -1296,7 +1296,17 @@ function renderChatPopup(
     }
   };
   if (sidepanelUrl) {
-    void currentPageTargetContext().then((ctx) => setIframeSrc(ctx));
+    void currentPageTargetContext().then((ctx) => {
+      setIframeSrc(ctx);
+      if (ctx) {
+        void safeChromePromise(() =>
+          chrome.runtime.sendMessage({
+            type: "babata.prepare_sidebar",
+            ...ctx,
+          }),
+        );
+      }
+    });
     window.setTimeout(() => {
       if (!iframe.getAttribute("src")) setIframeSrc();
     }, 150);
