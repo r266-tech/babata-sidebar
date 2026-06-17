@@ -1,10 +1,11 @@
 import { render } from "preact";
-import { useEffect, useMemo, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import type { TranslationModelOption, TranslationProviderSettings } from "./runtime-config";
 import {
   DEFAULT_SERVER_ORIGIN,
   getServerOrigin,
   normalizeServerOrigin,
+  resolveReachableServerOrigin,
   serverUrlFromOrigin,
   setServerOrigin as persistServerOrigin,
 } from "./runtime-config";
@@ -56,11 +57,17 @@ function App() {
   const [modelInput, setModelInput] = useState("");
   const [providerStatus, setProviderStatus] = useState("未检测");
   const [busy, setBusy] = useState<string | null>(null);
+  const checkServerSeq = useRef(0);
 
   const currentServerUrl = useMemo(() => normalizeServerOrigin(serverInput), [serverInput]);
 
   async function serverRequest(path: string, init?: RequestInit): Promise<Response> {
-    return fetch(serverUrlFromOrigin(currentServerUrl, path), init);
+    const reachable = await resolveReachableServerOrigin(currentServerUrl);
+    if (reachable !== currentServerUrl) {
+      setServerInput(reachable);
+      setServerOrigin(reachable);
+    }
+    return fetch(serverUrlFromOrigin(reachable, path), init);
   }
 
   async function loadServerSettings(origin = currentServerUrl) {
@@ -75,26 +82,37 @@ function App() {
   }
 
   async function checkServer(origin = currentServerUrl) {
+    const seq = checkServerSeq.current + 1;
+    checkServerSeq.current = seq;
     setBusy("server");
     setServerStatus("检测中...");
     try {
-      const resp = await fetch(serverUrlFromOrigin(origin, "/health"));
+      const normalized = normalizeServerOrigin(origin);
+      const reachable = await resolveReachableServerOrigin(normalized);
+      if (seq !== checkServerSeq.current) return;
+      if (reachable !== normalized) {
+        setServerInput(reachable);
+        setServerOrigin(reachable);
+      }
+      const resp = await fetch(serverUrlFromOrigin(reachable, "/health"));
       const data = await readJson(resp);
       if (!resp.ok || data.ok !== true) throw new Error(textField(data, "error") || `HTTP ${resp.status}`);
+      if (seq !== checkServerSeq.current) return;
       setServerHealth(data as ServerHealth);
-      setServerStatus("已连接");
-      await loadServerSettings(origin);
+      setServerStatus(reachable === normalized ? "已连接" : "已连接，已自动切回默认端口");
+      await loadServerSettings(reachable);
     } catch (e) {
+      if (seq !== checkServerSeq.current) return;
       setServerHealth(null);
       setServerStatus((e as Error).message || String(e));
     } finally {
-      setBusy(null);
+      if (seq === checkServerSeq.current) setBusy(null);
     }
   }
 
   useEffect(() => {
     void (async () => {
-      const origin = await getServerOrigin();
+      const origin = await resolveReachableServerOrigin(await getServerOrigin());
       setServerInput(origin);
       setServerOrigin(origin);
       await checkServer(origin);

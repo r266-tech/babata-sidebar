@@ -11,6 +11,7 @@ import {
   STORAGE_SERVER_ORIGIN,
   getServerOrigin,
   normalizeServerOrigin,
+  resolveReachableServerOrigin,
   serverFetch,
 } from "./runtime-config";
 
@@ -324,7 +325,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (m.type === "babata.server_origin.get") {
     void (async () => {
       try {
-        sendResponse?.({ ok: true, origin: await getServerOrigin() });
+        sendResponse?.({ ok: true, origin: await resolveReachableServerOrigin(await getServerOrigin()) });
       } catch (e) {
         sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
       }

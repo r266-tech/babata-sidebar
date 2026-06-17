@@ -5,9 +5,9 @@ import DOMPurify from "dompurify";
 import {
   DEFAULT_SERVER_ORIGIN,
   STORAGE_SERVER_ORIGIN,
-  getServerOrigin,
   normalizeServerOrigin,
-  serverUrlFromOrigin,
+  resolveReachableServerOrigin,
+  serverFetchFromOrigin,
 } from "./runtime-config";
 import "./styles.css";
 
@@ -1096,7 +1096,7 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    void getServerOrigin()
+    void resolveReachableServerOrigin()
       .then((origin) => {
         if (!cancelled) setServerOrigin(origin);
       })
@@ -1117,7 +1117,7 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch(serverUrlFromOrigin(serverOrigin, "/health"))
+    serverFetchFromOrigin(serverOrigin, "/health")
       .then(async (r) => {
         if (!cancelled) setServerOk(r.ok);
         if (!r.ok) return;
@@ -1142,7 +1142,7 @@ function App() {
     let timer: number | null = null;
     const poll = () => {
       timer = null;
-      fetch(serverUrlFromOrigin(serverOrigin, "/health"))
+      serverFetchFromOrigin(serverOrigin, "/health")
         .then(async (r) => {
           if (cancelled) return;
           setServerOk(r.ok);
@@ -1239,7 +1239,7 @@ function App() {
   useEffect(() => {
     if (!localHistoryLoaded) return;
     let cancelled = false;
-    fetch(serverUrlFromOrigin(serverOrigin, "/history?limit=200"), {
+    serverFetchFromOrigin(serverOrigin, "/history?limit=200", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: "{}",
@@ -1552,7 +1552,7 @@ function App() {
     void clearSavedChatHistory(historyStorageKey).catch(() => {});
     void clearSavedChatScrollState(historyStorageKey).catch(() => {});
     // 让 server 起新 session: 发 /new 给 cc.py (复用 cc 的 /new 命令路径).
-    void fetch(serverUrlFromOrigin(serverOrigin, "/chat"), {
+    void serverFetchFromOrigin(serverOrigin, "/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ message: "/new" }),
@@ -1572,7 +1572,7 @@ function App() {
     setCpuSwitching(cpu);
     setCpuError("");
     try {
-      const resp = await fetch(serverUrlFromOrigin(serverOrigin, "/cpu"), {
+      const resp = await serverFetchFromOrigin(serverOrigin, "/cpu", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ cpu }),

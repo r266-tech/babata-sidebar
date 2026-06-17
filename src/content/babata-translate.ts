@@ -43,6 +43,11 @@ const TR_INPLACE_CLASS = "bbt-tr-inplace";
 const SRC_CLASS = "bbt-src";
 const INPLACE_ATTR = "data-bbt-inplace";
 const SELECTION_SETTING_EVENT = "babata:selection-translation-setting";
+const LINK_MARKER_START = "[[BBT_LINK_";
+const LINK_MARKER_END_PREFIX = "[[/BBT_LINK_";
+const LINK_MARKER_SUFFIX = "]]";
+const LINK_MARKER_PAIR_RE = /\[\[BBT_LINK_(\d+)\]\]([\s\S]*?)\[\[\/BBT_LINK_\1\]\]/g;
+const LINK_MARKER_TOKEN_RE = /\[\[\/?BBT_LINK_\d+\]\]/g;
 
 const SAFE_HTML_OPTS = {
   ALLOWED_TAGS: ["b", "i", "em", "strong", "a", "code", "br", "span", "mark"],
@@ -70,6 +75,7 @@ const cache = new Map<string, string>();
 interface QueueItem {
   el: HTMLElement;
   text: string;
+  requestText: string;
   visible: boolean;
   attempts: number;
 }
@@ -728,10 +734,20 @@ function hasTextBlockSemantics(el: HTMLElement): boolean {
   return !!el.getAttribute("lang") || dir === "auto";
 }
 
+function normalizeSourceText(text: string): string {
+  return text
+    .replace(/[ \t\f\v\r]+/g, " ")
+    .replace(/[ \t]*\n[ \t]*/g, (_match, offset, full: string) => {
+      const before = full.slice(Math.max(0, offset - 24), offset).trim();
+      return LINE_BREAK_ABBREVIATION_RE.test(before) ? " " : "\n";
+    })
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 // Read only the page's source text, never our injected sibling/wrapper text.
-// This is the idempotency boundary: hash, language detection, trace text, and
-// outbound LLM payload must all agree on the same source-only string.
-function sourceText(el: HTMLElement): string {
+// This is the idempotency boundary for language detection and trace text.
+function buildSourceText(el: HTMLElement, linkIds?: Map<HTMLAnchorElement, number>): string {
   const parts: string[] = [];
 
   function pushBlockBreak() {
@@ -740,7 +756,7 @@ function sourceText(el: HTMLElement): string {
     if (!last.endsWith("\n")) parts.push("\n");
   }
 
-  function walk(node: Node) {
+  function walk(node: Node, linkIds?: Map<HTMLAnchorElement, number>) {
     if (node.nodeType === Node.TEXT_NODE) {
       parts.push(node.textContent || "");
       return;
@@ -761,25 +777,38 @@ function sourceText(el: HTMLElement): string {
       return;
     }
 
+    const linkId = node instanceof HTMLAnchorElement ? linkIds?.get(node) : undefined;
+    if (linkId !== undefined) parts.push(`${LINK_MARKER_START}${linkId}${LINK_MARKER_SUFFIX}`);
     const block = node !== el && FORCE_BLOCK_TAGS.has(node.tagName);
     if (block) pushBlockBreak();
     for (const child of Array.from(node.childNodes)) {
-      walk(child);
+      walk(child, linkIds);
     }
     if (block) pushBlockBreak();
+    if (linkId !== undefined) parts.push(`${LINK_MARKER_END_PREFIX}${linkId}${LINK_MARKER_SUFFIX}`);
   }
 
   for (const child of Array.from(el.childNodes)) {
-    walk(child);
+    walk(child, linkIds);
   }
-  return parts.join("")
-    .replace(/[ \t\f\v\r]+/g, " ")
-    .replace(/[ \t]*\n[ \t]*/g, (_match, offset, full: string) => {
-      const before = full.slice(Math.max(0, offset - 24), offset).trim();
-      return LINE_BREAK_ABBREVIATION_RE.test(before) ? " " : "\n";
-    })
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  return normalizeSourceText(parts.join(""));
+}
+
+function sourceText(el: HTMLElement): string {
+  return buildSourceText(el);
+}
+
+function sourceLinkElements(el: HTMLElement): HTMLAnchorElement[] {
+  return Array.from(el.querySelectorAll<HTMLAnchorElement>("a[href]"))
+    .filter((source) => !isIgnoredElement(source) && !isTranslationElement(source));
+}
+
+function sourceTextForTranslation(el: HTMLElement): string {
+  const anchors = sourceLinkElements(el);
+  if (anchors.length === 0) return sourceText(el);
+  const linkIds = new Map<HTMLAnchorElement, number>();
+  anchors.forEach((anchor, index) => linkIds.set(anchor, index + 1));
+  return buildSourceText(el, linkIds);
 }
 
 function isLeafTextElement(el: HTMLElement, knownHasRichMedia = hasRichMediaSurface(el)): boolean {
@@ -1552,8 +1581,7 @@ function addUrlLikeTokens(tokens: string[], value: string | null | undefined) {
 
 function collectSourceLinks(el: HTMLElement): SourceLink[] {
   const links: SourceLink[] = [];
-  for (const source of Array.from(el.querySelectorAll<HTMLAnchorElement>("a[href]"))) {
-    if (isIgnoredElement(source) || isTranslationElement(source)) continue;
+  for (const source of sourceLinkElements(el)) {
     const href = source.getAttribute("href") || "";
     const tokens: string[] = [];
     const visibleTexts = [sourceText(source), source.innerText, source.textContent ?? ""];
@@ -1568,6 +1596,11 @@ function collectSourceLinks(el: HTMLElement): SourceLink[] {
     links.push({ source, tokens, used: false });
   }
   return links;
+}
+
+function markerIdToIndex(markerId: string, links: SourceLink[]): number | null {
+  const index = Number(markerId) - 1;
+  return Number.isInteger(index) && index >= 0 && index < links.length ? index : null;
 }
 
 function copyAnchorAttrs(src: HTMLAnchorElement, dst: HTMLAnchorElement) {
@@ -1637,6 +1670,7 @@ function linkifyPreservedSourceLinks(el: HTMLElement, safe: string): string {
 
   const template = document.createElement("template");
   Reflect.set(template, "innerHTML", safe);
+  restoreMarkedSourceLinks(template, links);
   const walker = document.createTreeWalker(
     template.content,
     NodeFilter.SHOW_TEXT,
@@ -1681,7 +1715,46 @@ function linkifyPreservedSourceLinks(el: HTMLElement, safe: string): string {
     textNode.parentNode?.replaceChild(frag, textNode);
   }
 
-  return DOMPurify.sanitize(template.innerHTML, LINKIFIED_HTML_OPTS);
+  return DOMPurify.sanitize(template.innerHTML.replace(LINK_MARKER_TOKEN_RE, ""), LINKIFIED_HTML_OPTS);
+}
+
+function restoreMarkedSourceLinks(template: HTMLTemplateElement, links: SourceLink[]) {
+  const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
+  const textNodes: Text[] = [];
+  while (walker.nextNode()) {
+    if (walker.currentNode instanceof Text) textNodes.push(walker.currentNode);
+  }
+
+  for (const textNode of textNodes) {
+    const text = textNode.nodeValue ?? "";
+    if (!text || !LINK_MARKER_PAIR_RE.test(text)) {
+      LINK_MARKER_PAIR_RE.lastIndex = 0;
+      continue;
+    }
+    LINK_MARKER_PAIR_RE.lastIndex = 0;
+    const frag = document.createDocumentFragment();
+    let offset = 0;
+    let match: RegExpExecArray | null;
+    while ((match = LINK_MARKER_PAIR_RE.exec(text)) !== null) {
+      const markerIndex = markerIdToIndex(match[1], links);
+      if (markerIndex === null) continue;
+      if (match.index > offset) {
+        frag.append(document.createTextNode(text.slice(offset, match.index)));
+      }
+      const link = links[markerIndex];
+      const a = document.createElement("a");
+      copyAnchorAttrs(link.source, a);
+      a.textContent = match[2].replace(LINK_MARKER_TOKEN_RE, "") || collapsedText(link.source.textContent ?? "");
+      frag.append(a);
+      link.used = true;
+      offset = match.index + match[0].length;
+    }
+    if (offset === 0) continue;
+    if (offset < text.length) {
+      frag.append(document.createTextNode(text.slice(offset)));
+    }
+    textNode.parentNode?.replaceChild(frag, textNode);
+  }
 }
 
 function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
@@ -1690,7 +1763,7 @@ function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
   // 译文等于原文 (模型决定不翻 — 专有名词 / handle / 版本号等) → 不 inject sibling,
   // Otherwise the original appears twice for names, handles, and version text.
   const original = sourceText(el);
-  if (raw.trim() === original) return;
+  if (raw.trim().replace(LINK_MARKER_TOKEN_RE, "") === original) return;
   // server 返 plain text with \n\n 段分隔. 浏览器把 \n 当 whitespace 渲染,
   // 段间会粘连, 转 <br><br> 才有视觉换行 (DOMPurify allowlist 含 br).
   const withBreaks = raw
@@ -1730,7 +1803,8 @@ function rerenderCachedTranslations() {
       if (!(node instanceof HTMLElement)) return;
       const text = sourceText(node);
       if (!shouldTranslate(text)) return;
-      const fresh = hashText(normalizeForHash(text), TARGET_LANG);
+      const requestText = sourceTextForTranslation(node);
+      const fresh = hashText(normalizeForHash(requestText), TARGET_LANG);
       const translated = cache.get(fresh);
       if (translated !== undefined) {
         node.setAttribute(HASH_ATTR, fresh);
@@ -1794,7 +1868,8 @@ function doProcessCandidate(el: HTMLElement, src: TraceSource) {
     return;
   }
 
-  const fresh = hashText(normalizeForHash(text), TARGET_LANG);
+  const requestText = sourceTextForTranslation(el);
+  const fresh = hashText(normalizeForHash(requestText), TARGET_LANG);
   const existing = el.getAttribute(HASH_ATTR);
 
   // SPA 重 mount 时, 旧 .bbt-tr sibling 可能跟随 hash 节点带过来; 但 text 已变 →
@@ -1838,6 +1913,7 @@ function doProcessCandidate(el: HTMLElement, src: TraceSource) {
   queue.set(fresh, {
     el,
     text,
+    requestText,
     visible: isElementNearViewport(el),
     attempts: 0,
   });
@@ -1880,7 +1956,7 @@ async function flush() {
 async function flushOnce() {
   // 可见优先取 BATCH_SIZE, 但不丢 scroll-out: 队列里的后台段落继续补翻.
   // slice 暂不删, 等 round-trip 完按 result 状态决定.
-  const slice: { hash: string; el: HTMLElement; text: string }[] = [];
+  const slice: { hash: string; el: HTMLElement; text: string; requestText: string }[] = [];
   let sliceChars = 0;
   const candidates = Array.from(queue.entries()).sort((a, b) => {
     const av = a[1].visible || isElementNearViewport(a[1].el);
@@ -1891,17 +1967,17 @@ async function flushOnce() {
   for (const [h, item] of candidates) {
     if (slice.length >= BATCH_SIZE) break;
     item.visible = item.visible || isElementNearViewport(item.el);
-    if (slice.length > 0 && sliceChars + item.text.length > TRANSLATION_BATCH_CHAR_BUDGET) {
+    if (slice.length > 0 && sliceChars + item.requestText.length > TRANSLATION_BATCH_CHAR_BUDGET) {
       continue;
     }
-    slice.push({ hash: h, el: item.el, text: item.text });
-    sliceChars += item.text.length;
+    slice.push({ hash: h, el: item.el, text: item.text, requestText: item.requestText });
+    sliceChars += item.requestText.length;
   }
   if (slice.length === 0) return;
 
-  const batch = slice.map(({ hash, text }) => ({
+  const batch = slice.map(({ hash, requestText }) => ({
     hash,
-    text,
+    text: requestText,
   }));
 
   let results: { hash: string; translated: string }[] = [];
@@ -1953,7 +2029,8 @@ async function flushOnce() {
     completedHashes.add(r.hash);
     cache.set(r.hash, r.translated);
     const currentText = sourceText(item.el);
-    const currentHash = currentText ? hashText(normalizeForHash(currentText), TARGET_LANG) : "";
+    const currentRequestText = currentText ? sourceTextForTranslation(item.el) : "";
+    const currentHash = currentRequestText ? hashText(normalizeForHash(currentRequestText), TARGET_LANG) : "";
     if (currentHash !== r.hash) {
       trace("mo_add", item.el, r.hash, "stale_result", currentText);
       staleRechecks.push(item.el);

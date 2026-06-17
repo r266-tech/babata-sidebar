@@ -405,7 +405,7 @@ async function translateBatch(config, payload) {
     {
       role: "system",
       content:
-        "You translate visible web page text. Preserve URLs, code, numbers, emoji, product names, and line breaks. Return only JSON with shape {\"results\":[{\"hash\":\"...\",\"translated\":\"...\"}]}.",
+        "You translate visible web page text. Preserve URLs, code, numbers, emoji, product names, line breaks, and link markers like [[BBT_LINK_1]]...[[/BBT_LINK_1]] exactly around the translated text for that link. Return only JSON with shape {\"results\":[{\"hash\":\"...\",\"translated\":\"...\"}]}.",
     },
     {
       role: "user",

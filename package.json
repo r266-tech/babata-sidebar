@@ -28,6 +28,8 @@
     "smoke:companion": "node scripts/smoke-companion.mjs",
     "smoke:sidebar": "node scripts/smoke-sidebar.mjs",
     "smoke:rich-card": "node scripts/smoke-rich-card.mjs",
+    "smoke:server-origin-fallback": "node scripts/smoke-server-origin-fallback.mjs",
+    "smoke:translation-links": "node scripts/smoke-translation-links.mjs",
     "smoke:llm": "node scripts/smoke-llm.mjs",
     "smoke": "npm run smoke:companion && npm run smoke:sidebar && npm run smoke:rich-card"
   },
