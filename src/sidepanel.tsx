@@ -1239,11 +1239,7 @@ function App() {
   useEffect(() => {
     if (!localHistoryLoaded) return;
     let cancelled = false;
-    serverFetchFromOrigin(serverOrigin, "/history?limit=200", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: "{}",
-    })
+    serverFetchFromOrigin(serverOrigin, "/history?limit=200")
       .then((r) => r.json())
       .then((data: {
         ok?: boolean;

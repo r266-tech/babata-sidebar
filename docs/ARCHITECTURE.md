@@ -25,7 +25,7 @@ The companion exposes:
 - `POST /settings`
 - `POST /cpu`
 - `POST /chat`
-- `POST /history`
+- `GET /history`
 - `POST /translate`
 - `POST /translate/models`
 - `POST /translate/test`

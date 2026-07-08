@@ -993,8 +993,7 @@ async function route(req, res) {
     await handleChat(config, await readJson(req), res);
     return;
   }
-  if ((req.method === "GET" || req.method === "POST") && url.pathname === "/history") {
-    if (req.method === "POST") await readJson(req);
+  if (req.method === "GET" && url.pathname === "/history") {
     json(res, 200, historyPayload(url));
     return;
   }

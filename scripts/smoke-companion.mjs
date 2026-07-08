@@ -305,6 +305,15 @@ try {
   const historyPayload = await history.json();
   assert(history.ok && Array.isArray(historyPayload.turns), "history endpoint failed", historyPayload);
   assert(historyPayload.turns.some((turn) => turn.text?.includes("TOOL_OK")), "history did not record assistant turns", historyPayload);
+  const postHistory = await request("/history?limit=1", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  assert(postHistory.status === 404, "history should be GET-only", {
+    status: postHistory.status,
+    text: await postHistory.text(),
+  });
 
   const attention = await request("/attention", {
     method: "POST",
