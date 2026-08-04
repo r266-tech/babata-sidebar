@@ -35,8 +35,8 @@ The companion exposes:
 - `POST /clean_read`
 - `GET /ws` via WebSocket upgrade
 
-The public companion keeps the common path self-contained: Codex or Claude Code
-for chat, and an OpenAI-compatible provider for translation.
+The public companion keeps the common path self-contained: Codex, Claude Code,
+or Grok for chat, and an OpenAI-compatible provider for translation.
 
 ## Chat Context Contract
 
@@ -63,7 +63,9 @@ The offscreen document keeps a persistent `/ws` connection to the companion. The
 extension is a transport and permission boundary: it forwards browser
 primitives, returns results, and records traces for the side panel. It does not
 decide whether to call tools, how many calls are enough, or how to compose them;
-that loop belongs to the companion and the local Codex/Claude-side runtime.
+that loop belongs to the companion and the selected local CPU runtime. Grok is
+started as a single-turn, read-only process with its built-in tools, web search,
+cross-session memory, and subagents disabled.
 
 The default browser bridge allow-list is read-only:
 

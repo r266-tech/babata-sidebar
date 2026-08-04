@@ -3,7 +3,7 @@
   "private": false,
   "version": "0.0.1",
   "type": "module",
-  "description": "Local-first AI browser sidebar with page translation and Codex/Claude Code companion support.",
+  "description": "Local-first AI browser sidebar with page translation and Codex, Claude Code, or Grok companion support.",
   "license": "MIT",
   "repository": {
     "type": "git",

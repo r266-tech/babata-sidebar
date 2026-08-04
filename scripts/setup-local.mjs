@@ -62,7 +62,7 @@ async function commandExists(name) {
   }
   const pathDirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
   const extensions = process.platform === "win32"
-    ? (process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";")
+    ? ["", ...(process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";")]
     : [""];
   for (const dir of pathDirs) {
     for (const ext of extensions) {
@@ -96,14 +96,16 @@ if (nodeMajor < 20) {
 }
 
 printStep("Checking local assistant CLIs");
-const [hasCodex, hasClaude] = await Promise.all([
+const [hasCodex, hasClaude, hasGrok] = await Promise.all([
   commandExists(process.env.BABATA_CODEX_CLI_PATH || process.env.CODEX_CLI_PATH || "codex"),
   commandExists(process.env.CLAUDE_CLI_PATH || process.env.BABATA_CLAUDE_CLI_PATH || "claude"),
+  commandExists(process.env.BABATA_GROK_CLI_PATH || process.env.GROK_CLI_PATH || "grok"),
 ]);
 console.log(`Codex CLI: ${hasCodex ? "found" : "not found"}`);
 console.log(`Claude Code CLI: ${hasClaude ? "found" : "not found"}`);
-if (!hasCodex && !hasClaude) {
-  console.warn("Warning: sidebar chat needs either `codex` or `claude` on PATH, or a CLI path override in the environment.");
+console.log(`Grok CLI: ${hasGrok ? "found" : "not found"}`);
+if (!hasCodex && !hasClaude && !hasGrok) {
+  console.warn("Warning: sidebar chat needs `codex`, `claude`, or `grok` on PATH, or a CLI path override in the environment.");
 }
 
 if (!skipInstall) {

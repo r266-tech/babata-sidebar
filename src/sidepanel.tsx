@@ -81,10 +81,11 @@ type LightContext = {
   selection?: string;
 };
 
-type CpuName = "claude" | "codex";
+type CpuName = string;
 type CpuChoice = {
   name: CpuName;
   label: string;
+  short_label?: string;
   current?: boolean;
   available?: boolean;
 };
@@ -169,7 +170,7 @@ function isPageReadTool(name: string, input?: unknown): boolean {
 }
 
 function isCpuName(value: unknown): value is CpuName {
-  return value === "claude" || value === "codex";
+  return typeof value === "string" && /^[a-z0-9][a-z0-9_-]{0,31}$/i.test(value);
 }
 
 function normalizeCpuStatus(raw: unknown): CpuStatus | null {
@@ -183,6 +184,7 @@ function normalizeCpuStatus(raw: unknown): CpuStatus | null {
     .map((item) => ({
       name: item.name as CpuName,
       label: typeof item.label === "string" ? item.label : String(item.name),
+      short_label: typeof item.short_label === "string" ? item.short_label : undefined,
       current: Boolean(item.current),
       available: item.available !== false,
     }));
@@ -194,13 +196,17 @@ function normalizeCpuStatus(raw: unknown): CpuStatus | null {
     choices: choices.length > 0 ? choices : [
       { name: "codex", label: "Codex", current: obj.cpu === "codex", available: true },
       { name: "claude", label: "Claude Code", current: obj.cpu === "claude", available: true },
+      { name: "grok", label: "Grok", current: obj.cpu === "grok", available: true },
     ],
     message: typeof obj.message === "string" ? obj.message : undefined,
   };
 }
 
 function cpuShortLabel(choice: CpuChoice): string {
-  return choice.name === "claude" ? "CC" : "Codex";
+  if (choice.short_label) return choice.short_label;
+  if (choice.name === "claude") return "CC";
+  if (choice.name === "codex") return "Codex";
+  return choice.label || choice.name;
 }
 
 function renderMarkdown(text: string): string {
@@ -1689,6 +1695,7 @@ function App() {
   const cpuChoices = cpuStatus?.choices ?? [
     { name: "codex" as const, label: "Codex", current: false, available: true },
     { name: "claude" as const, label: "Claude Code", current: false, available: true },
+    { name: "grok" as const, label: "Grok", current: false, available: true },
   ];
   const cpuBusy = cpuStatus?.busy === true;
   const cpuSwitchTitle = cpuError || (

@@ -3,7 +3,7 @@
 Local-first AI browser sidebar for Chromium browsers. It pairs a Manifest V3
 extension with a loopback companion server so users can bring their own:
 
-- Codex CLI or Claude Code for sidebar chat.
+- Codex CLI, Claude Code, or Grok for sidebar chat.
 - Any OpenAI-compatible translation provider by entering `base_url`, `api_key`,
   and a selectable or manually entered `model`.
 
@@ -13,13 +13,13 @@ extension with a loopback companion server so users can bring their own:
 
 ## Features
 
-- Browser side panel chat backed by local Codex or Claude Code.
+- Browser side panel chat backed by local Codex, Claude Code, or Grok.
 - Multi-turn sidebar context: the companion sends a bounded recent chat window,
   current page metadata, selected text, and metadata-only attachments to the
   local model.
 - Read-only browser tool bridge: the extension forwards page/browser primitives
-  and shows traces; the local Codex/Claude-side runtime decides when and how
-  often to use them.
+  and shows traces; the selected local CPU runtime decides when and how often to
+  use them.
 - Optional prompt debug mode that shows the exact assembled chat prompt before
   each local model invocation.
 - Inline page translation and selection translation.
@@ -37,14 +37,15 @@ extension with a loopback companion server so users can bring their own:
   support.
 - At least one local coding assistant:
   - Codex CLI available as `codex`, or
-  - Claude Code available as `claude`.
+  - Claude Code available as `claude`, or
+  - Grok Build CLI available as `grok` (run `grok login` locally first).
 - An OpenAI-compatible translation endpoint, for example OpenRouter, OpenAI, or
   a compatible self-hosted gateway.
 
 ## Quick Start
 
-If you use Codex or Claude Code, you can hand the repository URL to your agent
-and ask it to run the local setup:
+If you use Codex, Claude Code, or Grok, you can hand the repository URL to your
+agent and ask it to run the local setup:
 
 ```text
 Clone https://github.com/r266-tech/babata-sidebar, run `npm run setup:local`,
@@ -97,6 +98,7 @@ Useful environment variables:
 | `BABATA_SIDEBAR_CONFIG` | `~/.babata-sidebar/config.json` | Exact config file path. |
 | `BABATA_CODEX_CLI_PATH` | `codex` | Codex CLI path override. |
 | `CLAUDE_CLI_PATH` | `claude` | Claude Code CLI path override. |
+| `BABATA_GROK_CLI_PATH` | `grok` | Grok Build CLI path override. |
 | `OPENROUTER_API_KEY` | empty | Optional default provider key. |
 | `OPENAI_API_KEY` | empty | Optional default provider key. |
 | `BABATA_TRANSLATION_MODEL` | empty | Optional default translation model. |
@@ -106,6 +108,10 @@ Useful environment variables:
 
 The extension options page can change the companion URL and translation
 provider without rebuilding the extension.
+
+Grok runs in single-turn, read-only mode with its built-in tools, web search,
+cross-session memory, and subagents disabled. Grok authentication stays in the
+Grok CLI; the extension and companion do not store Grok credentials.
 
 The side panel also has a prompt debug toggle. When enabled, each assistant turn
 stores collapsible `LLM prompt` blocks containing the prompt assembled
