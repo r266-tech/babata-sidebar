@@ -168,8 +168,24 @@ try {
   ].join("\n");
   await writeFile(path.join(binDir, "codex"), fakeCli, { mode: 0o700 });
   await writeFile(path.join(binDir, "claude"), fakeCli, { mode: 0o700 });
+  const fakeGrokCli = fakeCli.replace(
+    'prompt="$*"',
+    [
+      'prompt="$*"',
+      'case " $* " in *" --single "*) ;; *) printf "missing --single\\n" >&2; exit 64 ;; esac',
+      'case " $* " in *" --output-format plain "*) ;; *) printf "missing plain output\\n" >&2; exit 64 ;; esac',
+      'case " $* " in *" --permission-mode dontAsk "*) ;; *) printf "missing dontAsk\\n" >&2; exit 64 ;; esac',
+      'case " $* " in *" --sandbox read-only "*) ;; *) printf "missing read-only sandbox\\n" >&2; exit 64 ;; esac',
+      'case " $* " in *" --no-memory "*) ;; *) printf "missing --no-memory\\n" >&2; exit 64 ;; esac',
+      'case " $* " in *" --no-subagents "*) ;; *) printf "missing --no-subagents\\n" >&2; exit 64 ;; esac',
+      'case " $* " in *" --disable-web-search "*) ;; *) printf "missing --disable-web-search\\n" >&2; exit 64 ;; esac',
+      'case " $* " in *" --tools "*) ;; *) printf "missing --tools\\n" >&2; exit 64 ;; esac',
+    ].join("\n"),
+  );
+  await writeFile(path.join(binDir, "grok"), fakeGrokCli, { mode: 0o700 });
   await chmod(path.join(binDir, "codex"), 0o700);
   await chmod(path.join(binDir, "claude"), 0o700);
+  await chmod(path.join(binDir, "grok"), 0o700);
 
   child = spawn(process.execPath, ["companion/server.mjs"], {
     cwd: root,
@@ -188,6 +204,11 @@ try {
   const health = await waitForHealth();
   assert(health.ok === true, "health failed", health);
   assert(Array.isArray(health.choices), "health did not include CPU choices", health);
+  assert(
+    health.choices.map((choice) => choice.name).join(",") === "codex,claude,grok",
+    "health CPU choices are incomplete or out of order",
+    health,
+  );
 
   const save = await request("/settings", {
     method: "POST",
@@ -225,6 +246,29 @@ try {
   assert(chat.ok, "chat endpoint failed", chatText);
   assert(chatText.includes("\"type\":\"text_delta\""), "chat did not stream text_delta", chatText);
   assert(chatText.includes("claude fake reply"), "chat did not call configured fake Claude CLI", chatText);
+
+  const switchToGrok = await request("/cpu", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ cpu: "grok" }),
+  });
+  const grokStatus = await switchToGrok.json();
+  assert(switchToGrok.ok && grokStatus.cpu === "grok", "CPU switch to Grok failed", grokStatus);
+  assert(grokStatus.label === "Grok", "Grok label missing", grokStatus);
+  assert(
+    grokStatus.choices.some((choice) => choice.name === "grok" && choice.current === true && choice.available === true),
+    "Grok choice was not current and available",
+    grokStatus,
+  );
+
+  const grokChat = await request("/chat", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ message: "hello from grok" }),
+  });
+  const grokChatText = await grokChat.text();
+  assert(grokChat.ok, "Grok chat endpoint failed", grokChatText);
+  assert(grokChatText.includes("grok fake reply"), "chat did not call configured fake Grok CLI", grokChatText);
 
   const historyChat = await request("/chat", {
     method: "POST",
@@ -305,6 +349,15 @@ try {
   const historyPayload = await history.json();
   assert(history.ok && Array.isArray(historyPayload.turns), "history endpoint failed", historyPayload);
   assert(historyPayload.turns.some((turn) => turn.text?.includes("TOOL_OK")), "history did not record assistant turns", historyPayload);
+  const postHistory = await request("/history?limit=1", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  assert(postHistory.status === 404, "history should be GET-only", {
+    status: postHistory.status,
+    text: await postHistory.text(),
+  });
 
   const attention = await request("/attention", {
     method: "POST",

@@ -41,9 +41,38 @@ const CHAT_TOOL_ACTIONS = new Set(
     .filter(Boolean),
 );
 
-const CPU_LABELS = {
-  codex: "Codex",
-  claude: "Claude Code",
+const DEFAULT_CPU = "codex";
+const CPU_SPECS = {
+  codex: {
+    label: "Codex",
+    shortLabel: "Codex",
+    executable: () => process.env.BABATA_CODEX_CLI_PATH || process.env.CODEX_CLI_PATH || "codex",
+    args: (prompt) => ["exec", "--ask-for-approval", "never", "--sandbox", "read-only", "--cd", process.cwd(), prompt],
+  },
+  claude: {
+    label: "Claude Code",
+    shortLabel: "CC",
+    executable: () => process.env.CLAUDE_CLI_PATH || process.env.BABATA_CLAUDE_CLI_PATH || "claude",
+    args: (prompt) => ["-p", "--output-format", "text", "--permission-mode", "dontAsk", "--no-session-persistence", prompt],
+  },
+  grok: {
+    label: "Grok",
+    shortLabel: "Grok",
+    executable: () => process.env.BABATA_GROK_CLI_PATH || process.env.GROK_CLI_PATH || "grok",
+    args: (prompt) => [
+      "--output-format", "plain",
+      "--permission-mode", "dontAsk",
+      "--sandbox", "read-only",
+      "--no-memory",
+      "--no-subagents",
+      "--disable-web-search",
+      "--no-plan",
+      "--verbatim",
+      "--cwd", process.cwd(),
+      "--tools", "",
+      "--single", prompt,
+    ],
+  },
 };
 
 const wsClients = new Set();
@@ -52,7 +81,7 @@ const serverHistory = [];
 
 function emptyConfig() {
   return {
-    cpu: "codex",
+    cpu: DEFAULT_CPU,
     translation_provider: {
       base_url: DEFAULT_PROVIDER_BASE_URL,
       api_key: "",
@@ -84,7 +113,7 @@ function normalizeConfig(raw) {
   const provider = item.translation_provider && typeof item.translation_provider === "object"
     ? item.translation_provider
     : {};
-  const cpu = item.cpu === "claude" ? "claude" : "codex";
+  const cpu = isCpu(item.cpu) ? item.cpu : DEFAULT_CPU;
   return {
     cpu,
     translation_provider: {
@@ -134,7 +163,7 @@ function safeNumber(value, fallback) {
 }
 
 function isCpu(value) {
-  return value === "codex" || value === "claude";
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(CPU_SPECS, value);
 }
 
 function appendHistory(...turns) {
@@ -224,8 +253,13 @@ async function commandExists(command) {
     return accessExecutable(command);
   }
   const paths = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const extensions = process.platform === "win32"
+    ? ["", ...(process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";")]
+    : [""];
   for (const dir of paths) {
-    if (await accessExecutable(path.join(dir, command))) return true;
+    for (const ext of extensions) {
+      if (await accessExecutable(path.join(dir, `${command}${ext}`))) return true;
+    }
   }
   return false;
 }
@@ -240,16 +274,16 @@ async function accessExecutable(file) {
 }
 
 function cpuExecutable(cpu) {
-  if (cpu === "codex") return process.env.BABATA_CODEX_CLI_PATH || process.env.CODEX_CLI_PATH || "codex";
-  return process.env.CLAUDE_CLI_PATH || process.env.BABATA_CLAUDE_CLI_PATH || "claude";
+  return CPU_SPECS[cpu].executable();
 }
 
 async function cpuChoices(current) {
   const choices = [];
-  for (const name of ["codex", "claude"]) {
+  for (const name of Object.keys(CPU_SPECS)) {
     choices.push({
       name,
-      label: CPU_LABELS[name],
+      label: CPU_SPECS[name].label,
+      short_label: CPU_SPECS[name].shortLabel,
       current: current === name,
       available: await commandExists(cpuExecutable(name)),
     });
@@ -266,7 +300,7 @@ async function healthPayload(config) {
     ws_clients: wsClients.size,
     config_path: CONFIG_PATH,
     cpu: normalized.cpu,
-    label: CPU_LABELS[normalized.cpu],
+    label: CPU_SPECS[normalized.cpu].label,
     choices: await cpuChoices(normalized.cpu),
     translation_provider: publicConfig(normalized).translation_provider,
   };
@@ -587,21 +621,15 @@ function chatPrompt(envelope, toolResults = [], allowTools = true) {
 }
 
 function cpuArgs(cpu, prompt) {
-  if (cpu === "claude") {
-    return {
-      command: cpuExecutable("claude"),
-      args: ["-p", "--output-format", "text", "--permission-mode", "dontAsk", "--no-session-persistence", prompt],
-    };
-  }
   return {
-    command: cpuExecutable("codex"),
-    args: ["exec", "--ask-for-approval", "never", "--sandbox", "read-only", "--cd", process.cwd(), prompt],
+    command: cpuExecutable(cpu),
+    args: CPU_SPECS[cpu].args(prompt),
   };
 }
 
 async function runCpu(cpu, prompt) {
   const { command, args } = cpuArgs(cpu, prompt);
-  if (!(await commandExists(command))) throw httpError(503, `${CPU_LABELS[cpu]} command not found: ${command}`);
+  if (!(await commandExists(command))) throw httpError(503, `${CPU_SPECS[cpu].label} command not found: ${command}`);
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: process.cwd(),
@@ -612,7 +640,7 @@ async function runCpu(cpu, prompt) {
     let stderr = "";
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
-      reject(httpError(504, `${CPU_LABELS[cpu]} timed out`));
+      reject(httpError(504, `${CPU_SPECS[cpu].label} timed out`));
     }, CHAT_TIMEOUT_MS);
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
@@ -629,7 +657,7 @@ async function runCpu(cpu, prompt) {
       if (code === 0) {
         resolve(stdout.trim() || stderr.trim());
       } else {
-        reject(httpError(502, `${CPU_LABELS[cpu]} exited ${code}: ${(stderr || stdout).trim()}`));
+        reject(httpError(502, `${CPU_SPECS[cpu].label} exited ${code}: ${(stderr || stdout).trim()}`));
       }
     });
   });
@@ -993,8 +1021,7 @@ async function route(req, res) {
     await handleChat(config, await readJson(req), res);
     return;
   }
-  if ((req.method === "GET" || req.method === "POST") && url.pathname === "/history") {
-    if (req.method === "POST") await readJson(req);
+  if (req.method === "GET" && url.pathname === "/history") {
     json(res, 200, historyPayload(url));
     return;
   }
