@@ -1,31 +1,23 @@
 /// <reference types="chrome" />
+import {
+  STORAGE_TRANSLATION_MODE, STORAGE_ALWAYS_TRANSLATE_HOSTS, STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
+  effectiveTranslationModeForHost,
+} from "../translation-settings";
+
+import { parseCaptionBody, type CaptionCue } from "./youtube-captions";
 
 const BBT_YT_CAPTION_MESSAGE = "babata.youtube_caption_response";
 const TARGET_LANG = "zh";
-const MAX_CUES = 5000;
 const TRANSLATE_BATCH_SIZE = 24;
 const TRANSLATE_WINDOW_BEFORE = 4;
 const TRANSLATE_WINDOW_AFTER = 24;
 const TRANSLATE_WINDOW_THROTTLE_MS = 900;
+const TRANSLATE_MAX_ATTEMPTS = 4;
+const TRANSLATE_RETRY_BASE_MS = 1500;
+const TRANSLATE_MAX_CONCURRENT = 2;
 const OVERLAY_ID = "bbt-youtube-subtitle-overlay";
 const STYLE_ID = "bbt-youtube-subtitle-style";
 const PLAYER_ACTIVE_CLASS = "bbt-youtube-subtitle-active";
-
-interface CaptionCue {
-  startMs: number;
-  endMs: number;
-  text: string;
-}
-
-interface YoutubeTimedTextEvent {
-  tStartMs?: number;
-  dDurationMs?: number;
-  segs?: Array<{ utf8?: string }>;
-}
-
-interface YoutubeTimedTextResponse {
-  events?: YoutubeTimedTextEvent[];
-}
 
 function normalizeForHash(text: string): string {
   return text
@@ -51,97 +43,25 @@ function hashText(text: string, target: string): string {
   );
 }
 
-function cleanCaptionLine(text: string): string {
-  return text
-    .replace(/<[^>]+>/g, "")
-    .replace(/&gt;/gi, ">")
-    .replace(/^\s*(?:>{2,}|›{2,}|»+)\s*/u, "")
-    .trim();
-}
-
-function cleanCaptionText(text: string): string {
-  return text
-    .split(/\r?\n/)
-    .map((line) => cleanCaptionLine(line))
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function cueText(event: YoutubeTimedTextEvent): string {
-  return cleanCaptionText((event.segs || [])
-    .map((seg) => seg.utf8 || "")
-    .join(""));
-}
-
-function parseJson3(body: string): CaptionCue[] {
-  let parsed: YoutubeTimedTextResponse;
-  try {
-    parsed = JSON.parse(body) as YoutubeTimedTextResponse;
-  } catch {
-    return [];
-  }
-  const cues: CaptionCue[] = [];
-  for (const event of parsed.events || []) {
-    const text = cueText(event);
-    if (!text) continue;
-    const startMs = event.tStartMs ?? 0;
-    const duration = event.dDurationMs ?? 1800;
-    cues.push({ startMs, endMs: startMs + duration, text });
-    if (cues.length >= MAX_CUES) break;
-  }
-  return cues;
-}
-
-function parseTimestamp(raw: string): number | null {
-  const parts = raw.trim().split(":");
-  if (parts.length < 2 || parts.length > 3) return null;
-  const secPart = parts.pop() || "0";
-  const seconds = Number(secPart.replace(",", "."));
-  const minutes = Number(parts.pop() || "0");
-  const hours = Number(parts.pop() || "0");
-  if (!Number.isFinite(seconds) || !Number.isFinite(minutes) || !Number.isFinite(hours)) return null;
-  return ((hours * 3600) + (minutes * 60) + seconds) * 1000;
-}
-
-function parseVtt(body: string): CaptionCue[] {
-  const cues: CaptionCue[] = [];
-  const blocks = body.replace(/\r/g, "").split(/\n\n+/);
-  for (const block of blocks) {
-    const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
-    const timeIndex = lines.findIndex((line) => line.includes("-->"));
-    if (timeIndex < 0) continue;
-    const [startRaw, endRaw] = lines[timeIndex].split("-->").map((part) => part.trim().split(/\s+/)[0]);
-    const startMs = parseTimestamp(startRaw);
-    const endMs = parseTimestamp(endRaw);
-    if (startMs === null || endMs === null || endMs <= startMs) continue;
-    const text = cleanCaptionText(lines.slice(timeIndex + 1).join("\n"));
-    if (!text) continue;
-    cues.push({ startMs, endMs, text });
-    if (cues.length >= MAX_CUES) break;
-  }
-  return cues;
-}
-
-function parseCaptionBody(body: string): CaptionCue[] {
-  const trimmed = body.trim();
-  if (!trimmed) return [];
-  if (trimmed.startsWith("{")) return parseJson3(trimmed);
-  if (/^WEBVTT\b/.test(trimmed)) return parseVtt(trimmed);
-  return [];
-}
-
 function shouldTranslateCue(text: string): boolean {
   return /[\p{L}]/u.test(text)
     && !/^[\d\s:.,，.%％+\-–—/()（）[\]万亿千百十kKmMbB]+$/u.test(text);
 }
 
-async function translateCues(cues: CaptionCue[]): Promise<Map<string, string>> {
+async function translateCues(cues: CaptionCue[], sequence: number): Promise<Map<string, string>> {
   const out = new Map<string, string>();
-  for (let i = 0; i < cues.length; i += TRANSLATE_BATCH_SIZE) {
-    const chunk = cues.slice(i, i + TRANSLATE_BATCH_SIZE)
-      .filter((cue) => shouldTranslateCue(cue.text));
+  for (let i = 0; i < cues.length;) {
+    if (!subtitlesEnabled || sequence !== processingSeq) break;
+    const chunk: CaptionCue[] = [];
+    let chars = 0;
+    while (i < cues.length && chunk.length < TRANSLATE_BATCH_SIZE) {
+      const cue = cues[i];
+      if (chunk.length && chars + cue.text.length > 12_000) break;
+      i += 1;
+      if (!shouldTranslateCue(cue.text)) continue;
+      chunk.push(cue);
+      chars += cue.text.length;
+    }
     if (chunk.length === 0) continue;
     const batch = chunk.map((cue) => {
       const normalized = normalizeForHash(cue.text);
@@ -163,8 +83,11 @@ async function translateCues(cues: CaptionCue[]): Promise<Map<string, string>> {
       continue;
     }
     if (!resp?.ok || !Array.isArray(resp.results)) continue;
+    const expectedHashes = new Set(batch.map((item) => item.hash));
     for (const result of resp.results) {
-      if (result.hash && result.translated) out.set(result.hash, result.translated.trim());
+      if (result && expectedHashes.has(result.hash) && typeof result.translated === "string" && result.translated.trim()) {
+        out.set(result.hash, result.translated.trim());
+      }
     }
   }
   return out;
@@ -252,10 +175,22 @@ let overlayPlayer: HTMLElement | null = null;
 let activeCaptionCues: CaptionCue[] = [];
 let activeTranslations = new Map<string, string>();
 let inFlightTranslationHashes = new Set<string>();
+let translationRetries = new Map<string, { attempts: number; nextAt: number }>();
+let activeTranslationWindows = 0;
 let currentOverlayKey = "";
 let renderFrame = 0;
 let lastTranslationWindowKey = "";
 let lastTranslationWindowAt = 0;
+let subtitlesEnabled = false;
+let pageSuspended = false;
+let navigating = false;
+let videoKey = currentVideoKey();
+let settingsSequence = 0;
+
+function currentVideoKey(): string {
+  const url = new URL(location.href);
+  return url.searchParams.get("v") || url.pathname;
+}
 
 function cueHash(cue: CaptionCue): string {
   return hashText(normalizeForHash(cue.text), TARGET_LANG);
@@ -323,7 +258,8 @@ function hideOverlay() {
 }
 
 function scheduleCueWindowTranslation(centerIndex: number) {
-  if (centerIndex < 0 || activeCaptionCues.length === 0) return;
+  if (!subtitlesEnabled || pageSuspended || centerIndex < 0 || activeCaptionCues.length === 0) return;
+  if (activeTranslationWindows >= TRANSLATE_MAX_CONCURRENT) return;
   const start = Math.max(0, centerIndex - TRANSLATE_WINDOW_BEFORE);
   const end = Math.min(activeCaptionCues.length, centerIndex + TRANSLATE_WINDOW_AFTER);
   const now = Date.now();
@@ -340,18 +276,32 @@ function scheduleCueWindowTranslation(centerIndex: number) {
     if (!shouldTranslateCue(cue.text)) continue;
     const hash = cueHash(cue);
     if (activeTranslations.has(hash) || inFlightTranslationHashes.has(hash)) continue;
+    const retry = translationRetries.get(hash);
+    if (retry && (retry.attempts >= TRANSLATE_MAX_ATTEMPTS || retry.nextAt > now)) continue;
     inFlightTranslationHashes.add(hash);
     missing.push(cue);
   }
   if (missing.length === 0) return;
   const seq = processingSeq;
+  activeTranslationWindows += 1;
   void translateCueWindow(missing, seq);
 }
 
 async function translateCueWindow(cues: CaptionCue[], seq: number) {
-  const translations = await translateCues(cues);
+  const translations = await translateCues(cues, seq);
+  if (seq !== processingSeq) return;
+  activeTranslationWindows -= 1;
   for (const cue of cues) {
-    inFlightTranslationHashes.delete(cueHash(cue));
+    const hash = cueHash(cue);
+    inFlightTranslationHashes.delete(hash);
+    if (translations.has(hash)) translationRetries.delete(hash);
+    else {
+      const attempts = (translationRetries.get(hash)?.attempts ?? 0) + 1;
+      translationRetries.set(hash, {
+        attempts,
+        nextAt: Date.now() + TRANSLATE_RETRY_BASE_MS * 2 ** (attempts - 1),
+      });
+    }
   }
   if (seq !== processingSeq || translations.size === 0) return;
   for (const [hash, translated] of translations) {
@@ -360,6 +310,9 @@ async function translateCueWindow(cues: CaptionCue[], seq: number) {
 }
 
 function renderSubtitleOverlay() {
+  renderFrame = 0;
+  if (!subtitlesEnabled || pageSuspended || activeCaptionCues.length === 0) { hideOverlay(); return; }
+  if (currentVideoKey() !== videoKey) { resetCaptions(); return; }
   const video = activeVideo();
   if (!video || activeCaptionCues.length === 0) {
     hideOverlay();
@@ -394,6 +347,8 @@ function installSubtitleOverlay(cues: CaptionCue[]) {
   activeCaptionCues = cues;
   activeTranslations = new Map();
   inFlightTranslationHashes = new Set();
+  translationRetries.clear();
+  activeTranslationWindows = 0;
   currentOverlayKey = "";
   lastTranslationWindowKey = "";
   lastTranslationWindowAt = 0;
@@ -408,18 +363,28 @@ function installSubtitleOverlay(cues: CaptionCue[]) {
   renderFrame = requestAnimationFrame(renderSubtitleOverlay);
 }
 
-const processedUrls = new Set<string>();
+const processedUrls = new Map<string, string>();
 let processingSeq = 0;
 
 async function processCaptionResponse(url: string, body: string) {
-  if (processedUrls.has(url)) return;
-  processedUrls.add(url);
-  if (processedUrls.size > 20) {
-    const first = processedUrls.values().next().value as string | undefined;
-    if (first) processedUrls.delete(first);
-  }
+  if (navigating || pageSuspended || body.length > 2_000_000) return;
+  let requestedVideo: string | null;
+  try {
+    const caption = new URL(url, location.href);
+    if (!caption.pathname.endsWith("/api/timedtext")) return;
+    requestedVideo = caption.searchParams.get("v");
+  } catch { return; }
+  if (currentVideoKey() !== videoKey) resetCaptions();
+  if (requestedVideo && requestedVideo !== currentVideoKey()) return;
+  const bodyHash = hashText(body, "caption");
+  if (processedUrls.get(url) === bodyHash) return;
   const cues = parseCaptionBody(body);
   if (cues.length === 0) return;
+  processedUrls.set(url, bodyHash);
+  if (processedUrls.size > 20) {
+    const first = processedUrls.keys().next().value as string | undefined;
+    if (first) processedUrls.delete(first);
+  }
   ++processingSeq;
   installSubtitleOverlay(cues);
 }
@@ -433,9 +398,63 @@ window.addEventListener("message", (event) => {
     response?: string;
   };
   if (data?.source !== "babata-youtube-subtitles-main") return;
+  if (data.type === "babata.youtube_caption_ready") { requestLastCaption(); return; }
   if (data.type !== BBT_YT_CAPTION_MESSAGE) return;
-  if (!data.url || !data.response) return;
+  if (typeof data.url !== "string" || typeof data.response !== "string") return;
   void processCaptionResponse(data.url, data.response);
 });
+
+function requestLastCaption() {
+  window.postMessage({ source: "babata-youtube-subtitles", type: "babata.youtube_caption_request" }, "*");
+}
+requestLastCaption();
+
+function resetCaptions() {
+  processingSeq += 1;
+  videoKey = currentVideoKey();
+  activeCaptionCues = [];
+  activeTranslations.clear();
+  inFlightTranslationHashes.clear();
+  translationRetries.clear();
+  activeTranslationWindows = 0;
+  processedUrls.clear();
+  if (renderFrame) cancelAnimationFrame(renderFrame);
+  renderFrame = 0;
+  hideOverlay();
+}
+
+async function refreshEnabled() {
+  const sequence = ++settingsSequence;
+  try {
+    const settings = await chrome.storage.local.get([
+      STORAGE_TRANSLATION_MODE, STORAGE_ALWAYS_TRANSLATE_HOSTS, STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
+    ]);
+    if (sequence !== settingsSequence) return;
+    const wasEnabled = subtitlesEnabled;
+    subtitlesEnabled = effectiveTranslationModeForHost(
+      settings[STORAGE_TRANSLATION_MODE], settings[STORAGE_ALWAYS_TRANSLATE_HOSTS], location.hostname,
+      settings[STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS],
+    ) !== "off";
+    if (!subtitlesEnabled) hideOverlay();
+    if (subtitlesEnabled && !wasEnabled) translationRetries.clear();
+    if (!renderFrame && subtitlesEnabled && !pageSuspended && activeCaptionCues.length) {
+      renderFrame = requestAnimationFrame(renderSubtitleOverlay);
+    }
+  } catch {
+    if (sequence === settingsSequence) { subtitlesEnabled = false; hideOverlay(); }
+  }
+}
+
+document.addEventListener("yt-navigate-start", () => { navigating = true; resetCaptions(); });
+document.addEventListener("yt-navigate-finish", () => {
+  navigating = false;
+  if (videoKey !== currentVideoKey()) resetCaptions();
+  requestLastCaption();
+});
+window.addEventListener("popstate", () => resetCaptions());
+window.addEventListener("pagehide", () => { pageSuspended = true; resetCaptions(); });
+window.addEventListener("pageshow", () => { pageSuspended = false; requestLastCaption(); void refreshEnabled(); });
+chrome.storage.onChanged.addListener((_changes, area) => { if (area === "local") void refreshEnabled(); });
+void refreshEnabled();
 
 export {};

@@ -33,27 +33,45 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://*.youtube.com/*", "*://*.youtube-nocookie.com/*"],
-      "js": ["src/content/youtube-subtitles.ts"],
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://*.youtube-nocookie.com/*"
+      ],
+      "js": [
+        "src/content/youtube-subtitles.ts"
+      ],
       "run_at": "document_start",
       "all_frames": false
     },
     {
-      "matches": ["*://*.youtube.com/*", "*://*.youtube-nocookie.com/*"],
-      "js": ["src/content/youtube-subtitles-main.ts"],
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://*.youtube-nocookie.com/*"
+      ],
+      "js": [
+        "src/content/youtube-subtitles-main.ts"
+      ],
       "run_at": "document_start",
       "all_frames": false,
       "world": "MAIN"
     },
     {
-      "matches": ["<all_urls>"],
-      "js": ["src/content/babata-widget.ts"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "src/content/babata-widget.ts"
+      ],
       "run_at": "document_idle",
       "all_frames": false
     },
     {
-      "matches": ["<all_urls>"],
-      "js": ["src/content/babata-translate.ts"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "src/content/babata-translate.ts"
+      ],
       "run_at": "document_idle",
       "all_frames": true,
       "match_about_blank": true
@@ -65,7 +83,9 @@
         "src/sidepanel.html",
         "assets/*"
       ],
-      "matches": ["<all_urls>"]
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ],
   "permissions": [
@@ -75,24 +95,23 @@
     "tabGroups",
     "bookmarks",
     "history",
-    "downloads",
     "scripting",
-    "debugger",
-    "alarms",
-    "notifications",
     "offscreen",
-    "webNavigation",
     "activeTab",
-    "unlimitedStorage",
-    "contextMenus"
+    "unlimitedStorage"
   ],
-  "host_permissions": ["<all_urls>"],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*;"
   },
   "commands": {
     "open-sidebar": {
-      "suggested_key": { "default": "Alt+S", "mac": "Alt+S" },
+      "suggested_key": {
+        "default": "Alt+S",
+        "mac": "Alt+S"
+      },
       "description": "打开 babata 侧边栏"
     }
   }

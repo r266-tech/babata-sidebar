@@ -1,46 +1,12 @@
+import { connectCdp as connect, fetchJson as json, evaluateCdp as evalOn } from "./manual-smoke-cdp.mjs";
+import { smokeExtensionId } from "./manual-smoke-config.mjs";
+
 const CDP = process.env.BABATA_EDGE_CDP || "http://127.0.0.1:9222";
-const EXT_ID = process.env.BABATA_EXTENSION_ID || "giaglakcelnaklncmnhnpbmkfiffaflo";
+const EXT_ID = smokeExtensionId();
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.BABATA_ORIGIN_FALLBACK_PORT || "18791");
 const ORIGIN = `http://${HOST}:${PORT}`;
 const DEAD_ORIGIN = process.env.BABATA_ORIGIN_FALLBACK_DEAD_ORIGIN || "http://127.0.0.1:18793";
-
-let nextId = 1;
-
-async function json(url, opts) {
-  const res = await fetch(url, opts);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${url}`);
-  return res.json();
-}
-
-function connect(wsUrl) {
-  const ws = new WebSocket(wsUrl);
-  const pending = new Map();
-  ws.addEventListener("message", (event) => {
-    const msg = JSON.parse(event.data);
-    if (!msg.id || !pending.has(msg.id)) return;
-    const { resolve, reject } = pending.get(msg.id);
-    pending.delete(msg.id);
-    if (msg.error) reject(new Error(JSON.stringify(msg.error)));
-    else resolve(msg.result);
-  });
-  return new Promise((resolve, reject) => {
-    ws.addEventListener("open", () => {
-      resolve({
-        send(method, params = {}) {
-          const id = nextId++;
-          ws.send(JSON.stringify({ id, method, params }));
-          return new Promise((res, rej) => pending.set(id, { resolve: res, reject: rej }));
-        },
-        close() {
-          ws.close();
-          ws.terminate?.();
-        },
-      });
-    }, { once: true });
-    ws.addEventListener("error", reject, { once: true });
-  });
-}
 
 async function findExtensionWorker() {
   const targets = await json(`${CDP}/json/list`);
@@ -50,20 +16,6 @@ async function findExtensionWorker() {
 async function findOptionsPage() {
   const targets = await json(`${CDP}/json/list`);
   return targets.find((t) => t.type === "page" && t.url.includes(`${EXT_ID}/src/options.html`));
-}
-
-async function evalOn(target, expression, awaitPromise = false) {
-  const client = await connect(target.webSocketDebuggerUrl);
-  try {
-    return await client.send("Runtime.evaluate", {
-      expression,
-      awaitPromise,
-      returnByValue: true,
-      userGesture: true,
-    });
-  } finally {
-    client.close();
-  }
 }
 
 async function reloadExtension() {
@@ -108,7 +60,7 @@ async function setStorage(worker, values) {
 
 async function restoreStorage(values) {
   const worker = await findExtensionWorker();
-  if (!worker) return;
+  if (!worker) throw new Error("extension service worker missing; smoke settings could not be restored");
   const restore = {};
   const remove = [];
   for (const [key, value] of Object.entries(values)) {
@@ -175,7 +127,7 @@ function writeJson(req, res, body, status = 200) {
   res.writeHead(status, {
     "access-control-allow-origin": req.headers.origin || "*",
     "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type,authorization",
+    "access-control-allow-headers": "content-type,authorization,x-babata-client-id,x-babata-extension-origin",
     "content-type": "application/json; charset=utf-8",
   });
   res.end(`${JSON.stringify(body)}\n`);
@@ -229,9 +181,11 @@ async function runProbe() {
   let optionsPage = null;
   let createdOptionsPage = false;
   let previous = {};
+  let restoreRequired = false;
   try {
     const worker = await reloadExtension();
     previous = await readStorage(worker, ["babata.server_origin"]);
+    restoreRequired = true;
     await setStorage(worker, { "babata.server_origin": DEAD_ORIGIN });
 
     optionsPage = await findOptionsPage();
@@ -258,16 +212,19 @@ async function runProbe() {
       page,
     }, null, 2));
   } finally {
-    await restoreStorage({ "babata.server_origin": previous["babata.server_origin"] });
-    if (createdOptionsPage && optionsPage?.id) {
-      try {
-        await json(`${CDP}/json/close/${optionsPage.id}`);
-      } catch {
-        // ignore close races
+    try {
+      if (restoreRequired) await restoreStorage({ "babata.server_origin": previous["babata.server_origin"] });
+    } finally {
+      if (createdOptionsPage && optionsPage?.id) {
+        try {
+          await json(`${CDP}/json/close/${optionsPage.id}`);
+        } catch {
+          // ignore close races
+        }
       }
+      server?.closeAllConnections?.();
+      if (server) await new Promise((resolve) => server.close(resolve));
     }
-    server?.closeAllConnections?.();
-    if (server) await new Promise((resolve) => server.close(resolve));
   }
 }
 

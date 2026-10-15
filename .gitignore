@@ -20,6 +20,8 @@ node_modules/
 # Local development
 .local/
 *.log
+test-results/
+playwright-report/
 
 # Reference repos (symlinks to ~/code/translate-references/*)
 scratch/

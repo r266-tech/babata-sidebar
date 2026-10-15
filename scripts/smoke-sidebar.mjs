@@ -1,6 +1,8 @@
+import { smokeExtensionId } from "./manual-smoke-config.mjs";
+
 const CDP = process.env.BABATA_EDGE_CDP || "http://127.0.0.1:9222";
 const SERVER = process.env.BABATA_SIDEBAR_SERVER_ORIGIN || "http://127.0.0.1:18791";
-const EXT_ID = process.env.BABATA_EXTENSION_ID || "giaglakcelnaklncmnhnpbmkfiffaflo";
+const EXT_ID = smokeExtensionId();
 const EXT_ORIGIN = `chrome-extension://${EXT_ID}`;
 const BAD_ORIGIN = "https://not-babata.invalid";
 const TIMEOUT_MS = Number(process.env.BABATA_SMOKE_TIMEOUT_MS || "4000");

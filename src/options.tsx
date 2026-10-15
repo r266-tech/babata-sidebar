@@ -3,8 +3,10 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import type { TranslationModelOption, TranslationProviderSettings } from "./runtime-config";
 import {
   DEFAULT_SERVER_ORIGIN,
+  companionHeaders,
   getServerOrigin,
   normalizeServerOrigin,
+  parseServerOrigin,
   resolveReachableServerOrigin,
   serverUrlFromOrigin,
   setServerOrigin as persistServerOrigin,
@@ -45,6 +47,11 @@ async function readJson(resp: Response): Promise<Record<string, unknown>> {
   return data && typeof data === "object" ? data as Record<string, unknown> : {};
 }
 
+async function fetchCompanion(origin: string, path: string, init?: RequestInit): Promise<Response> {
+  const headers = await companionHeaders(init?.headers);
+  return fetch(serverUrlFromOrigin(origin, path), { ...init, headers });
+}
+
 function App() {
   const [serverInput, setServerInput] = useState(DEFAULT_SERVER_ORIGIN);
   const [serverOrigin, setServerOrigin] = useState(DEFAULT_SERVER_ORIGIN);
@@ -56,37 +63,39 @@ function App() {
   const [models, setModels] = useState<TranslationModelOption[]>([]);
   const [modelInput, setModelInput] = useState("");
   const [providerStatus, setProviderStatus] = useState("未检测");
-  const [busy, setBusy] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>("server");
+  const [providerOrigin, setProviderOrigin] = useState<string | null>(null);
   const checkServerSeq = useRef(0);
 
   const currentServerUrl = useMemo(() => normalizeServerOrigin(serverInput), [serverInput]);
 
   async function serverRequest(path: string, init?: RequestInit): Promise<Response> {
-    const reachable = await resolveReachableServerOrigin(currentServerUrl);
-    if (reachable !== currentServerUrl) {
-      setServerInput(reachable);
-      setServerOrigin(reachable);
-    }
-    return fetch(serverUrlFromOrigin(reachable, path), init);
+    if (!parseServerOrigin(serverInput)) throw new Error("仅支持 HTTP localhost 或 127.0.0.1 地址，不含路径和登录信息");
+    if (providerOrigin !== currentServerUrl) throw new Error("请先检测 Companion 地址，再配置翻译服务");
+    return fetchCompanion(currentServerUrl, path, { ...init, signal: AbortSignal.timeout(90_000) });
   }
 
-  async function loadServerSettings(origin = currentServerUrl) {
-    const resp = await fetch(serverUrlFromOrigin(origin, "/settings"));
+  async function loadServerSettings(origin = currentServerUrl, seq = checkServerSeq.current) {
+    const resp = await fetchCompanion(origin, "/settings", { signal: AbortSignal.timeout(5000) });
     const data = await readJson(resp);
     if (!resp.ok || data.ok !== true) throw new Error(textField(data, "error") || `HTTP ${resp.status}`);
+    if (seq !== checkServerSeq.current) return;
     const nextProvider = normalizeProvider(data.translation_provider);
+    setProviderOrigin(origin);
     setProvider(nextProvider);
     setApiKey(nextProvider.api_key || "");
     setModelInput(nextProvider.model);
     setProviderStatus(nextProvider.api_key_set ? "已保存 API key" : "未配置 API key");
   }
 
-  async function checkServer(origin = currentServerUrl) {
+  async function checkServer(origin = serverInput) {
     const seq = checkServerSeq.current + 1;
     checkServerSeq.current = seq;
+    setProviderOrigin(null);
     setBusy("server");
     setServerStatus("检测中...");
     try {
+      if (!parseServerOrigin(origin)) throw new Error("仅支持 HTTP localhost 或 127.0.0.1 地址，不含路径和登录信息");
       const normalized = normalizeServerOrigin(origin);
       const reachable = await resolveReachableServerOrigin(normalized);
       if (seq !== checkServerSeq.current) return;
@@ -94,13 +103,13 @@ function App() {
         setServerInput(reachable);
         setServerOrigin(reachable);
       }
-      const resp = await fetch(serverUrlFromOrigin(reachable, "/health"));
+      const resp = await fetch(serverUrlFromOrigin(reachable, "/health"), { signal: AbortSignal.timeout(5000) });
       const data = await readJson(resp);
       if (!resp.ok || data.ok !== true) throw new Error(textField(data, "error") || `HTTP ${resp.status}`);
       if (seq !== checkServerSeq.current) return;
       setServerHealth(data as ServerHealth);
       setServerStatus(reachable === normalized ? "已连接" : "已连接，已自动切回默认端口");
-      await loadServerSettings(reachable);
+      await loadServerSettings(reachable, seq);
     } catch (e) {
       if (seq !== checkServerSeq.current) return;
       setServerHealth(null);
@@ -116,16 +125,26 @@ function App() {
       setServerInput(origin);
       setServerOrigin(origin);
       await checkServer(origin);
-    })();
+    })().catch((error) => {
+      setServerStatus((error as Error).message || String(error));
+      setBusy(null);
+    });
   }, []);
 
   async function saveServer() {
+    if (!parseServerOrigin(serverInput)) {
+      setServerStatus("仅支持 HTTP localhost 或 127.0.0.1 地址，不含路径和登录信息");
+      return;
+    }
     setBusy("server");
-    const normalized = await persistServerOrigin(serverInput);
-    setServerInput(normalized);
-    setServerOrigin(normalized);
-    setBusy(null);
-    await checkServer(normalized);
+    try {
+      const normalized = await persistServerOrigin(serverInput);
+      setServerInput(normalized);
+      setServerOrigin(normalized);
+      await checkServer(normalized);
+    } catch (error) {
+      setServerStatus((error as Error).message);
+    } finally { setBusy(null); }
   }
 
   function providerPayload(includeKey: boolean) {
@@ -204,7 +223,7 @@ function App() {
       const nextProvider = normalizeProvider(data.translation_provider);
       setProvider(nextProvider);
       setModelInput(nextProvider.model);
-      setApiKey(nextProvider.api_key || apiKey);
+      setApiKey(nextProvider.api_key || "");
       setProviderStatus(`已保存并测试通过: ${translated || "ok"}`);
     } catch (e) {
       setProviderStatus((e as Error).message || String(e));
@@ -216,7 +235,7 @@ function App() {
   return (
     <main>
       <header>
-        <img src="icons/babata-48.png" alt="" />
+        <img src="/icons/babata-48.png" alt="" />
         <div>
           <h1>babata settings</h1>
           <p>Configure the local companion and translation provider.</p>
@@ -231,14 +250,21 @@ function App() {
         <label>
           <span>Server URL</span>
           <input
+            disabled={busy !== null}
             value={serverInput}
-            onInput={(e) => setServerInput((e.currentTarget as HTMLInputElement).value)}
+            onInput={(e) => {
+              setServerInput((e.currentTarget as HTMLInputElement).value);
+              setProviderOrigin(null);
+              setApiKey("");
+              setModels([]);
+              setProviderStatus("请先检测新的 Companion 地址");
+            }}
             placeholder="http://127.0.0.1:18791"
           />
         </label>
         <div class="row">
-          <button onClick={saveServer} disabled={busy === "server"}>Save & Detect</button>
-          <button onClick={() => checkServer()} disabled={busy === "server"}>Detect</button>
+          <button onClick={saveServer} disabled={busy !== null}>Save & Detect</button>
+          <button onClick={() => checkServer()} disabled={busy !== null}>Detect</button>
         </div>
         <p class="meta">
           Active: {serverOrigin}. CPU: {serverHealth?.label || serverHealth?.cpu || "unknown"}.
@@ -255,8 +281,16 @@ function App() {
         <label>
           <span>Base URL</span>
           <input
+            disabled={busy !== null}
             value={provider.base_url}
-            onInput={(e) => setProvider({ ...provider, base_url: (e.currentTarget as HTMLInputElement).value })}
+            onInput={(e) => {
+              setProvider({ ...provider, base_url: (e.currentTarget as HTMLInputElement).value, api_key: undefined, api_key_set: false });
+              // A stored key belongs to its existing endpoint. Editing the
+              // destination must never implicitly send it to a different host.
+              setApiKey("");
+              setModels([]);
+              setProviderStatus("地址已更改，请按需填写对应的 API key");
+            }}
             placeholder="https://openrouter.ai/api/v1"
           />
         </label>
@@ -264,6 +298,8 @@ function App() {
           <span>API key</span>
           <div class="secret-row">
             <input
+              aria-label="API key"
+              disabled={busy !== null}
               type={showApiKey ? "text" : "password"}
               value={apiKey}
               onInput={(e) => setApiKey((e.currentTarget as HTMLInputElement).value)}
@@ -281,6 +317,7 @@ function App() {
         <label>
           <span>Model</span>
           <input
+            disabled={busy !== null}
             list="models"
             value={modelInput}
             onInput={(e) => setModelInput((e.currentTarget as HTMLInputElement).value)}
@@ -295,9 +332,9 @@ function App() {
           </datalist>
         </label>
         <div class="row">
-          <button onClick={fetchModels} disabled={busy !== null}>Fetch Models</button>
-          <button onClick={testProvider} disabled={busy !== null || !modelInput.trim()}>Test</button>
-          <button class="primary" onClick={saveProvider} disabled={busy !== null || !modelInput.trim()}>
+          <button onClick={fetchModels} disabled={busy !== null || providerOrigin !== currentServerUrl}>Fetch Models</button>
+          <button onClick={testProvider} disabled={busy !== null || providerOrigin !== currentServerUrl || !modelInput.trim()}>Test</button>
+          <button class="primary" onClick={saveProvider} disabled={busy !== null || providerOrigin !== currentServerUrl || !modelInput.trim()}>
             Save Provider
           </button>
         </div>

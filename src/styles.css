@@ -1,6 +1,5 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss" source("./");
+@config "../tailwind.config.js";
 
 /* Warm neutral theme. CSS variables keep future light/dark changes local. */
 :root {

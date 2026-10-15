@@ -1,4 +1,5 @@
 const BBT_YT_CAPTION_MESSAGE = "babata.youtube_caption_response";
+let lastCaption: { url: string; response: string } | undefined;
 
 function captionUrl(input: RequestInfo | URL): string {
   if (typeof input === "string") return input;
@@ -8,13 +9,13 @@ function captionUrl(input: RequestInfo | URL): string {
 
 function isYoutubeCaptionUrl(url: string): boolean {
   if (!url) return false;
-  return /\/api\/timedtext\b/.test(url)
-    || /[?&]fmt=json3\b/.test(url)
-    || /[?&]kind=asr\b/.test(url);
+  try { return new URL(url, location.href).pathname === "/api/timedtext"; }
+  catch { return false; }
 }
 
 function postCaptionResponse(url: string, response: string) {
   if (!response || response.length > 2_000_000) return;
+  lastCaption = { url, response };
   window.postMessage({
     source: "babata-youtube-subtitles-main",
     type: BBT_YT_CAPTION_MESSAGE,
@@ -22,6 +23,15 @@ function postCaptionResponse(url: string, response: string) {
     response,
   }, "*");
 }
+
+// The isolated-world bundle may finish loading after the first caption fetch.
+window.addEventListener("message", (event) => {
+  if (event.source !== window || event.data?.source !== "babata-youtube-subtitles") return;
+  if (event.data.type === "babata.youtube_caption_request" && lastCaption) {
+    postCaptionResponse(lastCaption.url, lastCaption.response);
+  }
+});
+window.postMessage({ source: "babata-youtube-subtitles-main", type: "babata.youtube_caption_ready" }, "*");
 
 const xhrUrls = new WeakMap<XMLHttpRequest, string>();
 const originalOpen = XMLHttpRequest.prototype.open;
@@ -36,6 +46,7 @@ XMLHttpRequest.prototype.open = function open(
 ) {
   const rawUrl = typeof url === "string" ? url : url.href;
   if (isYoutubeCaptionUrl(rawUrl)) xhrUrls.set(this, rawUrl);
+  else xhrUrls.delete(this);
   return Reflect.apply(originalOpen, this, [method, url, async, username, password]) as void;
 };
 
@@ -43,6 +54,7 @@ XMLHttpRequest.prototype.send = function send(body?: XMLHttpRequestBodyInit | nu
   const url = xhrUrls.get(this);
   if (url) {
     this.addEventListener("load", () => {
+      if (xhrUrls.get(this) !== url) return;
       try {
         if (this.status >= 200 && this.status < 300 && typeof this.responseText === "string") {
           postCaptionResponse(url, this.responseText);
@@ -59,7 +71,7 @@ const originalFetch = window.fetch.bind(window);
 window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const response = await originalFetch(input, init);
   const url = response.url || captionUrl(input);
-  if (isYoutubeCaptionUrl(url)) {
+  if (response.ok && isYoutubeCaptionUrl(url)) {
     void response.clone().text()
       .then((body) => postCaptionResponse(url, body))
       .catch(() => {});

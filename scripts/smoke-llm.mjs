@@ -1,5 +1,7 @@
+import { smokeExtensionId } from "./manual-smoke-config.mjs";
+
 const SERVER = process.env.BABATA_SIDEBAR_SERVER_ORIGIN || "http://127.0.0.1:18791";
-const EXT_ID = process.env.BABATA_EXTENSION_ID || "giaglakcelnaklncmnhnpbmkfiffaflo";
+const EXT_ID = smokeExtensionId();
 const EXT_ORIGIN = `chrome-extension://${EXT_ID}`;
 const RUN_ID = `SMOKE_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 const HTTP_TIMEOUT_MS = Number(process.env.BABATA_LLM_SMOKE_HTTP_TIMEOUT_MS || "180000");

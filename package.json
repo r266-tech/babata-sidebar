@@ -13,11 +13,6 @@
     "url": "https://github.com/r266-tech/babata-sidebar/issues"
   },
   "homepage": "https://github.com/r266-tech/babata-sidebar#readme",
-  "overrides": {
-    "@crxjs/vite-plugin": {
-      "rollup": "2.80.0"
-    }
-  },
   "scripts": {
     "setup:local": "node scripts/setup-local.mjs",
     "companion": "node companion/server.mjs",
@@ -31,22 +26,28 @@
     "smoke:server-origin-fallback": "node scripts/smoke-server-origin-fallback.mjs",
     "smoke:translation-links": "node scripts/smoke-translation-links.mjs",
     "smoke:llm": "node scripts/smoke-llm.mjs",
-    "smoke": "npm run smoke:companion && npm run smoke:sidebar && npm run smoke:rich-card"
+    "smoke": "npm run smoke:companion && npm run test:browser",
+    "test": "node --test tests/companion.test.mjs tests/runtime-config.test.mjs tests/chat-offscreen.test.mjs tests/chat-history.test.mjs tests/content.test.mjs tests/service-worker.test.mjs tests/scripts.test.mjs",
+    "test:browser": "npm run build && node --test --test-concurrency=1 tests/browser.test.mjs tests/chat-browser.test.mjs tests/content-browser.test.mjs",
+    "check": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
-    "@types/dompurify": "^3.0.5",
-    "dompurify": "^3.4.2",
+    "cross-spawn": "^7.0.6",
+    "dompurify": "^3.4.17",
     "marked": "^18.0.3",
-    "preact": "^10.24.3"
+    "preact": "^10.24.3",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "@crxjs/vite-plugin": "^2.0.0-beta.32",
+    "@playwright/test": "^1.64.1",
     "@preact/preset-vite": "^2.10.1",
+    "@tailwindcss/postcss": "^4.3.3",
     "@types/chrome": "^0.0.287",
-    "autoprefixer": "^10.4.20",
+    "esbuild": "^0.25.12",
     "postcss": "^8.5.1",
-    "tailwindcss": "^3.4.17",
+    "tailwindcss": "^4.3.3",
     "typescript": "^5.7.2",
-    "vite": "^6.0.7"
+    "vite": "^6.4.4"
   }
 }

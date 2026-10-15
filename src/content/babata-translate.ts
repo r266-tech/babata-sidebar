@@ -21,7 +21,7 @@ import {
 //   IntersectionObserver — viewport 内段落入境触发翻译
 //   MutationObserver — SPA (推特/Notion 等) 重 mount 时, 已 hash 段重 inject 不调 LLM
 //   L1 cache (page-side Map<hash,html>) — 同 page 内重 mount 命中
-//   L2 cache (server-side sqlite) — 跨 tab/session, 24h TTL (server 端处理)
+//   Cache lifetime is limited to this document; the companion does not cache.
 //
 // Fixes the common SPA timeline failure mode: scroll down misses text, scroll
 // back up loses previously injected translations.
@@ -74,6 +74,7 @@ let alwaysTranslateDisabledHosts: string[] = [];
 const cache = new Map<string, string>();
 interface QueueItem {
   el: HTMLElement;
+  elements: Set<HTMLElement>;
   text: string;
   requestText: string;
   visible: boolean;
@@ -81,7 +82,16 @@ interface QueueItem {
 }
 const queue = new Map<string, QueueItem>();
 let flushTimer: number | null = null;
-let flushInProgress = false;
+let flushingLifecycle: number | null = null;
+let active = false;
+let lifecycle = 0;
+const CACHE_MAX = 5000;
+let injectedTranslations = new WeakMap<HTMLElement, HTMLElement>();
+
+function cacheTranslation(hash: string, translated: string) {
+  cache.set(hash, translated);
+  while (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value!);
+}
 
 const TARGET_LANG = "zh";
 // Batch enough visible text together so nearby page content translates in a
@@ -268,7 +278,9 @@ const EXCLUDE_SELECTOR = [
   '[role="button"]', '[role="menu"]', '[role="menubar"]', '[role="menuitem"]',
   '[role="option"]', '[role="tab"]', '[role="tablist"]',
   "details", "summary",
-  '[contenteditable="true"]', '[aria-hidden="true"]',
+  '[translate="no"]', ".notranslate",
+  '[data-bbt-clean-read-active="1"]',
+  '[contenteditable]:not([contenteditable="false"])', '[aria-hidden="true"]',
   ...ADDITIONAL_STAY_ORIGINAL_SELECTORS,
   ...YOUTUBE_CAPTION_EXCLUDE_SELECTORS,
   `.${TR_CLASS}`,
@@ -287,16 +299,12 @@ const VISUALLY_HIDDEN_CLASS_RE = /(?:^|\s)(?:sr-only|visually-hidden)(?:\s|$)|Vi
 // Physical leaf mark written to the DOM. A permanent WeakSet lock is brittle:
 // if new text appears inside an already-claimed subtree, collection can miss it;
 // if injected translations are removed externally, reinjection is blocked.
-const multiCache = new WeakMap<HTMLElement, boolean>();
+let multiCache = new WeakMap<HTMLElement, boolean>();
 // inline 判断缓存 — getComputedStyle 同步 reflow, 同元素重复调贵.
-const inlineCache = new WeakMap<HTMLElement, boolean>();
-const hiddenCache = new WeakMap<HTMLElement, boolean>();
+let inlineCache = new WeakMap<HTMLElement, boolean>();
+let hiddenCache = new WeakMap<HTMLElement, boolean>();
 // MO sentinel — 自己 inject 的 .bbt-tr font 加进, MO addedNodes 跳 (kiss translator.js:319,711).
 const skipMoNodes = new WeakSet<Node>();
-// SPA reconciliation debounce. After injecting the same hash, skip immediate
-// MutationObserver echoes long enough for bursty feed updates to settle.
-const recentlyInjected = new Map<string, number>();
-const INJECT_DEBOUNCE_MS = 1500;
 // Trailing stable-window scanner. A leading throttle can capture unstable text
 // from the first mutation and then suppress the later settled content. Here
 // every mutation refreshes the timestamp, and processing only happens after a
@@ -305,7 +313,7 @@ const STABLE_WINDOW_MS = 1100;
 const stableWindowMap = new Map<HTMLElement, { ts: number; src: TraceSource }>();
 let stableWindowTimer: number | null = null;
 // element in-flight 锁 — 同 element 已 enqueue 在 LLM 中, 新 mutation 不重 enqueue.
-const inFlightElements = new WeakSet<HTMLElement>();
+let inFlightElements = new WeakSet<HTMLElement>();
 // hash in-flight 锁 — 跨 element instance 同 text. X swap SPAN 时新 instance 不在
 // inFlightElements (WeakSet 是 element 级), 重新走 doProcessCandidate, cache 还没 set
 // (flush async 在 server roundtrip 中), 又 enqueue 触发并发 flush. 两次 server 调用同
@@ -406,8 +414,6 @@ function registerShadowRoot(root: ShadowRoot) {
   observeMutations(root);
 }
 
-// periodic cleanup 防 Map leak (long timeline 累积). cleanupTimer 留 handle 给 lifecycle.
-let cleanupTimer: number | null = null;
 let mo: MutationObserver | null = null;
 let observedMutationRoots = new WeakSet<ParentNode>();
 let observedShadowRoots = new Set<ShadowRoot>();
@@ -415,16 +421,6 @@ const cleanupFns: Array<() => void> = [];
 
 function registerCleanup(fn: () => void) {
   cleanupFns.push(fn);
-}
-
-function startCleanupTimer() {
-  if (cleanupTimer !== null) return;
-  cleanupTimer = window.setInterval(() => {
-    const cutoff = Date.now() - INJECT_DEBOUNCE_MS * 4;
-    for (const [h, ts] of recentlyInjected) {
-      if (ts < cutoff) recentlyInjected.delete(h);
-    }
-  }, INJECT_DEBOUNCE_MS * 8);
 }
 
 // 每 200ms 扫 stableWindowMap, 静默 1100ms+ 的 element 提升到 doProcessCandidate.
@@ -446,12 +442,10 @@ function startStableWindowTimer() {
   }, 200);
 }
 function teardownAll() {
+  active = false;
+  lifecycle += 1;
   const w = window as unknown as { __babataTranslateBooted?: boolean };
   w.__babataTranslateBooted = false;
-  if (cleanupTimer !== null) {
-    clearInterval(cleanupTimer);
-    cleanupTimer = null;
-  }
   if (stableWindowTimer !== null) {
     clearInterval(stableWindowTimer);
     stableWindowTimer = null;
@@ -481,6 +475,8 @@ function teardownAll() {
     flushTimer = null;
   }
   queue.clear();
+  flushingLifecycle = null;
+  inFlightElements = new WeakSet<HTMLElement>();
   stableWindowMap.clear();
   inFlightHashes.clear();
   visibleHashes.clear();
@@ -1189,6 +1185,7 @@ function hideSelectionPopup(popup: SelectionPopup) {
 
 async function translateSelectionText(text: string): Promise<string | null> {
   if (!selectionTranslationEnabled) return null;
+  const generation = lifecycle;
   const hash = hashText(normalizeForHash(text), TARGET_LANG);
   const cached = cache.get(hash);
   if (cached) return cached;
@@ -1201,11 +1198,13 @@ async function translateSelectionText(text: string): Promise<string | null> {
       batch: [{ hash, text }],
     }),
   )) as { ok: boolean; results?: { hash: string; translated: string }[] } | undefined;
-  const translated = resp?.ok
-    ? resp.results?.find((item) => item.hash === hash)?.translated?.trim()
-    : "";
+  if (!active || generation !== lifecycle) return null;
+  const result = resp?.ok && Array.isArray(resp.results)
+    ? resp.results.find((item) => item?.hash === hash)
+    : undefined;
+  const translated = typeof result?.translated === "string" ? result.translated.trim() : "";
   if (!translated) return null;
-  cache.set(hash, translated);
+  cacheTranslation(hash, translated);
   return translated;
 }
 
@@ -1232,7 +1231,7 @@ function setupSelectionTranslator() {
   async function showForSelection() {
     const snapshot = currentSelectionSnapshot();
     if (!snapshot) {
-      hideSelectionPopup(popup);
+      hideAndInvalidate();
       return;
     }
 
@@ -1254,7 +1253,7 @@ function setupSelectionTranslator() {
     hideSelectionPopup(popup);
   }
 
-  const onSelectionChange = () => schedule();
+  const onSelectionChange = () => { hideAndInvalidate(); schedule(); };
   const onPointerUp = (event: MouseEvent | TouchEvent) => {
     if (event instanceof MouseEvent && event.button === 2) return;
     schedule(120);
@@ -1308,6 +1307,8 @@ function setupSelectionTranslator() {
 // ── inject ────────────────────────────────────────────────────────────
 
 function clearTranslation(el: HTMLElement) {
+  injectedTranslations.get(el)?.remove();
+  injectedTranslations.delete(el);
   el.querySelectorAll(`:scope .${TR_INPLACE_CLASS}`).forEach((node) => node.remove());
   const next = el.nextElementSibling;
   if (next && next.classList.contains(TR_CLASS)) {
@@ -1329,6 +1330,7 @@ function clearAllTranslations() {
   for (const root of translationRoots()) {
     root.querySelectorAll(`.${TR_CLASS}`).forEach((node) => node.remove());
   }
+  injectedTranslations = new WeakMap<HTMLElement, HTMLElement>();
 }
 
 function isElementNearViewport(el: HTMLElement): boolean {
@@ -1757,9 +1759,10 @@ function restoreMarkedSourceLinks(template: HTMLTemplateElement, links: SourceLi
   }
 }
 
-function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
+function injectTranslation(el: HTMLElement, raw: string) {
+  if (!active || !el.isConnected) return;
   clearTranslation(el);
-  if (mode === "off" || !raw) return;
+  if (mode === "off" || !raw || isIgnoredElement(el)) return;
   // 译文等于原文 (模型决定不翻 — 专有名词 / handle / 版本号等) → 不 inject sibling,
   // Otherwise the original appears twice for names, handles, and version text.
   const original = sourceText(el);
@@ -1775,6 +1778,7 @@ function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
   if (shouldRenderInPlace(el, original)) {
     const template = markInPlaceSource(el);
     const tr = createInPlaceTranslationElement(template, safe);
+    injectedTranslations.set(el, tr);
     skipMoNodes.add(tr);
     el.setAttribute(INPLACE_ATTR, "1");
     if (template) {
@@ -1782,21 +1786,19 @@ function injectTranslation(el: HTMLElement, raw: string, hash?: string) {
     } else {
       el.appendChild(tr);
     }
-    if (hash) recentlyInjected.set(hash, Date.now());
     return;
   }
   const tr = createTranslationElement(el, safe, inlineLeaf);
+  injectedTranslations.set(el, tr);
   // MO sentinel: 自己 inject 的 node 加进 skipMoNodes, MO addedNodes 看到跳 (防自触发).
   skipMoNodes.add(tr);
   // Sibling injection avoids mutating the source leaf. Infinite-loop prevention
   // comes from ignoring removedNodes, not from appending inside the source leaf.
   el.insertAdjacentElement("afterend", tr);
-  if (hash) recentlyInjected.set(hash, Date.now());
 }
 
 function rerenderCachedTranslations() {
   clearAllTranslations();
-  recentlyInjected.clear();
   if (mode === "off") return;
   for (const root of translationRoots()) {
     root.querySelectorAll(`[${HASH_ATTR}]`).forEach((node) => {
@@ -1808,7 +1810,7 @@ function rerenderCachedTranslations() {
       const translated = cache.get(fresh);
       if (translated !== undefined) {
         node.setAttribute(HASH_ATTR, fresh);
-        injectTranslation(node, translated, fresh);
+        injectTranslation(node, translated);
         return;
       }
       processCandidate(node, "rerun");
@@ -1819,7 +1821,7 @@ function rerenderCachedTranslations() {
 // ── candidate processing ──────────────────────────────────────────────
 
 function processCandidate(el: HTMLElement, src: TraceSource = "init") {
-  if (mode === "off") return;
+  if (!active || mode === "off") return;
   el = candidateRoot(el);
 
   // user-initiated (rerun = mode toggle / init = boot) 立即处理, 不等 stable window.
@@ -1840,6 +1842,7 @@ function processCandidate(el: HTMLElement, src: TraceSource = "init") {
 }
 
 function doProcessCandidate(el: HTMLElement, src: TraceSource) {
+  if (!active || mode === "off" || !el.isConnected) return;
   const hasInjected = hasInjectedTranslation(el);
   if (isIgnoredElement(el)) {
     clearCandidateState(el);
@@ -1860,10 +1863,12 @@ function doProcessCandidate(el: HTMLElement, src: TraceSource) {
 
   const text = sourceText(el);
   if (!text) {
+    clearCandidateState(el);
     trace(src, el, "", "skip_no_text");
     return;
   }
   if (!shouldTranslate(text)) {
+    clearCandidateState(el);
     trace(src, el, "", "not_translatable", text);
     return;
   }
@@ -1882,13 +1887,6 @@ function doProcessCandidate(el: HTMLElement, src: TraceSource) {
     clearTranslation(el);
   }
 
-  // 同 hash 全 page 共享 1500ms debounce — 防不同 element 同 text 短时间反复 inject.
-  const recentTs = recentlyInjected.get(fresh);
-  if (recentTs !== undefined && Date.now() - recentTs < INJECT_DEBOUNCE_MS) {
-    trace(src, el, fresh, "debounce", text);
-    return;
-  }
-
   if (existing !== fresh) {
     el.setAttribute(HASH_ATTR, fresh);
   }
@@ -1896,13 +1894,15 @@ function doProcessCandidate(el: HTMLElement, src: TraceSource) {
   const cached = cache.get(fresh);
   if (cached !== undefined) {
     trace(src, el, fresh, "cache_inject", text);
-    injectTranslation(el, cached, fresh);
+    injectTranslation(el, cached);
     return;
   }
 
   // hash in-flight: 同 text 跨 element instance 已 enqueue 在 server roundtrip 中,
   // 不重 enqueue 触发并发 flush. 等 flush 完 cache.set 后, 同 hash 走 cache hit.
   if (inFlightHashes.has(fresh)) {
+    queue.get(fresh)?.elements.add(el);
+    inFlightElements.add(el);
     trace(src, el, fresh, "in_flight_defer", text);
     return;
   }
@@ -1912,6 +1912,7 @@ function doProcessCandidate(el: HTMLElement, src: TraceSource) {
   inFlightHashes.add(fresh);
   queue.set(fresh, {
     el,
+    elements: new Set([el]),
     text,
     requestText,
     visible: isElementNearViewport(el),
@@ -1924,14 +1925,15 @@ function doProcessCandidate(el: HTMLElement, src: TraceSource) {
       const evicted = queue.get(oldest);
       queue.delete(oldest);
       inFlightHashes.delete(oldest);
-      if (evicted) inFlightElements.delete(evicted.el);
+      evicted?.elements.forEach((element) => inFlightElements.delete(element));
     }
   }
   scheduleFlush();
 }
 
 function scheduleFlush(delayMs = FLUSH_DEBOUNCE_MS) {
-  if (flushInProgress) return;
+  if (!active || mode === "off") return;
+  if (flushingLifecycle === lifecycle) return;
   if (flushTimer !== null) return;
   const backoffMs = Math.max(0, nextFlushNotBefore - Date.now());
   flushTimer = window.setTimeout(flush, Math.max(delayMs, backoffMs));
@@ -1939,24 +1941,42 @@ function scheduleFlush(delayMs = FLUSH_DEBOUNCE_MS) {
 
 async function flush() {
   flushTimer = null;
-  if (flushInProgress) {
+  if (!active || mode === "off") return;
+  if (flushingLifecycle === lifecycle) {
     scheduleFlush();
     return;
   }
   if (queue.size === 0) return;
-  flushInProgress = true;
+  const generation = lifecycle;
+  flushingLifecycle = generation;
   try {
     await flushOnce();
   } finally {
-    flushInProgress = false;
-    if (queue.size > 0) scheduleFlush();
+    if (flushingLifecycle === generation) {
+      flushingLifecycle = null;
+      if (queue.size > 0) scheduleFlush();
+    }
   }
 }
 
 async function flushOnce() {
+  const generation = lifecycle;
+  // Removed timeline entries cannot consume a model call or retain every old
+  // DOM copy of the same paragraph while a retry is pending.
+  for (const [hash, item] of queue) {
+    for (const element of item.elements) {
+      if (!element.isConnected || isIgnoredElement(element)) {
+        item.elements.delete(element);
+        inFlightElements.delete(element);
+      }
+    }
+    const liveElement = item.elements.values().next().value as HTMLElement | undefined;
+    if (liveElement) item.el = liveElement;
+    else { queue.delete(hash); inFlightHashes.delete(hash); }
+  }
   // 可见优先取 BATCH_SIZE, 但不丢 scroll-out: 队列里的后台段落继续补翻.
   // slice 暂不删, 等 round-trip 完按 result 状态决定.
-  const slice: { hash: string; el: HTMLElement; text: string; requestText: string }[] = [];
+  const slice: { hash: string; el: HTMLElement; elements: Set<HTMLElement>; text: string; requestText: string }[] = [];
   let sliceChars = 0;
   const candidates = Array.from(queue.entries()).sort((a, b) => {
     const av = a[1].visible || isElementNearViewport(a[1].el);
@@ -1970,7 +1990,7 @@ async function flushOnce() {
     if (slice.length > 0 && sliceChars + item.requestText.length > TRANSLATION_BATCH_CHAR_BUDGET) {
       continue;
     }
-    slice.push({ hash: h, el: item.el, text: item.text, requestText: item.requestText });
+    slice.push({ hash: h, el: item.el, elements: item.elements, text: item.text, requestText: item.requestText });
     sliceChars += item.requestText.length;
   }
   if (slice.length === 0) return;
@@ -1991,8 +2011,9 @@ async function flushOnce() {
       batch,
     }),
   )) as { ok: boolean; results?: typeof results } | undefined;
+  if (!active || generation !== lifecycle) return;
   if (resp?.ok && Array.isArray(resp.results)) {
-    results = resp.results;
+    results = resp.results.filter((item) => item && typeof item.hash === "string" && typeof item.translated === "string");
     networkOk = true;
     transportFailures = 0;
     nextFlushNotBefore = 0;
@@ -2027,16 +2048,19 @@ async function flushOnce() {
     const item = byHash.get(r.hash);
     if (!item || !r.translated) continue;
     completedHashes.add(r.hash);
-    cache.set(r.hash, r.translated);
-    const currentText = sourceText(item.el);
-    const currentRequestText = currentText ? sourceTextForTranslation(item.el) : "";
-    const currentHash = currentRequestText ? hashText(normalizeForHash(currentRequestText), TARGET_LANG) : "";
-    if (currentHash !== r.hash) {
-      trace("mo_add", item.el, r.hash, "stale_result", currentText);
-      staleRechecks.push(item.el);
-      continue;
+    cacheTranslation(r.hash, r.translated);
+    for (const element of queue.get(r.hash)?.elements ?? [item.el]) {
+      if (!element.isConnected) continue;
+      const currentText = sourceText(element);
+      const currentRequestText = currentText ? sourceTextForTranslation(element) : "";
+      const currentHash = currentRequestText ? hashText(normalizeForHash(currentRequestText), TARGET_LANG) : "";
+      if (currentHash !== r.hash) {
+        trace("mo_add", element, r.hash, "stale_result", currentText);
+        staleRechecks.push(element);
+        continue;
+      }
+      injectTranslation(element, r.translated);
     }
-    injectTranslation(item.el, r.translated, r.hash);
   }
 
   if (networkOk) {
@@ -2057,9 +2081,15 @@ async function flushOnce() {
       }
     }
   }
-  // 不管 networkOk 与否, slice 里 element / hash 释放 in-flight 锁.
-  for (const { el } of slice) inFlightElements.delete(el);
-  for (const { hash } of slice) inFlightHashes.delete(hash);
+  // Retain hash ownership across retries so duplicate DOM mutations cannot
+  // overwrite the queue entry and reset its retry count.
+  for (const { hash, elements } of slice) {
+    if (!queue.has(hash)) {
+      inFlightHashes.delete(hash);
+      elements.forEach((el) => inFlightElements.delete(el));
+    }
+  }
+  for (const element of staleRechecks) inFlightElements.delete(element);
   for (const el of staleRechecks) {
     if (el.isConnected) processCandidate(el, "mo_add");
   }
@@ -2111,6 +2141,16 @@ function observeNew(root: ParentNode, src: TraceSource = "init") {
 function observeMutations(root: ParentNode = document.body) {
   if (mo === null) {
     mo = new MutationObserver((records) => {
+      // An ancestor class can change a descendant's computed display, and a
+      // child insertion changes whether its parent is one inline paragraph.
+      // Invalidating just the mutation target leaves those descendants stuck
+      // in their previous hidden/layout state.
+      if (records.some((record) => record.type === "attributes"
+        && !(record.target instanceof HTMLElement && record.target.closest(`.${TR_CLASS}`)))) {
+        hiddenCache = new WeakMap<HTMLElement, boolean>();
+        inlineCache = new WeakMap<HTMLElement, boolean>();
+      }
+      multiCache = new WeakMap<HTMLElement, boolean>();
       for (const r of records) {
         // F7 codex: kiss translator.js:711-714 完整 sentinel — 跳 mutation.target 是
         // .bbt-tr font 自己 / 已 inside .bbt-tr 的 mutation. X reconcile burst 期间
@@ -2127,6 +2167,9 @@ function observeMutations(root: ParentNode = document.body) {
             hiddenCache.delete(target);
             inlineCache.delete(target);
             multiCache.delete(target);
+            if (isIgnoredElement(target)) {
+              for (const leaf of target.querySelectorAll<HTMLElement>(`[${HASH_ATTR}], [${LEAF_ATTR}]`)) clearCandidateState(leaf);
+            }
             const leaf = closestLeafElement(target);
             if (leaf) processCandidate(leaf, "mo_add");
             observeNew(target, "mo_add");
@@ -2175,17 +2218,25 @@ function observeMutations(root: ParentNode = document.body) {
           observeNew(node, "mo_add");
         }
 
-        // Intentionally ignore removedNodes. React-style pages can remove
-        // injected siblings during reconciliation; reprocessing on removal
-        // causes add/remove loops. Later added/characterData mutations naturally
-        // re-enter the stable-window path.
+        // Release detached observer targets without reprocessing source text:
+        // reprocessing removals would fight React's reconciliation. If only the
+        // source was removed, its generated sibling must disappear with it.
+        for (const node of r.removedNodes) {
+          if (!(node instanceof HTMLElement) || node.isConnected) continue;
+          for (const element of [node, ...node.querySelectorAll<HTMLElement>(`[${HASH_ATTR}], [${LEAF_ATTR}]`)]) {
+            io?.unobserve(element);
+            stableWindowMap.delete(element);
+            injectedTranslations.get(element)?.remove();
+            injectedTranslations.delete(element);
+          }
+        }
       }
     });
   }
   if (observedMutationRoots.has(root)) return;
   mo.observe(root, {
     attributes: true,
-    attributeFilter: ["class", "style", "hidden", "aria-hidden"],
+    attributeFilter: ["class", "style", "hidden", "aria-hidden", "translate", "contenteditable", "data-bbt-clean-read-active"],
     childList: true,
     subtree: true,
     characterData: true,
@@ -2297,23 +2348,26 @@ function boot() {
   const w = window as unknown as { __babataTranslateBooted?: boolean };
   if (w.__babataTranslateBooted) return;
   w.__babataTranslateBooted = true;
+  active = true;
+  const generation = ++lifecycle;
   document.addEventListener(TEARDOWN_EVENT, teardownAll);
   registerCleanup(() => document.removeEventListener(TEARDOWN_EVENT, teardownAll));
 
   injectModeStyle();
   void loadMode().then(() => {
+    if (!active || generation !== lifecycle) return;
     applyModeAttr();
     makeIO();
     observeNew(document.body);
     observeMutations();
     setupAttentionWatchers();
     setupSelectionTranslator();
-    startCleanupTimer();
     startStableWindowTimer();
   });
 
   try {
-    const onStorageChanged = (changes: Record<string, chrome.storage.StorageChange>) => {
+    const onStorageChanged = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
+      if (area !== "local") return;
       let modeChanged = false;
       if (changes[STORAGE_MODE]) {
         baseMode = normalizeMode(changes[STORAGE_MODE].newValue);
@@ -2339,6 +2393,7 @@ function boot() {
           rerenderCachedTranslations();
           // off → bilingual/replace: 之前没翻新内容, 触发 collect 走 cache hit / enqueue.
           observeNew(document.body, "rerun");
+          scheduleFlush();
         }
       }
       if (changes[STORAGE_SELECTION_TRANSLATION]) {
@@ -2356,6 +2411,10 @@ function boot() {
   window.addEventListener("pagehide", teardownAll, { once: true });
   registerCleanup(() => window.removeEventListener("pagehide", teardownAll));
 }
+
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted && !extInvalidated) boot();
+});
 
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", boot, { once: true });

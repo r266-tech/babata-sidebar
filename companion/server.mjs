@@ -1,27 +1,29 @@
 #!/usr/bin/env node
 import http from "node:http";
-import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import spawn from "cross-spawn";
+import { randomUUID } from "node:crypto";
+import { WebSocket, WebSocketServer } from "ws";
 import { promises as fs, constants as fsConstants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const HOST = process.env.BABATA_SIDEBAR_HOST || "127.0.0.1";
 const PORT = Number(process.env.BABATA_SIDEBAR_PORT || process.env.PORT || "18791");
+if (!Number.isInteger(PORT) || PORT < 0 || PORT > 65535) throw new Error("BABATA_SIDEBAR_PORT must be an integer between 0 and 65535");
 const DEFAULT_PROVIDER_BASE_URL = "https://openrouter.ai/api/v1";
 const DEFAULT_CONFIG_DIR = path.join(os.homedir(), ".babata-sidebar");
 const CONFIG_DIR = process.env.BABATA_SIDEBAR_DATA_DIR || DEFAULT_CONFIG_DIR;
 const CONFIG_PATH = process.env.BABATA_SIDEBAR_CONFIG || path.join(CONFIG_DIR, "config.json");
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
-const CHAT_TIMEOUT_MS = Number(process.env.BABATA_CHAT_TIMEOUT_MS || "600000");
-const PROVIDER_TIMEOUT_MS = Number(process.env.BABATA_PROVIDER_TIMEOUT_MS || "60000");
-const TRANSLATE_BATCH_MAX = Number(process.env.BABATA_TRANSLATE_BATCH_MAX || "48");
-const CHAT_MODEL_MAX_MESSAGES = Number(process.env.BABATA_CHAT_MODEL_MAX_MESSAGES || "24");
-const CHAT_MODEL_TEXT_MAX_CHARS = Number(process.env.BABATA_CHAT_MODEL_TEXT_MAX_CHARS || "8000");
-const CHAT_TOOL_LOOP_MAX = Number(process.env.BABATA_CHAT_TOOL_LOOP_MAX || "4");
-const CHAT_TOOL_TIMEOUT_MS = Number(process.env.BABATA_CHAT_TOOL_TIMEOUT_MS || "30000");
-const CHAT_TOOL_RESULT_MAX_CHARS = Number(process.env.BABATA_CHAT_TOOL_RESULT_MAX_CHARS || "12000");
-const SERVER_HISTORY_MAX_TURNS = Number(process.env.BABATA_SERVER_HISTORY_MAX_TURNS || "200");
+const CHAT_TIMEOUT_MS = envInt("BABATA_CHAT_TIMEOUT_MS", 600000, 1, 1000000);
+const PROVIDER_TIMEOUT_MS = envInt("BABATA_PROVIDER_TIMEOUT_MS", 60000, 1, 1000000);
+const TRANSLATE_BATCH_MAX = envInt("BABATA_TRANSLATE_BATCH_MAX", 48, 1, 5000);
+const CHAT_MODEL_MAX_MESSAGES = envInt("BABATA_CHAT_MODEL_MAX_MESSAGES", 24, 1, 5000);
+const CHAT_MODEL_TEXT_MAX_CHARS = envInt("BABATA_CHAT_MODEL_TEXT_MAX_CHARS", 8000, 1, 1000000);
+const CHAT_TOOL_LOOP_MAX = envInt("BABATA_CHAT_TOOL_LOOP_MAX", 4, 0, 5000);
+const CHAT_TOOL_TIMEOUT_MS = envInt("BABATA_CHAT_TOOL_TIMEOUT_MS", 30000, 1, 1000000);
+const CHAT_TOOL_RESULT_MAX_CHARS = envInt("BABATA_CHAT_TOOL_RESULT_MAX_CHARS", 12000, 1, 1000000);
+const SERVER_HISTORY_MAX_TURNS = envInt("BABATA_SERVER_HISTORY_MAX_TURNS", 200, 1, 5000);
 const CHAT_DEBUG_PROMPT_ENV = process.env.BABATA_CHAT_DEBUG_PROMPT === "1"
   || process.env.BABATA_CHAT_DEBUG_PROMPT === "true";
 const DEFAULT_CHAT_TOOL_ACTIONS = [
@@ -47,19 +49,21 @@ const CPU_SPECS = {
     label: "Codex",
     shortLabel: "Codex",
     executable: () => process.env.BABATA_CODEX_CLI_PATH || process.env.CODEX_CLI_PATH || "codex",
-    args: (prompt) => ["exec", "--ask-for-approval", "never", "--sandbox", "read-only", "--cd", process.cwd(), prompt],
+    args: () => ["exec", "-c", 'approval_policy="never"', "--sandbox", "read-only", "--ephemeral", "--cd", process.cwd(), "-"],
+    stdinPrompt: true,
   },
   claude: {
     label: "Claude Code",
     shortLabel: "CC",
     executable: () => process.env.CLAUDE_CLI_PATH || process.env.BABATA_CLAUDE_CLI_PATH || "claude",
-    args: (prompt) => ["-p", "--output-format", "text", "--permission-mode", "dontAsk", "--no-session-persistence", prompt],
+    args: () => ["-p", "--output-format", "text", "--permission-mode", "dontAsk", "--no-session-persistence"],
+    stdinPrompt: true,
   },
   grok: {
     label: "Grok",
     shortLabel: "Grok",
     executable: () => process.env.BABATA_GROK_CLI_PATH || process.env.GROK_CLI_PATH || "grok",
-    args: (prompt) => [
+    args: (promptPath) => [
       "--output-format", "plain",
       "--permission-mode", "dontAsk",
       "--sandbox", "read-only",
@@ -70,14 +74,29 @@ const CPU_SPECS = {
       "--verbatim",
       "--cwd", process.cwd(),
       "--tools", "",
-      "--single", prompt,
+      "--prompt-file", promptPath,
     ],
+    filePrompt: true,
   },
 };
 
 const wsClients = new Set();
 const pendingWsResponses = new Map();
 const serverHistory = [];
+const activeChats = new Set();
+const activeRequests = new Set();
+const MAX_ACTIVE_CHATS = envInt("BABATA_CHAT_MAX_CONCURRENT", 4, 1, 32);
+const MAX_ACTIVE_PROVIDER_CALLS = envInt("BABATA_PROVIDER_MAX_CONCURRENT", 8, 1, 64);
+let activeProviderCalls = 0;
+let configWriteChain = Promise.resolve();
+
+function envInt(name, fallback, min, max) {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}`);
+  }
+  return value;
+}
 
 function emptyConfig() {
   return {
@@ -94,17 +113,36 @@ async function readConfig() {
   try {
     const raw = await fs.readFile(CONFIG_PATH, "utf8");
     const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("config object required");
+    if (parsed.cpu !== undefined && !isCpu(parsed.cpu)) throw new Error("invalid configured cpu");
+    if (parsed.translation_provider !== undefined) validateProviderSettings(parsed.translation_provider);
     return normalizeConfig(parsed);
-  } catch {
-    return emptyConfig();
+  } catch (err) {
+    if (err.code === "ENOENT") return normalizeConfig({});
+    throw httpError(500, "companion config could not be read; existing file was preserved");
   }
 }
 
 async function writeConfig(config) {
   await fs.mkdir(path.dirname(CONFIG_PATH), { recursive: true, mode: 0o700 });
-  const tmp = `${CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;
-  await fs.writeFile(tmp, `${JSON.stringify(normalizeConfig(config), null, 2)}\n`, { mode: 0o600 });
-  await fs.rename(tmp, CONFIG_PATH);
+  const tmp = `${CONFIG_PATH}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(tmp, `${JSON.stringify(normalizeConfig(config), null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    await fs.rename(tmp, CONFIG_PATH);
+  } finally {
+    await fs.rm(tmp, { force: true });
+  }
+}
+
+function updateConfig(update) {
+  const next = configWriteChain.then(async () => {
+    const config = await readConfig();
+    update(config);
+    await writeConfig(config);
+    return config;
+  });
+  configWriteChain = next.catch(() => {});
+  return next;
 }
 
 function normalizeConfig(raw) {
@@ -118,8 +156,8 @@ function normalizeConfig(raw) {
     cpu,
     translation_provider: {
       base_url: text(provider.base_url) || process.env.OPENAI_BASE_URL || process.env.OPENROUTER_BASE_URL || base.translation_provider.base_url,
-      api_key: text(provider.api_key) || process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || "",
-      model: text(provider.model) || process.env.BABATA_TRANSLATION_MODEL || process.env.OPENAI_MODEL || process.env.OPENROUTER_MODEL || "",
+      api_key: typeof provider.api_key === "string" ? text(provider.api_key) : process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || "",
+      model: typeof provider.model === "string" ? text(provider.model) : process.env.BABATA_TRANSLATION_MODEL || process.env.OPENAI_MODEL || process.env.OPENROUTER_MODEL || "",
     },
   };
 }
@@ -166,12 +204,13 @@ function isCpu(value) {
   return typeof value === "string" && Object.prototype.hasOwnProperty.call(CPU_SPECS, value);
 }
 
-function appendHistory(...turns) {
+function appendHistory(scope, ...turns) {
   for (const turn of turns) {
     if (!turn || typeof turn !== "object") continue;
     const role = turn.role === "assistant" ? "assistant" : "user";
     serverHistory.push({
       role,
+      scope,
       text: clampText(turn.text, CHAT_MODEL_TEXT_MAX_CHARS),
       title: text(turn.title) || undefined,
       updated_at: Date.now(),
@@ -180,9 +219,26 @@ function appendHistory(...turns) {
   while (serverHistory.length > SERVER_HISTORY_MAX_TURNS) serverHistory.shift();
 }
 
-function historyPayload(url) {
-  const limit = Math.max(1, Math.min(Number(url.searchParams.get("limit") || "50"), 500));
-  return { ok: true, turns: serverHistory.slice(-limit) };
+function historyPayload(url, scope) {
+  const requested = Number(url.searchParams.get("limit") || "50");
+  const limit = Number.isFinite(requested) ? Math.max(1, Math.min(Math.floor(requested), 500)) : 50;
+  return { ok: true, turns: serverHistory.filter((turn) => turn.scope === scope).slice(-limit).map(({ scope: _, ...turn }) => turn) };
+}
+
+function requestOrigin(req) {
+  // Host-permitted Chromium extension GETs may omit Origin. Never let the
+  // fallback replace a real Origin, and validate it against the same allowlist.
+  return req.headers.origin ?? req.headers["x-babata-extension-origin"];
+}
+
+function requestClient(req, url) {
+  const id = text(req.headers["x-babata-client-id"] || url.searchParams.get("client_id"));
+  if (id && !/^[a-zA-Z0-9_-]{1,128}$/.test(id)) throw httpError(400, "invalid client id");
+  return { origin: requestOrigin(req), id };
+}
+
+function historyScope(client, conversation = "") {
+  return JSON.stringify([client.origin, client.id, text(conversation).slice(0, 200)]);
 }
 
 function allowedOrigin(origin) {
@@ -192,7 +248,7 @@ function allowedOrigin(origin) {
     .map((item) => item.trim())
     .filter(Boolean);
   if (explicit.length > 0) return explicit.includes(origin);
-  return origin.startsWith("chrome-extension://") || origin.startsWith("moz-extension://");
+  return /^(?:chrome|moz)-extension:\/\/[a-zA-Z0-9_-]+$/.test(origin);
 }
 
 function setCors(req, res) {
@@ -202,7 +258,8 @@ function setCors(req, res) {
     res.setHeader("vary", "Origin");
   }
   res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
-  res.setHeader("access-control-allow-headers", "content-type,authorization");
+  res.setHeader("access-control-allow-headers", "content-type,authorization,x-babata-client-id,x-babata-extension-origin");
+  res.setHeader("cache-control", "no-store");
 }
 
 function json(res, status, body) {
@@ -220,13 +277,15 @@ function sseHeaders(res) {
 }
 
 function sse(res, event) {
-  res.write(`data: ${JSON.stringify(event)}\n\n`);
+  if (!res.destroyed && !res.writableEnded) res.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
 async function readJson(req) {
   let size = 0;
   const chunks = [];
-  for await (const chunk of req) {
+  // Keep the socket alive long enough to deliver a structured 413. The error
+  // handler closes it explicitly so unread bytes cannot poison a reused socket.
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
     size += chunk.length;
     if (size > MAX_BODY_BYTES) throw httpError(413, "request body too large");
     chunks.push(chunk);
@@ -235,7 +294,9 @@ async function readJson(req) {
   const raw = Buffer.concat(chunks).toString("utf8");
   if (!raw.trim()) return {};
   try {
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("object required");
+    return parsed;
   } catch {
     throw httpError(400, "invalid JSON");
   }
@@ -266,8 +327,8 @@ async function commandExists(command) {
 
 async function accessExecutable(file) {
   try {
-    await fs.access(file, fsConstants.X_OK);
-    return true;
+    await fs.access(file, process.platform === "win32" ? fsConstants.F_OK : fsConstants.X_OK);
+    return (await fs.stat(file)).isFile();
   } catch {
     return false;
   }
@@ -313,9 +374,22 @@ function providerFrom(config, override = {}) {
     base_url: text(item.base_url) || current.base_url || DEFAULT_PROVIDER_BASE_URL,
     api_key: Object.prototype.hasOwnProperty.call(item, "api_key")
       ? text(item.api_key)
-      : current.api_key,
+      : text(item.base_url) && !sameProviderDestination(item.base_url, current.base_url)
+        ? ""
+        : current.api_key,
     model: text(item.model) || current.model,
   };
+}
+
+function validateProviderSettings(provider) {
+  if (!provider || typeof provider !== "object" || Array.isArray(provider)) {
+    throw httpError(400, "translation_provider must be an object");
+  }
+  for (const field of ["base_url", "api_key", "model"]) {
+    if (provider[field] !== undefined && typeof provider[field] !== "string") {
+      throw httpError(400, `translation_provider.${field} must be a string`);
+    }
+  }
 }
 
 function providerPublic(provider) {
@@ -329,12 +403,26 @@ function providerPublic(provider) {
 function providerUrl(baseUrl, endpoint) {
   const trimmed = text(baseUrl).replace(/\/+$/, "");
   if (!trimmed) throw httpError(400, "provider base_url is required");
-  if (endpoint === "chat/completions" && /\/chat\/completions$/i.test(trimmed)) return trimmed;
-  if (endpoint === "models" && /\/models$/i.test(trimmed)) return trimmed;
-  return `${trimmed}/${endpoint}`;
+  let url;
+  try { url = new URL(trimmed); } catch { throw httpError(400, "invalid provider base_url"); }
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
+    throw httpError(400, "provider base_url must be an HTTP(S) URL without credentials");
+  }
+  url.pathname = `${url.pathname.replace(/\/(?:chat\/completions|models)\/?$/i, "").replace(/\/+$/, "")}/${endpoint}`;
+  url.hash = "";
+  return url.toString();
+}
+
+function sameProviderDestination(next, current) {
+  const normalized = providerUrl(next, "chat/completions");
+  try { return normalized === providerUrl(current, "chat/completions"); }
+  catch { return false; } // Permit repairing a malformed old URL, dropping its key.
 }
 
 async function providerFetch(provider, endpoint, init = {}) {
+  init.signal?.throwIfAborted();
+  if (activeProviderCalls >= MAX_ACTIVE_PROVIDER_CALLS) throw httpError(429, "too many active provider requests");
+  activeProviderCalls += 1;
   const headers = {
     "content-type": "application/json",
     ...(provider.api_key ? { authorization: `Bearer ${provider.api_key}` } : {}),
@@ -343,25 +431,47 @@ async function providerFetch(provider, endpoint, init = {}) {
     ...(init.headers || {}),
   };
   const controller = new AbortController();
+  const abort = () => controller.abort(init.signal.reason);
+  init.signal?.addEventListener("abort", abort, { once: true });
   const timer = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
   try {
-    return await fetch(providerUrl(provider.base_url, endpoint), {
+    const resp = await fetch(providerUrl(provider.base_url, endpoint), {
       ...init,
       headers,
       signal: controller.signal,
+      redirect: "error",
     });
+    // Keep the timeout alive until the body has arrived, not just the headers.
+    if (Number(resp.headers.get("content-length")) > MAX_BODY_BYTES) {
+      await resp.body?.cancel();
+      throw httpError(502, "provider response exceeded limit");
+    }
+    const chunks = [];
+    let bytes = 0;
+    for await (const chunk of resp.body || []) {
+      bytes += chunk.byteLength;
+      if (bytes > MAX_BODY_BYTES) throw httpError(502, "provider response exceeded limit");
+      chunks.push(chunk);
+    }
+    let data;
+    try { data = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+    catch { throw httpError(resp.ok ? 502 : resp.status, `provider returned non-JSON data (HTTP ${resp.status})`); }
+    if (!resp.ok) throw httpError(resp.status, providerError(data) || `provider HTTP ${resp.status}`);
+    return data;
+  } catch (err) {
+    init.signal?.throwIfAborted();
+    if (controller.signal.aborted) throw httpError(504, "translation provider timed out");
+    throw err;
   } finally {
+    init.signal?.removeEventListener("abort", abort);
     clearTimeout(timer);
+    activeProviderCalls -= 1;
   }
 }
 
-async function listProviderModels(config, payload) {
+async function listProviderModels(config, payload, signal) {
   const provider = providerFrom(config, payload);
-  const resp = await providerFetch(provider, "models", { method: "GET", headers: {} });
-  const data = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    throw httpError(resp.status, providerError(data) || `provider HTTP ${resp.status}`);
-  }
+  const data = await providerFetch(provider, "models", { method: "GET", headers: {}, signal });
   const raw = Array.isArray(data?.data) ? data.data : Array.isArray(data?.models) ? data.models : [];
   const models = raw
     .map((item) => {
@@ -386,11 +496,11 @@ function providerError(data) {
   return text(data.message);
 }
 
-async function chatCompletion(provider, messages, extra = {}) {
+async function chatCompletion(provider, messages, extra = {}, signal) {
   if (!provider.model) throw httpError(400, "model is required");
-  if (!provider.api_key) throw httpError(400, "api_key is required");
-  const resp = await providerFetch(provider, "chat/completions", {
+  const data = await providerFetch(provider, "chat/completions", {
     method: "POST",
+    signal,
     body: JSON.stringify({
       model: provider.model,
       messages,
@@ -398,10 +508,6 @@ async function chatCompletion(provider, messages, extra = {}) {
       ...extra,
     }),
   });
-  const data = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    throw httpError(resp.status, providerError(data) || `provider HTTP ${resp.status}`);
-  }
   const content = data?.choices?.[0]?.message?.content;
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -410,12 +516,12 @@ async function chatCompletion(provider, messages, extra = {}) {
   throw httpError(502, "provider returned no text");
 }
 
-async function testProvider(config, payload) {
+async function testProvider(config, payload, signal) {
   const provider = providerFrom(config, payload);
   const translated = await chatCompletion(provider, [
     { role: "system", content: "Translate the user's text to Simplified Chinese. Return only the translation." },
     { role: "user", content: "Hello, world." },
-  ]);
+  ], {}, signal);
   return {
     ok: true,
     translated: translated.trim(),
@@ -423,7 +529,7 @@ async function testProvider(config, payload) {
   };
 }
 
-async function translateBatch(config, payload) {
+async function translateBatch(config, payload, signal) {
   const provider = providerFrom(config, payload.translation_provider || payload);
   const target = text(payload.target) || "zh";
   const batch = Array.isArray(payload.batch) ? payload.batch : [];
@@ -450,7 +556,7 @@ async function translateBatch(config, payload) {
         batch: normalized,
       }),
     },
-  ]);
+  ], {}, signal);
   const parsed = extractJson(content);
   const rawResults = Array.isArray(parsed?.results) ? parsed.results : Array.isArray(parsed) ? parsed : [];
   const wanted = new Set(normalized.map((item) => item.hash));
@@ -492,17 +598,17 @@ function extractJson(content) {
 }
 
 function normalizeChatMessages(raw, fallbackMessage) {
-  const messages = Array.isArray(raw)
-    ? raw
-      .filter((item) => item && typeof item === "object")
-      .filter((item) => item.role === "user" || item.role === "assistant")
-      .map((item) => ({
-        role: item.role,
-        text: clampText(item.text, CHAT_MODEL_TEXT_MAX_CHARS),
-      }))
-      .filter((item) => item.text.trim())
-    : [];
-  const fallback = text(fallbackMessage);
+  const messages = [];
+  if (Array.isArray(raw)) {
+    for (let i = raw.length - 1; i >= 0 && messages.length < CHAT_MODEL_MAX_MESSAGES; i -= 1) {
+      const item = raw[i];
+      if (!item || (item.role !== "user" && item.role !== "assistant")) continue;
+      const content = clampText(item.text, CHAT_MODEL_TEXT_MAX_CHARS);
+      if (content.trim()) messages.push({ role: item.role, text: content });
+    }
+    messages.reverse();
+  }
+  const fallback = clampText(fallbackMessage, CHAT_MODEL_TEXT_MAX_CHARS);
   const last = messages[messages.length - 1];
   if (fallback && !(last?.role === "user" && last.text.trim() === fallback)) {
     messages.push({ role: "user", text: fallback });
@@ -525,7 +631,7 @@ function normalizePageContext(raw) {
 
 function normalizeAttachments(raw) {
   return Array.isArray(raw)
-    ? raw.map((item) => ({
+    ? raw.slice(0, 64).map((item) => ({
         kind: text(item?.kind),
         name: clampText(item?.name, 500),
         mime: clampText(item?.mime, 200),
@@ -620,44 +726,97 @@ function chatPrompt(envelope, toolResults = [], allowTools = true) {
   ].filter(Boolean).join("\n");
 }
 
-function cpuArgs(cpu, prompt) {
-  return {
-    command: cpuExecutable(cpu),
-    args: CPU_SPECS[cpu].args(prompt),
-  };
+async function runCpu(cpu, prompt, signal) {
+  signal?.throwIfAborted();
+  const command = cpuExecutable(cpu);
+  if (!(await commandExists(command))) throw httpError(503, `${CPU_SPECS[cpu].label} command not found: ${command}`);
+  let promptDir;
+  try {
+    let promptPath;
+    if (CPU_SPECS[cpu].filePrompt) {
+      promptDir = await fs.mkdtemp(path.join(os.tmpdir(), "babata-prompt-"));
+      promptPath = path.join(promptDir, "prompt.txt");
+      await fs.writeFile(promptPath, prompt, { mode: 0o600 });
+    }
+    signal?.throwIfAborted();
+    return await invokeCpu(cpu, command, CPU_SPECS[cpu].args(promptPath), prompt, signal);
+  } finally {
+    if (promptDir) await fs.rm(promptDir, { recursive: true, force: true });
+  }
 }
 
-async function runCpu(cpu, prompt) {
-  const { command, args } = cpuArgs(cpu, prompt);
-  if (!(await commandExists(command))) throw httpError(503, `${CPU_SPECS[cpu].label} command not found: ${command}`);
+function invokeCpu(cpu, command, args, prompt, signal) {
+  signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: process.cwd(),
       env: { ...process.env, NO_COLOR: "1" },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [CPU_SPECS[cpu].stdinPrompt ? "pipe" : "ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
     });
     let stdout = "";
     let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(httpError(504, `${CPU_SPECS[cpu].label} timed out`));
-    }, CHAT_TIMEOUT_MS);
+    let settled = false;
+    let stopping = false;
+    const finish = (err, output) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (err) reject(err);
+      else resolve(output);
+    };
+    const kill = (sig) => {
+      if (!child.pid) return false;
+      try {
+        if (process.platform === "win32") {
+          spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" }).on("error", () => child.kill());
+        } else {
+          process.kill(-child.pid, sig);
+        }
+        return true;
+      } catch { return false; /* already exited */ }
+    };
+    const stop = (err) => {
+      if (settled || stopping) return;
+      stopping = true;
+      if (!kill("SIGTERM")) { finish(err); return; }
+      // Keep this timer referenced, including during server shutdown, and keep
+      // the concurrency slot until descendants have received the forced kill.
+      setTimeout(() => { kill("SIGKILL"); finish(err); }, 750);
+    };
+    const abort = () => stop(signal.reason || new Error("chat cancelled"));
+    const timer = setTimeout(() => stop(httpError(504, `${CPU_SPECS[cpu].label} timed out`)), CHAT_TIMEOUT_MS);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (child.stdin) {
+      child.stdin.on("error", (err) => { if (err.code !== "EPIPE") stop(err); });
+      child.stdin.end(prompt);
+    }
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    const checkSize = () => {
+      if (stdout.length + stderr.length > 2_000_000) stop(httpError(502, "model output exceeded limit"));
+    };
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString("utf8");
+      if (!settled && !stopping) { stdout += chunk; checkSize(); }
     });
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
+      if (!settled && !stopping) { stderr += chunk; checkSize(); }
     });
     child.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
+      finish(err);
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
+      if (stopping || settled) return;
+      // A CLI can exit after starting helpers with detached stdio. They still
+      // belong to this invocation's process group and must not outlive it.
+      if (process.platform !== "win32" && kill("SIGTERM")) {
+        setTimeout(() => kill("SIGKILL"), 750);
+      }
       if (code === 0) {
-        resolve(stdout.trim() || stderr.trim());
+        finish(null, stdout.trim());
       } else {
-        reject(httpError(502, `${CPU_SPECS[cpu].label} exited ${code}: ${(stderr || stdout).trim()}`));
+        finish(httpError(502, `${CPU_SPECS[cpu].label} exited ${code}: ${clampText((stderr || stdout).trim(), 4000)}`));
       }
     });
   });
@@ -712,47 +871,51 @@ function emitDebugPrompt(onEvent, cpu, prompt, meta) {
   });
 }
 
-function firstWsClient() {
-  for (const socket of wsClients) {
-    if (!socket.destroyed && socket.writable) return socket;
-  }
-  return null;
+function browserClient(client) {
+  const matches = [...wsClients].filter((socket) => socket.readyState === WebSocket.OPEN
+    && socket.origin === client.origin && socket.clientId === client.id);
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function sendWsToSocket(socket, payload) {
-  const data = Buffer.from(JSON.stringify(payload), "utf8");
-  socket.write(wsFrame(data));
+  if (socket.readyState !== WebSocket.OPEN) throw httpError(503, "browser extension WebSocket disconnected");
+  socket.send(JSON.stringify(payload));
 }
 
-function requestBrowserTool(action, args) {
+function requestBrowserTool(action, args, socket, signal) {
+  signal?.throwIfAborted();
   if (!CHAT_TOOL_ACTIONS.has(action)) {
     throw httpError(400, `tool not allowed: ${action}`);
   }
-  const socket = firstWsClient();
   if (!socket) throw httpError(503, "browser extension WebSocket not connected");
   const id = randomUUID();
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
       pendingWsResponses.delete(id);
+    };
+    const abort = () => { cleanup(); reject(signal.reason || new Error("chat cancelled")); };
+    const timer = setTimeout(() => {
+      cleanup();
       reject(httpError(504, `browser tool timed out: ${action}`));
     }, CHAT_TOOL_TIMEOUT_MS);
-    pendingWsResponses.set(id, { resolve, reject, timer, socket });
+    signal?.addEventListener("abort", abort, { once: true });
+    pendingWsResponses.set(id, { resolve, reject, cleanup, socket });
     try {
       sendWsToSocket(socket, { kind: "request", id, action, args });
     } catch (err) {
-      clearTimeout(timer);
-      pendingWsResponses.delete(id);
+      cleanup();
       reject(err);
     }
   });
 }
 
-function settleWsResponse(message) {
+function settleWsResponse(socket, message) {
   const id = typeof message?.id === "string" ? message.id : "";
   const pending = pendingWsResponses.get(id);
-  if (!pending) return;
-  clearTimeout(pending.timer);
-  pendingWsResponses.delete(id);
+  if (!pending || pending.socket !== socket) return;
+  pending.cleanup();
   if (message.ok === false) {
     pending.reject(httpError(502, text(message.error) || "browser tool failed"));
   } else {
@@ -774,10 +937,16 @@ async function runAgentChat(cpu, envelope, onEvent, options = {}) {
         toolResultsCount: toolResults.length,
       });
     }
-    const output = await runCpu(cpu, prompt);
+    options.signal?.throwIfAborted();
+    const output = await runCpu(cpu, prompt, options.signal);
     const call = allowTools ? parseToolCall(output) : null;
     if (!call) return cleanModelOutput(output) || "(empty response)";
 
+    // A tab switch while the model is running must not redirect its default read.
+    if (!["tab_id", "tabId", "window_id", "windowId"].some((key) => key in call.args)) {
+      if (envelope.page?.tab_id !== undefined) call.args.tab_id = envelope.page.tab_id;
+      else if (envelope.page?.window_id !== undefined) call.args.window_id = envelope.page.window_id;
+    }
     const traceId = randomUUID();
     onEvent?.({
       type: "tool_use",
@@ -791,7 +960,7 @@ async function runAgentChat(cpu, envelope, onEvent, options = {}) {
     });
 
     try {
-      const result = await requestBrowserTool(call.action, call.args);
+      const result = await requestBrowserTool(call.action, call.args, options.socket, options.signal);
       toolResults.push({ action: call.action, args: call.args, ok: true, result });
       onEvent?.({
         type: "tool_result",
@@ -800,6 +969,7 @@ async function runAgentChat(cpu, envelope, onEvent, options = {}) {
         text: jsonForPrompt(result, CHAT_TOOL_RESULT_MAX_CHARS),
       });
     } catch (err) {
+      options.signal?.throwIfAborted();
       const message = err.message || String(err);
       toolResults.push({ action: call.action, args: call.args, ok: false, error: message });
       onEvent?.({
@@ -819,28 +989,37 @@ async function runAgentChat(cpu, envelope, onEvent, options = {}) {
       toolResultsCount: toolResults.length,
     });
   }
-  return cleanModelOutput(await runCpu(cpu, prompt)) || "(empty response)";
+  return cleanModelOutput(await runCpu(cpu, prompt, options.signal)) || "(empty response)";
 }
 
-async function handleChat(config, payload, res) {
+async function handleChat(config, payload, res, client) {
+  if (payload.cpu !== undefined && !isCpu(payload.cpu)) throw httpError(400, "invalid cpu");
+  if (activeChats.size >= MAX_ACTIVE_CHATS) throw httpError(429, "too many active chats");
   sseHeaders(res);
+  res.flushHeaders();
   const message = text(payload.message);
   if (message === "/new") {
     sse(res, { type: "done" });
     res.end();
     return;
   }
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  res.on("close", cancel);
+  activeChats.add(controller);
   try {
-    const cpu = normalizeConfig(config).cpu;
+    const cpu = payload.cpu || normalizeConfig(config).cpu;
     const envelope = chatEnvelope(payload);
     const output = await runAgentChat(
       cpu,
       envelope,
       (event) => sse(res, event),
-      { debugPrompt: wantsDebugPrompt(payload) },
+      { debugPrompt: wantsDebugPrompt(payload), signal: controller.signal, socket: browserClient(client) },
     );
+    controller.signal.throwIfAborted();
     const lastUser = [...envelope.messages].reverse().find((msg) => msg.role === "user");
     appendHistory(
+      historyScope(client, payload.conversation_id),
       { role: "user", text: lastUser?.text || message },
       { role: "assistant", text: output },
     );
@@ -850,11 +1029,13 @@ async function handleChat(config, payload, res) {
     sse(res, { type: "error", text: err.message || String(err) });
     sse(res, { type: "done" });
   } finally {
+    res.off("close", cancel);
+    activeChats.delete(controller);
     res.end();
   }
 }
 
-async function cleanRead(config, payload) {
+async function cleanRead(config, payload, client, signal) {
   const article = payload.article && typeof payload.article === "object" ? payload.article : {};
   const title = text(payload.title) || text(article.title) || "Clean read";
   const articleBody = text(article.markdown) || text(article.text) || "";
@@ -880,7 +1061,7 @@ async function cleanRead(config, payload) {
   let markdown = fallback;
   try {
     const provider = providerFrom(config, payload.translation_provider || {});
-    if (provider.api_key && provider.model && (text(article.text) || text(article.markdown))) {
+    if (provider.model && (text(article.text) || text(article.markdown))) {
       markdown = await chatCompletion(provider, [
         {
           role: "system",
@@ -888,9 +1069,10 @@ async function cleanRead(config, payload) {
             "Rewrite the provided article into clean Chinese Markdown. Preserve facts, quotes, links, and useful details. Remove ads, navigation, and social sharing noise. Return sections named exactly: ## 阅读判定, ## 摘要, ## AI 锐评, ## 正文.",
         },
         { role: "user", content: JSON.stringify({ title: text(payload.title), url: text(payload.url), article }) },
-      ], { temperature: 0.1 });
+      ], { temperature: 0.1 }, signal);
     }
   } catch {
+    signal?.throwIfAborted();
     markdown = fallback;
   }
   if (!/##\s*阅读判定/.test(markdown) || !/##\s*AI\s*锐评/.test(markdown)) {
@@ -902,11 +1084,16 @@ async function cleanRead(config, payload) {
       markdown,
     ].join("\n").trim();
   }
+  signal?.throwIfAborted();
   appendHistory(
+    historyScope(client, payload.conversation_id),
     { role: "user", text: `净化阅读：${title}`, title },
     { role: "assistant", text: markdown, title },
   );
-  sendWs({
+  if (client.id) {
+    return { ok: true, result: { run_id: text(payload.run_id), markdown, url: text(payload.url), title, tab_id: payload.tab_id, window_id: payload.window_id } };
+  }
+  sendWs(client, {
     kind: "notification",
     action: "clean_read_result",
     args: {
@@ -921,10 +1108,10 @@ async function cleanRead(config, payload) {
   return { ok: true, queued: true };
 }
 
-async function proactive(payload) {
+async function proactive(payload, client) {
   const intent = text(payload.intent);
   if (intent === "prompt_suggestions") {
-    sendWs({
+    sendWs(client, {
       kind: "notification",
       action: "suggest_prompts",
       args: {
@@ -935,7 +1122,7 @@ async function proactive(payload) {
     });
   }
   if (intent === "agent_view") {
-    sendWs({
+    sendWs(client, {
       kind: "notification",
       action: "mascot_speak",
       args: {
@@ -952,23 +1139,25 @@ function publicPathWithoutOrigin(url, method) {
   return method === "GET" && url.pathname === "/health";
 }
 
-async function route(req, res) {
-  const url = new URL(req.url || "/", `http://${HOST}:${PORT}`);
+async function route(req, res, signal) {
+  const url = new URL(req.url || "/", "http://localhost");
   setCors(req, res);
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     res.end();
     return;
   }
-  if (!publicPathWithoutOrigin(url, req.method) && !req.headers.origin) {
+  const origin = requestOrigin(req);
+  if (!publicPathWithoutOrigin(url, req.method) && !origin) {
     json(res, 403, { ok: false, error: "origin required" });
     return;
   }
-  if (req.headers.origin && !allowedOrigin(req.headers.origin)) {
+  if (origin && !allowedOrigin(origin)) {
     json(res, 403, { ok: false, error: "origin not allowed" });
     return;
   }
 
+  const client = requestClient(req, url);
   const config = await readConfig();
 
   if (req.method === "GET" && url.pathname === "/health") {
@@ -981,48 +1170,52 @@ async function route(req, res) {
   }
   if (req.method === "POST" && url.pathname === "/settings") {
     const body = await readJson(req);
-    const next = normalizeConfig(config);
-    if (isCpu(body.cpu)) next.cpu = body.cpu;
-    if (body.translation_provider && typeof body.translation_provider === "object") {
-      const incoming = body.translation_provider;
-      next.translation_provider = {
-        ...next.translation_provider,
-        ...(text(incoming.base_url) ? { base_url: text(incoming.base_url) } : {}),
-        ...(Object.prototype.hasOwnProperty.call(incoming, "api_key") ? { api_key: text(incoming.api_key) } : {}),
-        ...(Object.prototype.hasOwnProperty.call(incoming, "model") ? { model: text(incoming.model) } : {}),
-      };
-    }
-    await writeConfig(next);
+    if (body.translation_provider !== undefined) validateProviderSettings(body.translation_provider);
+    const next = await updateConfig((current) => {
+      if (body.cpu !== undefined) {
+        if (!isCpu(body.cpu)) throw httpError(400, "invalid cpu");
+        current.cpu = body.cpu;
+      }
+      if (body.translation_provider && typeof body.translation_provider === "object") {
+        const incoming = body.translation_provider;
+        if (text(incoming.base_url)) {
+          const changed = !sameProviderDestination(incoming.base_url, current.translation_provider.base_url);
+          if (changed) current.translation_provider.api_key = "";
+          current.translation_provider.base_url = text(incoming.base_url);
+        }
+        for (const field of ["api_key", "model"]) {
+          if (Object.prototype.hasOwnProperty.call(incoming, field)) current.translation_provider[field] = text(incoming[field]);
+        }
+      }
+    });
     json(res, 200, { ok: true, ...settingsConfig(next) });
     return;
   }
   if (req.method === "POST" && url.pathname === "/cpu") {
     const body = await readJson(req);
     if (!isCpu(body.cpu)) throw httpError(400, "invalid cpu");
-    const next = normalizeConfig(config);
-    next.cpu = body.cpu;
-    await writeConfig(next);
+    const next = await updateConfig((current) => { current.cpu = body.cpu; });
     json(res, 200, await healthPayload(next));
     return;
   }
   if (req.method === "POST" && url.pathname === "/translate/models") {
-    json(res, 200, await listProviderModels(config, await readJson(req)));
+    json(res, 200, await listProviderModels(config, await readJson(req), signal));
     return;
   }
   if (req.method === "POST" && url.pathname === "/translate/test") {
-    json(res, 200, await testProvider(config, await readJson(req)));
+    json(res, 200, await testProvider(config, await readJson(req), signal));
     return;
   }
   if (req.method === "POST" && url.pathname === "/translate") {
-    json(res, 200, await translateBatch(config, await readJson(req)));
+    json(res, 200, await translateBatch(config, await readJson(req), signal));
     return;
   }
   if (req.method === "POST" && url.pathname === "/chat") {
-    await handleChat(config, await readJson(req), res);
+    await handleChat(config, await readJson(req), res, client);
     return;
   }
   if (req.method === "GET" && url.pathname === "/history") {
-    json(res, 200, historyPayload(url));
+    json(res, 200, historyPayload(url, historyScope(client, url.searchParams.get("conversation_id"))));
     return;
   }
   if (req.method === "POST" && (url.pathname === "/attention" || url.pathname === "/translate_trace")) {
@@ -1031,148 +1224,88 @@ async function route(req, res) {
     return;
   }
   if (req.method === "POST" && url.pathname === "/proactive") {
-    json(res, 200, await proactive(await readJson(req)));
+    json(res, 200, await proactive(await readJson(req), client));
     return;
   }
   if (req.method === "POST" && url.pathname === "/clean_read") {
-    json(res, 200, await cleanRead(config, await readJson(req)));
+    json(res, 200, await cleanRead(config, await readJson(req), client, signal));
     return;
   }
   json(res, 404, { ok: false, error: "not found" });
 }
 
 const server = http.createServer((req, res) => {
-  route(req, res).catch((err) => {
+  const controller = new AbortController();
+  const abort = () => { if (!res.writableEnded) controller.abort(); };
+  activeRequests.add(controller);
+  res.on("close", abort);
+  route(req, res, controller.signal).catch((err) => {
+    if (res.destroyed || res.writableEnded) return;
+    if (res.headersSent) { res.end(); return; }
     const status = Number(err.status) || 500;
+    if (status === 413) res.setHeader("connection", "close");
     json(res, status, { ok: false, error: err.message || String(err) });
-  });
+  }).finally(() => { res.off("close", abort); activeRequests.delete(controller); });
 });
 
-server.on("upgrade", (req, socket) => {
-  const url = new URL(req.url || "/", `http://${HOST}:${PORT}`);
-  if (url.pathname !== "/ws" || !req.headers.origin || !allowedOrigin(req.headers.origin)) {
-    socket.destroy();
-    return;
-  }
-  const key = req.headers["sec-websocket-key"];
-  if (!key) {
-    socket.destroy();
-    return;
-  }
-  const accept = createHash("sha1")
-    .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-    .digest("base64");
-  socket.write([
-    "HTTP/1.1 101 Switching Protocols",
-    "Upgrade: websocket",
-    "Connection: Upgrade",
-    `Sec-WebSocket-Accept: ${accept}`,
-    "",
-    "",
-  ].join("\r\n"));
-  socket.id = randomUUID();
-  socket.wsBuffer = Buffer.alloc(0);
-  wsClients.add(socket);
-  socket.on("data", (chunk) => consumeWsData(socket, chunk));
-  socket.on("close", () => removeWsClient(socket));
-  socket.on("error", () => removeWsClient(socket));
+// Use a bounded RFC 6455 implementation for fragmentation, ping/pong and masking.
+const websocketServer = new WebSocketServer({ noServer: true, maxPayload: MAX_BODY_BYTES, perMessageDeflate: false });
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const url = new URL(req.url || "/", "http://localhost");
+    if (url.pathname !== "/ws" || !req.headers.origin || !allowedOrigin(req.headers.origin)) {
+      socket.destroy();
+      return;
+    }
+    const client = requestClient(req, url);
+    websocketServer.handleUpgrade(req, socket, head, (ws) => {
+      // A reconnect supersedes only this browser's old connection.
+      if (client.id) {
+        for (const old of wsClients) {
+          if (old.origin === client.origin && old.clientId === client.id) old.close(1000, "reconnected");
+        }
+      }
+      ws.origin = client.origin;
+      ws.clientId = client.id;
+      wsClients.add(ws);
+      ws.on("message", (data, binary) => { if (!binary) handleWsText(ws, data.toString("utf8")); });
+      ws.on("close", () => removeWsClient(ws));
+      ws.on("error", () => removeWsClient(ws));
+    });
+  } catch { socket.destroy(); }
 });
 
 function removeWsClient(socket) {
   wsClients.delete(socket);
-  for (const [id, pending] of pendingWsResponses) {
+  for (const pending of pendingWsResponses.values()) {
     if (pending.socket !== socket) continue;
-    clearTimeout(pending.timer);
-    pendingWsResponses.delete(id);
+    pending.cleanup();
     pending.reject(httpError(503, "browser extension WebSocket disconnected"));
   }
 }
 
-function sendWs(payload) {
-  const data = Buffer.from(JSON.stringify(payload), "utf8");
-  for (const socket of wsClients) {
-    try {
-      socket.write(wsFrame(data));
-    } catch {
-      wsClients.delete(socket);
-    }
-  }
+function sendWs(client, payload) {
+  const socket = browserClient(client);
+  if (socket) sendWsToSocket(socket, payload);
 }
 
-function handleWsText(raw) {
+function handleWsText(socket, raw) {
   let message;
-  try {
-    message = JSON.parse(raw);
-  } catch {
-    return;
-  }
-  if (message?.kind === "response") settleWsResponse(message);
+  try { message = JSON.parse(raw); } catch { return; }
+  if (message?.kind === "response") settleWsResponse(socket, message);
 }
 
-function consumeWsData(socket, chunk) {
-  socket.wsBuffer = Buffer.concat([socket.wsBuffer || Buffer.alloc(0), chunk]);
-  let offset = 0;
-  while (socket.wsBuffer.length - offset >= 2) {
-    const first = socket.wsBuffer[offset];
-    const second = socket.wsBuffer[offset + 1];
-    const opcode = first & 0x0f;
-    const masked = (second & 0x80) !== 0;
-    let length = second & 0x7f;
-    let header = offset + 2;
-    if (length === 126) {
-      if (socket.wsBuffer.length - header < 2) break;
-      length = socket.wsBuffer.readUInt16BE(header);
-      header += 2;
-    } else if (length === 127) {
-      if (socket.wsBuffer.length - header < 8) break;
-      const bigLength = socket.wsBuffer.readBigUInt64BE(header);
-      if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) {
-        socket.destroy();
-        return;
-      }
-      length = Number(bigLength);
-      header += 8;
-    }
-    let mask;
-    if (masked) {
-      if (socket.wsBuffer.length - header < 4) break;
-      mask = socket.wsBuffer.subarray(header, header + 4);
-      header += 4;
-    }
-    if (socket.wsBuffer.length - header < length) break;
-    let payload = Buffer.from(socket.wsBuffer.subarray(header, header + length));
-    if (mask) {
-      for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i % 4];
-    }
-    offset = header + length;
-    if (opcode === 0x8) {
-      socket.end();
-      break;
-    }
-    if (opcode === 0x1) handleWsText(payload.toString("utf8"));
-  }
-  socket.wsBuffer = socket.wsBuffer.subarray(offset);
-}
-
-function wsFrame(payload) {
-  if (payload.length < 126) {
-    return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
-  }
-  if (payload.length < 65536) {
-    const header = Buffer.alloc(4);
-    header[0] = 0x81;
-    header[1] = 126;
-    header.writeUInt16BE(payload.length, 2);
-    return Buffer.concat([header, payload]);
-  }
-  const header = Buffer.alloc(10);
-  header[0] = 0x81;
-  header[1] = 127;
-  header.writeBigUInt64BE(BigInt(payload.length), 2);
-  return Buffer.concat([header, payload]);
+for (const event of ["SIGTERM", "SIGINT"]) {
+  process.once(event, () => {
+    for (const controller of activeRequests) controller.abort();
+    for (const controller of activeChats) controller.abort();
+    for (const socket of wsClients) socket.terminate();
+    server.close();
+    server.closeAllConnections();
+  });
 }
 
 server.listen(PORT, HOST, () => {
-  console.log(`babata-sidebar companion listening on http://${HOST}:${PORT}`);
+  console.log(`babata-sidebar companion listening on http://${HOST.includes(":") ? `[${HOST}]` : HOST}:${server.address().port}`);
   console.log(`config: ${CONFIG_PATH}`);
 });
