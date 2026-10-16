@@ -223,6 +223,9 @@ resumes bounded look-ahead. Seeking keeps useful in-flight cues and cancels
 batches outside the new playback window. Display mode can be changed per player;
 font size is saved as a shared subtitle preference. Captions already in the
 target language do not make translation requests.
+The track selector groups matching native copies of the same captions, including
+confirmed rolling-display clones. Different languages, content, or unrelated
+timing remain separate, and native tracks are retained for restoration.
 
 Caption coverage depends on the player exposing a text track or an accessible
 subtitle response. Generic support is not a claim that every site's proprietary

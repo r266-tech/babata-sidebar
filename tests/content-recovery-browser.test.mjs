@@ -92,7 +92,9 @@ await test('extension reload restores page and paused-video translation without 
     nativeTrack.mode = 'showing';
     nativeTrack.addCue(new VTTCue(0, 30, 'A paused caption should recover after the extension updates.'));
   });
-  await page.locator('#source').scrollIntoViewIfNeeded();
+  // Replacement mode can hide #source while Playwright is waiting to scroll.
+  // Its article remains visible before and after translation completes.
+  await page.locator('article').first().scrollIntoViewIfNeeded();
   await expect(page.locator('#source + .bbt-tr')).toContainText('译文');
   await expect(page.locator('#short + .bbt-tr')).toContainText('译文');
   await page.locator('#draft').fill('An unsent reply must survive the extension update.');

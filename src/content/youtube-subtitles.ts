@@ -5,7 +5,7 @@ import {
 } from "../translation-settings";
 import { requestTranslation } from "./translation-client";
 import { parseCaptionBody, type CaptionCue } from "./youtube-captions";
-import { captionTextKey, cuesFromTextTrack, type CaptionSource } from "./video-captions";
+import { captionTextKey, cuesFromTextTrack, groupCaptionSources, type CaptionSource } from "./video-captions";
 import { SubtitleTranslationScheduler } from "./video-translation-scheduler";
 import { VideoTranscription } from "./video-asr";
 
@@ -105,6 +105,9 @@ class VideoSubtitleController {
   private asrStartSequence = 0;
   private interactionGeneration = 0;
   private sourceId = "";
+  private sourceAliases = new Map<string, string>();
+  private sourceOptions: CaptionSource[] = [];
+  private sourcesDirty = true;
   private mode: TranslationMode = globalVideoEnabled ? globalMode : "off";
   private manualMode: TranslationMode | undefined;
   private frame = 0;
@@ -121,6 +124,7 @@ class VideoSubtitleController {
   private trackSnapshots = new Map<TextTrack, string>();
   private cueSnapshots = new WeakMap<TextTrackCue, string>();
   private sourceSignature = "";
+  private selectedSource: CaptionSource | undefined;
   private mediaKey: string;
   private asrCues: CaptionCue[] = [];
   private asrDelayMs = 0;
@@ -198,7 +202,7 @@ class VideoSubtitleController {
     this.sourceSelect.onchange = () => {
       if (!globalVideoEnabled || this.disposed) return;
       const source = this.sources.get(this.sourceSelect.value);
-      if (source) this.selectSource(source);
+      if (source && this.sourceAliases.get(this.sourceId) !== source.id) this.selectSource(source);
     };
     this.scaleInput.oninput = () => {
       const scale = Number(this.scaleInput.value);
@@ -316,17 +320,19 @@ class VideoSubtitleController {
   installSource(source: CaptionSource, select = false): void {
     if (!source.cues.length || this.disposed) return;
     this.sources.set(source.id, source);
-    this.updateSourceOptions();
-    if (select || !this.sourceId || this.sourceId === source.id) this.selectSource(source);
+    this.sourcesDirty = true;
+    this.updateSourceOptions(select ? source.id : undefined);
   }
 
   private selectSource(source: CaptionSource): void {
-    const signature = `${source.id}:${captionTextKey(JSON.stringify(source.cues))}`;
+    if (this.selectedSource === source) return;
+    const signature = `${source.id}:${source.language}:${captionTextKey(JSON.stringify(source.cues))}`;
+    this.selectedSource = source;
     if (signature === this.sourceSignature) return;
     const changed = source.id !== this.sourceId;
     this.sourceSignature = signature;
     this.sourceId = source.id;
-    this.sourceSelect.value = source.id;
+    this.sourceSelect.value = this.sourceAliases.get(source.id) ?? source.id;
     if (changed && source.id !== "asr") {
       this.asrDelayMs = 0;
       if (this.asr.active || this.asrStarting) this.stopAsr("已切换字幕轨道，听译已停止。");
@@ -347,7 +353,7 @@ class VideoSubtitleController {
         track.removeEventListener("cuechange", listener);
         this.watchedTracks.delete(track);
         this.trackSnapshots.delete(track);
-        this.sources.delete(trackId(track));
+        if (this.sources.delete(trackId(track))) this.sourcesDirty = true;
         this.savedTrackModes.delete(track);
       }
     }
@@ -361,10 +367,14 @@ class VideoSubtitleController {
         track.addEventListener("cuechange", listener);
       }
       const cues = track.cues;
-      if (!cues?.length) continue;
+      if (!cues?.length) {
+        if (this.sources.delete(trackId(track))) this.sourcesDirty = true;
+        this.trackSnapshots.delete(track);
+        continue;
+      }
       const first = cues[0] as VTTCue;
       const last = cues[cues.length - 1] as VTTCue;
-      const snapshot = `${cues.length}:${first.startTime}:${first.text}:${last.startTime}:${last.endTime}:${last.text}`;
+      const snapshot = `${track.kind}:${track.label}:${track.language}:${cues.length}:${first.startTime}:${first.text}:${last.startTime}:${last.endTime}:${last.text}`;
       const fingerprint = (cue: TextTrackCue) => `${cue.startTime}:${cue.endTime}:${(cue as VTTCue).text}`;
       const active = Array.from(track.activeCues ?? []);
       // Some custom players expose cues without activeCues. Inspect only the
@@ -382,25 +392,40 @@ class VideoSubtitleController {
       if (this.trackSnapshots.get(track) === snapshot && active.every((cue) => this.cueSnapshots.get(cue) === fingerprint(cue))) continue;
       this.trackSnapshots.set(track, snapshot);
       for (const cue of Array.from(cues)) this.cueSnapshots.set(cue, fingerprint(cue));
-      this.installSource({ id: trackId(track), label: track.label || track.language || `字幕 ${tracks.indexOf(track) + 1}`, language: track.language, cues: cuesFromTextTrack(track), track }, track === preferred && (!this.sourceId || this.sourceId.startsWith("track:")));
+      const id = trackId(track);
+      this.sources.set(id, { id, label: track.label || track.language || `字幕 ${tracks.indexOf(track) + 1}`, language: track.language, cues: cuesFromTextTrack(track), track });
+      this.sourcesDirty = true;
     }
-    if (this.sourceId.startsWith("track:") && !this.sources.has(this.sourceId)) {
-      const alternative = this.sources.values().next().value;
-      if (alternative) this.selectSource(alternative);
-      else this.clearCaptionState();
-    }
-    this.updateSourceOptions();
+    // Reconcile once after all tracks are present. Selecting during the loop
+    // can dispatch a copy first and its canonical track a moment later.
+    this.updateSourceOptions(preferred && (!this.sourceId || this.sourceId.startsWith("track:")) ? trackId(preferred) : undefined);
   };
 
-  private updateSourceOptions(): void {
-    const options = [...this.sources.values()].map((source) => ({ id: source.id, label: source.label }));
+  private updateSourceOptions(preferredId?: string): void {
+    if (this.sourcesDirty) {
+      const grouped = groupCaptionSources([...this.sources.values()]);
+      this.sourceAliases = grouped.aliases;
+      this.sourceOptions = grouped.sources;
+      this.sourcesDirty = false;
+    }
+    const options = this.sourceOptions.map((source) => ({ id: source.id, label: source.label }));
     const signature = JSON.stringify(options);
-    if (this.sourceSelect.dataset.signature === signature) return;
-    this.sourceSelect.dataset.signature = signature;
-    this.sourceSelect.replaceChildren();
-    if (!options.length) this.sourceSelect.add(new Option("等待网站字幕", ""));
-    for (const option of options) this.sourceSelect.add(new Option(option.label, option.id));
-    this.sourceSelect.value = this.sourceId;
+    if (this.sourceSelect.dataset.signature !== signature) {
+      this.sourceSelect.dataset.signature = signature;
+      this.sourceSelect.replaceChildren();
+      if (!options.length) this.sourceSelect.add(new Option("等待网站字幕", ""));
+      for (const option of options) this.sourceSelect.add(new Option(option.label, option.id));
+    }
+    let selected = this.sources.get(this.sourceId);
+    const preferred = preferredId && this.sources.get(this.sourceAliases.get(preferredId) ?? preferredId);
+    // Keep an existing member of the selected group and its translation cache.
+    // The canonical ID represents that group in the UI; it is not an instruction
+    // to switch a live source whenever the website adds a duplicate track.
+    if (preferred && (!selected || this.sourceAliases.get(selected.id) !== preferred.id)) selected = preferred;
+    selected ??= this.sourceOptions[0];
+    if (selected) this.selectSource(selected);
+    else if (this.sourceId) this.clearCaptionState();
+    this.sourceSelect.value = this.sourceAliases.get(this.sourceId) ?? this.sourceId;
   }
 
   private hideNativeTrack(track: TextTrack): void {
@@ -606,6 +631,7 @@ class VideoSubtitleController {
     this.scheduler.setSource("", []);
     this.sourceId = "";
     this.sourceSignature = "";
+    this.selectedSource = undefined;
     this.lastSchedule = "";
     this.hide();
   }
@@ -615,6 +641,7 @@ class VideoSubtitleController {
     this.seeking = false;
     this.scheduler.setDispatchPaused(false);
     this.sources.clear();
+    this.sourcesDirty = true;
     this.trackSnapshots.clear();
     this.asrCues = [];
     this.asrDelayMs = 0;

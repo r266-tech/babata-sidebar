@@ -8,6 +8,155 @@ export interface CaptionSource {
   track?: TextTrack;
 }
 
+interface PreparedCaptionSource {
+  cues: CaptionCue[];
+  language: string;
+  key: string;
+  endMs: number;
+}
+
+export interface CaptionSourceGroups {
+  sources: CaptionSource[];
+  aliases: Map<string, string>;
+}
+
+// Sources are replaced when their cues or metadata change. Keep comparisons
+// tied to those revisions instead of scanning transcripts during playback.
+const preparedSources = new WeakMap<CaptionSource, PreparedCaptionSource>();
+const rollingMatches = new WeakMap<CaptionSource, WeakMap<CaptionSource, boolean>>();
+
+function prepareCaptionSource(source: CaptionSource): PreparedCaptionSource {
+  const previous = preparedSources.get(source);
+  if (previous) return previous;
+  const language = source.language.trim().toLowerCase().replace(/_/g, "-");
+  const cues = source.cues.filter((cue) => Number.isFinite(cue.startMs) && Number.isFinite(cue.endMs)
+    && cue.startMs >= 0 && cue.endMs > cue.startMs && typeof cue.text === "string")
+    .map((cue) => ({ ...cue, text: cleanCaptionText(cue.text) })).filter((cue) => cue.text)
+    .sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
+  const prepared = { cues, language, key: captionTextKey(JSON.stringify(cues), "source", language), endMs: cues.reduce((end, cue) => Math.max(end, cue.endMs), 0) };
+  preparedSources.set(source, prepared);
+  return prepared;
+}
+
+function sameCaptionCues(left: PreparedCaptionSource, right: PreparedCaptionSource): boolean {
+  return left.cues.length > 0 && left.language === right.language && left.cues.length === right.cues.length
+    && left.cues.every((cue, index) => cue.startMs === right.cues[index].startMs
+      && cue.endMs === right.cues[index].endMs && cue.text === right.cues[index].text);
+}
+
+function isInternalCopy(source: CaptionSource): boolean {
+  return !!source.track && !source.language.trim() && /^(?:clone|copy)(?:[\s_-]*\d+)?$/i.test(source.label.trim());
+}
+
+function isRollingCopy(copy: CaptionSource, original: CaptionSource): boolean {
+  let comparisons = rollingMatches.get(copy);
+  if (!comparisons) { comparisons = new WeakMap(); rollingMatches.set(copy, comparisons); }
+  const cached = comparisons.get(original);
+  if (cached !== undefined) return cached;
+  const result = matchesRollingCues(prepareCaptionSource(copy), prepareCaptionSource(original));
+  comparisons.set(original, result);
+  return result;
+}
+
+function matchesRollingCues(copy: PreparedCaptionSource, original: PreparedCaptionSource): boolean {
+  const toleranceMs = 1;
+  if (!copy.cues.length || !original.cues.length
+    || Math.abs(copy.cues[0].startMs - original.cues[0].startMs) > toleranceMs
+    || Math.abs(copy.endMs - original.endMs) > toleranceMs) return false;
+  const covered = new Map<number, Array<{ startMs: number; endMs: number; canClipStart: boolean }>>();
+  let next = 0;
+  let active: number[] = [];
+  for (const cue of copy.cues) {
+    active = active.filter((index) => original.cues[index].endMs + toleranceMs >= cue.startMs);
+    while (next < original.cues.length && original.cues[next].startMs <= cue.startMs + toleranceMs) {
+      if (original.cues[next].endMs + toleranceMs >= cue.startMs) active.push(next);
+      next += 1;
+    }
+    // A real rolling display has few simultaneous lines. Preserve unusual or
+    // hostile tracks instead of allowing a quadratic transcript comparison.
+    if (active.length > 32) return false;
+    let match: number[] | undefined;
+    for (const start of active) {
+      let text = "";
+      const indices: number[] = [];
+      for (let index = start; index < original.cues.length && indices.length < 32; index += 1) {
+        const part = original.cues[index];
+        // A combined line must be displayed while all its original lines are
+        // valid. Matching words somewhere else in the video are insufficient.
+        if (part.startMs > cue.startMs + toleranceMs || part.endMs + toleranceMs < cue.endMs) break;
+        text += `${text ? " " : ""}${part.text}`;
+        indices.push(index);
+        if (text === cue.text) {
+          if (match) return false; // Repeated simultaneous phrases are ambiguous.
+          match = indices;
+          break;
+        }
+        if (!cue.text.startsWith(`${text} `)) break;
+      }
+    }
+    if (!match) return false;
+    for (const index of match) {
+      const intervals = covered.get(index) ?? [];
+      const canClipStart = match.some((other) => other !== index
+        && original.cues[other].startMs > original.cues[index].startMs + toleranceMs
+        && Math.abs(original.cues[other].startMs - cue.startMs) <= toleranceMs);
+      intervals.push({ startMs: cue.startMs, endMs: cue.endMs, canClipStart });
+      covered.set(index, intervals);
+    }
+  }
+  if (covered.size !== original.cues.length) return false;
+  for (const [index, intervals] of covered) {
+    let endMs = original.cues[index].startMs;
+    for (let at = 0; at < intervals.length; at += 1) {
+      const interval = intervals[at];
+      // Some players keep an older line only from the next line's arrival,
+      // as part of their combined rolling cue. That precise leading clip is
+      // allowed; arbitrary gaps, isolated clips, and missing tails are not.
+      if (interval.startMs > endMs + toleranceMs && (at !== 0 || !interval.canClipStart)) return false;
+      endMs = Math.max(endMs, interval.endMs);
+    }
+    if (endMs + toleranceMs < original.cues[index].endMs) return false;
+  }
+  return true;
+}
+
+/** Collapse equivalent native choices without deleting their live sources.
+ * Imported files and transcription remain distinct, explicit user choices. */
+export function groupCaptionSources(sources: CaptionSource[]): CaptionSourceGroups {
+  const aliases = new Map(sources.map((source) => [source.id, source.id]));
+  const native = sources.filter((source) => source.track);
+  const buckets = new Map<string, CaptionSource[]>();
+  // Prefer a descriptive track over a platform's internal copy when exact
+  // duplicates have the same language, regardless of insertion order.
+  for (const source of [...native].sort((a, b) => Number(isInternalCopy(a)) - Number(isInternalCopy(b)))) {
+    const prepared = prepareCaptionSource(source);
+    const bucket = buckets.get(prepared.key) ?? [];
+    const duplicate = bucket.find((candidate) => sameCaptionCues(prepared, prepareCaptionSource(candidate)));
+    if (duplicate) aliases.set(source.id, duplicate.id);
+    else { bucket.push(source); buckets.set(prepared.key, bucket); }
+  }
+  const representatives = native.filter((source) => aliases.get(source.id) === source.id);
+  const originals = representatives.filter((source) => source.language.trim() && !isInternalCopy(source));
+  for (const source of representatives) {
+    if (!isInternalCopy(source)) continue;
+    const candidates = originals.filter((original) => isRollingCopy(source, original));
+    // An unknown-language copy must never choose arbitrarily between real
+    // language tracks, even when their short captions happen to match.
+    if (candidates.length === 1) aliases.set(source.id, candidates[0].id);
+  }
+  for (const [id, candidate] of aliases) aliases.set(id, aliases.get(candidate) ?? candidate);
+  const byId = new Map(sources.map((source) => [source.id, source]));
+  const seen = new Set<string>();
+  const choices: CaptionSource[] = [];
+  for (const source of sources) {
+    const id = aliases.get(source.id)!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    choices.push(byId.get(id)!);
+  }
+  return { sources: choices, aliases };
+}
+
 export function captionTextKey(text: string, target = "zh", language = ""): string {
   // The transport key is only an identifier. The companion builds its own
   // complete provider/prompt/language cache identity from the request.

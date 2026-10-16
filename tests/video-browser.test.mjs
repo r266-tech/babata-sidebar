@@ -6,15 +6,31 @@ import { chromium, expect } from '@playwright/test';
 const bundle = (await build({ entryPoints: ['src/content/youtube-subtitles.ts'], bundle: true, write: false, format: 'iife' })).outputFiles[0].text;
 const captureBundle = (await build({ entryPoints: ['src/content/youtube-subtitles-main.ts'], bundle: true, write: false, format: 'iife' })).outputFiles[0].text;
 
+function rollingTrackFixtures(count = 20) {
+  const cues = Array.from({ length: count }, (_, index) => ({
+    start: index * 2, end: index * 2 + 3,
+    text: `Synthetic stage ${index + 1} explains an independent instruction.`,
+  }));
+  const rolling = [{ start: 0, end: 2, text: cues[0].text }];
+  for (let index = 1; index < cues.length; index++) {
+    rolling.push({ start: index * 2, end: index * 2 + 1, text: `${cues[index - 1].text}\n${cues[index].text}` });
+    rolling.push({ start: index * 2 + 1, end: index * 2 + (index === cues.length - 1 ? 3 : 2), text: cues[index].text });
+  }
+  return [
+    { kind: 'subtitles', label: 'English auto-generated', language: 'en', mode: 'showing', cues },
+    { kind: 'captions', label: 'clone', language: '', mode: 'hidden', cues: rolling },
+  ];
+}
+
 await test('video captions and explicit audio transcription in Chromium', { timeout: 90_000 }, async (t) => {
   const browser = await chromium.launch({ headless: true, args: ['--autoplay-policy=no-user-gesture-required'] });
   t.after(() => browser.close());
 
-  async function fixture({ cueCount = 80, language = 'en', mode = 'replace', response = 'echo', realMedia = false, playing = false, videoEnabled = true, disabledHosts = [], capabilities = 'echo', transcription = 'echo' } = {}) {
+  async function fixture({ cueCount = 80, language = 'en', mode = 'replace', response = 'echo', realMedia = false, playing = false, videoEnabled = true, disabledHosts = [], capabilities = 'echo', transcription = 'echo', trackFixtures } = {}) {
     const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
     await page.route('https://video.test/**', (route) => route.fulfill({ contentType: 'text/html', body: '<!doctype html><html><head><style>body{margin:0}main{width:700px;height:950px;padding:25px}video{display:block;width:640px;height:360px;background:#222}</style></head><body><main><video id="video" muted></video></main></body></html>' }));
     await page.goto('https://video.test/watch');
-    await page.evaluate(async ({ cueCount, language, mode, response, realMedia, playing, videoEnabled, disabledHosts, capabilities, transcription }) => {
+    await page.evaluate(async ({ cueCount, language, mode, response, realMedia, playing, videoEnabled, disabledHosts, capabilities, transcription, trackFixtures }) => {
       window.requests = [];
       window.pendingReplies = [];
       window.pendingCapabilities = [];
@@ -72,11 +88,39 @@ await test('video captions and explicit audio transcription in Chromium', { time
       } else {
         Object.defineProperty(video, 'currentTime', { value: 0, writable: true });
         Object.defineProperty(video, 'paused', { value: !playing, writable: true });
-        window.nativeTrack = video.addTextTrack('subtitles', 'English source', language);
-        nativeTrack.mode = 'showing';
-        for (let index = 0; index < cueCount; index++) nativeTrack.addCue(new VTTCue(index * 2, (index + 1) * 2, language.startsWith('zh') ? `中文第 ${index} 条字幕。` : `Caption number ${index}.`));
+        if (trackFixtures) {
+          window.fixtureTracks = [];
+          window.createFixtureTrack = async (source) => {
+            const element = document.createElement('track');
+            element.kind = source.kind; element.label = source.label; element.srclang = source.language;
+            const stamp = (seconds) => {
+              const milliseconds = Math.round(seconds * 1000);
+              return `${String(Math.floor(milliseconds / 3600000)).padStart(2, '0')}:${String(Math.floor(milliseconds / 60000) % 60).padStart(2, '0')}:${String(Math.floor(milliseconds / 1000) % 60).padStart(2, '0')}.${String(milliseconds % 1000).padStart(3, '0')}`;
+            };
+            const text = `WEBVTT\n\n${source.cues.map((cue, index) => `${index + 1}\n${stamp(cue.start)} --> ${stamp(cue.end)}\n${cue.text}`).join('\n\n')}\n\n`;
+            const url = URL.createObjectURL(new Blob([text], { type: 'text/vtt' }));
+            element.src = url;
+            try {
+              await new Promise((resolve, reject) => {
+                element.addEventListener('load', resolve, { once: true });
+                element.addEventListener('error', () => reject(new Error('Synthetic WebVTT track failed to load')), { once: true });
+                video.append(element);
+                element.track.mode = source.mode === 'disabled' ? 'hidden' : source.mode;
+              });
+            } finally { URL.revokeObjectURL(url); }
+            element.track.mode = source.mode;
+            fixtureTracks.push(element);
+            return element;
+          };
+          for (const source of trackFixtures) await createFixtureTrack(source);
+          window.nativeTrack = fixtureTracks[0].track;
+        } else {
+          window.nativeTrack = video.addTextTrack('subtitles', 'English source', language);
+          nativeTrack.mode = 'showing';
+          for (let index = 0; index < cueCount; index++) nativeTrack.addCue(new VTTCue(index * 2, (index + 1) * 2, language.startsWith('zh') ? `中文第 ${index} 条字幕。` : `Caption number ${index}.`));
+        }
       }
-    }, { cueCount, language, mode, response, realMedia, playing, videoEnabled, disabledHosts, capabilities, transcription });
+    }, { cueCount, language, mode, response, realMedia, playing, videoEnabled, disabledHosts, capabilities, transcription, trackFixtures });
     const errors = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.addScriptTag({ content: bundle });
@@ -413,6 +457,163 @@ await test('video captions and explicit audio transcription in Chromium', { time
     assert.deepEqual(texts, ['Caption number 0.', 'Caption number 1.', 'The corrected middle caption.']);
     assert.deepEqual(errors, []);
     await page.close();
+  });
+
+  await t.test('a rolling clone has one canonical option and never translates duplicate combinations', async (t) => {
+    const sources = rollingTrackFixtures();
+    sources[0].mode = 'hidden';
+    sources[1].mode = 'showing';
+    const { page, errors } = await fixture({ trackFixtures: sources, playing: true });
+    t.after(() => page.close());
+    await page.getByRole('button', { name: '字幕设置' }).click();
+    const select = page.getByLabel('字幕轨道');
+    await expect(select.locator('option')).toHaveText(['English auto-generated']);
+    await expect(page.locator('.bbt-video-overlay')).toContainText(`译文 ${sources[0].cues[0].text}`);
+    await expect.poll(() => page.evaluate(() => requests.filter((message) => message.type === 'babata.translate').flatMap((message) => message.batch).length)).toBe(18);
+    await page.evaluate(() => { video.currentTime = 34; video.dispatchEvent(new Event('timeupdate')); });
+    await expect.poll(() => page.evaluate(() => requests.filter((message) => message.type === 'babata.translate').flatMap((message) => message.batch).length)).toBe(20);
+    await page.evaluate(() => { video.currentTime = 2.5; video.dispatchEvent(new Event('timeupdate')); });
+    await expect(page.locator('.bbt-video-overlay')).toContainText(`译文 ${sources[0].cues[1].text}`);
+    const texts = await page.evaluate(() => requests.filter((message) => message.type === 'babata.translate').flatMap((message) => message.batch).map((item) => item.text));
+    assert.deepEqual(texts.slice().sort(), sources[0].cues.map((cue) => cue.text).sort(), 'only the twenty original sentences reach translation, once each');
+    assert.equal(await page.evaluate(() => video.textTracks.length), 2, 'folding the menu must preserve both physical tracks');
+
+    await page.evaluate(() => setSettings({ 'babata.video_translation_enabled': false }));
+    await expect(page.locator('.bbt-video-overlay')).toBeHidden();
+    assert.deepEqual(await page.evaluate(() => fixtureTracks.map((element) => element.track.mode)), ['hidden', 'showing']);
+    await page.evaluate(() => setSettings({ 'babata.video_translation_enabled': true }));
+    await expect(page.locator('.bbt-video-overlay')).toContainText(`译文 ${sources[0].cues[1].text}`);
+    await page.waitForTimeout(80);
+    assert.equal(await page.evaluate(() => requests.filter((message) => message.type === 'babata.translate').flatMap((message) => message.batch).length), 20);
+    assert.deepEqual(errors, []);
+  });
+
+  await t.test('rolling clone folding preserves explicit languages and same-label tracks with different content', async (t) => {
+    const sources = rollingTrackFixtures();
+    sources.push({ ...sources[0], label: 'Deutsch', language: 'de', mode: 'hidden', cues: sources[0].cues.map((cue, index) => ({ ...cue, text: `Synthetischer Schritt ${index + 1} erläutert eine eigenständige Anweisung.` })) });
+    sources.push({ ...sources[0], mode: 'hidden', cues: sources[0].cues.map((cue, index) => ({ ...cue, text: `Different commentary line ${index + 1} explains another idea.` })) });
+    const { page, errors } = await fixture({ trackFixtures: sources });
+    t.after(() => page.close());
+    await page.getByRole('button', { name: '字幕设置' }).click();
+    const select = page.getByLabel('字幕轨道');
+    await expect(select.locator('option')).toHaveText(['English auto-generated', 'Deutsch', 'English auto-generated']);
+    await expect(page.locator('.bbt-video-overlay')).toContainText(`译文 ${sources[0].cues[0].text}`);
+    await select.selectOption({ label: 'Deutsch' });
+    await expect.poll(() => page.evaluate(() => requests.filter((message) => message.type === 'babata.translate').flatMap((message) => message.batch).length)).toBe(2);
+    await expect(page.locator('.bbt-video-overlay')).toContainText('译文 Synthetischer Schritt 1 erläutert eine eigenständige Anweisung.');
+    await select.selectOption(await select.locator('option').nth(2).getAttribute('value'));
+    await expect(page.locator('.bbt-video-overlay')).toContainText('译文 Different commentary line 1 explains another idea.');
+    assert.equal(await page.evaluate(() => video.textTracks.length), 4);
+    assert.equal(await page.evaluate(() => requests.filter((message) => message.type === 'babata.translate').flatMap((message) => message.batch).length), 3);
+    assert.deepEqual(errors, []);
+  });
+
+  await t.test('an ambiguous rolling clone stays independent when different declared languages share its transcript', async (t) => {
+    const sources = rollingTrackFixtures();
+    sources.push({ ...sources[0], label: 'Deutsch', language: 'de', mode: 'hidden' });
+    const { page, errors } = await fixture({ trackFixtures: sources });
+    t.after(() => page.close());
+    await page.getByRole('button', { name: '字幕设置' }).click();
+    const select = page.getByLabel('字幕轨道');
+    await expect(select.locator('option')).toHaveText(['English auto-generated', 'clone', 'Deutsch']);
+    await select.selectOption({ label: 'clone' });
+    await page.evaluate(() => { video.currentTime = 2.5; video.dispatchEvent(new Event('timeupdate')); });
+    await expect(page.locator('.bbt-video-overlay')).toHaveAttribute('data-state', 'ready');
+    await expect(page.locator('.bbt-video-overlay')).toContainText(sources[0].cues[0].text);
+    await expect(page.locator('.bbt-video-overlay')).toContainText(sources[0].cues[1].text);
+    assert.deepEqual(errors, []);
+  });
+
+  await t.test('a selected rolling clone keeps its request identity when the original track arrives later', async (t) => {
+    const sources = rollingTrackFixtures();
+    const { page, errors } = await fixture({ trackFixtures: [{ ...sources[1], mode: 'showing' }] });
+    t.after(() => page.close());
+    await page.getByRole('button', { name: '字幕设置' }).click();
+    const select = page.getByLabel('字幕轨道');
+    await expect(select.locator('option')).toHaveText(['clone']);
+    await expect(page.locator('.bbt-video-overlay')).toContainText(`译文 ${sources[0].cues[0].text}`);
+    await page.evaluate(() => { video.currentTime = 2.5; video.dispatchEvent(new Event('timeupdate')); });
+    await expect(page.locator('.bbt-video-overlay')).toHaveAttribute('data-state', 'ready');
+    await expect(page.locator('.bbt-video-overlay')).toContainText(sources[0].cues[1].text);
+    const count = await page.evaluate(() => requests.filter((message) => message.type === 'babata.translate').flatMap((message) => message.batch).length);
+    assert.equal(count, 2);
+    await page.evaluate(async (source) => {
+      const element = await createFixtureTrack({ ...source, mode: 'hidden' });
+      element.track.dispatchEvent(new Event('cuechange'));
+    }, sources[0]);
+    await expect(select.locator('option')).toHaveText(['English auto-generated']);
+    assert.notEqual(await select.inputValue(), '');
+    await select.selectOption({ label: 'English auto-generated' });
+    await page.waitForTimeout(100);
+    assert.equal(await page.evaluate(() => requests.filter((message) => message.type === 'babata.translate').flatMap((message) => message.batch).length), count, 'adding the canonical option and selecting its current row must not change the active request identity');
+    await expect(page.locator('.bbt-video-overlay')).toContainText(sources[0].cues[0].text);
+    await expect(page.locator('.bbt-video-overlay')).toContainText(sources[0].cues[1].text);
+    assert.deepEqual(errors, []);
+  });
+
+  await t.test('a folded rolling clone remains watched and becomes selectable after text or timing changes', async (t) => {
+    const sources = rollingTrackFixtures();
+    const { page, errors } = await fixture({ trackFixtures: sources });
+    t.after(() => page.close());
+    await page.getByRole('button', { name: '字幕设置' }).click();
+    const select = page.getByLabel('字幕轨道');
+    await expect(select.locator('option')).toHaveText(['English auto-generated']);
+    await expect(page.locator('.bbt-video-overlay')).toContainText(`译文 ${sources[0].cues[0].text}`);
+    await page.evaluate(() => {
+      const track = fixtureTracks[1].track;
+      window.originalCloneText = track.cues[0].text;
+      track.cues[0].text = 'A live clone correction supplies a different sentence.';
+      track.dispatchEvent(new Event('cuechange'));
+    });
+    await expect(select.locator('option')).toHaveText(['English auto-generated', 'clone']);
+    await select.selectOption({ label: 'clone' });
+    await expect(page.locator('.bbt-video-overlay')).toContainText('译文 A live clone correction supplies a different sentence.');
+    await page.evaluate(() => {
+      const track = fixtureTracks[1].track;
+      track.cues[0].text = originalCloneText;
+      track.dispatchEvent(new Event('cuechange'));
+    });
+    await expect(select.locator('option')).toHaveText(['English auto-generated']);
+    assert.notEqual(await select.inputValue(), '', 'rejoining the canonical track must leave a selected visible option');
+    await expect(page.locator('.bbt-video-overlay')).toContainText(`译文 ${sources[0].cues[0].text}`);
+
+    await page.evaluate(() => {
+      const track = fixtureTracks[1].track;
+      for (const cue of Array.from(track.cues)) { cue.endTime += 5; cue.startTime += 5; }
+      track.dispatchEvent(new Event('cuechange'));
+    });
+    await expect(select.locator('option')).toHaveText(['English auto-generated', 'clone']);
+    assert.equal(await select.locator('option:checked').textContent(), 'clone', 'a track that separates again must preserve the user-selected underlying source');
+    await select.selectOption({ label: 'clone' });
+    await page.evaluate(() => { video.currentTime = 5.5; video.dispatchEvent(new Event('timeupdate')); });
+    await expect(page.locator('.bbt-video-overlay')).toContainText(`译文 ${sources[0].cues[0].text}`);
+    assert.equal(await select.locator('option:checked').textContent(), 'clone');
+    assert.deepEqual(errors, []);
+  });
+
+  await t.test('removing the original DOM track promotes its rolling clone and restores the clone native mode when off', async (t) => {
+    const sources = rollingTrackFixtures();
+    sources[1].mode = 'showing';
+    const { page, errors } = await fixture({ trackFixtures: sources });
+    t.after(() => page.close());
+    await page.getByRole('button', { name: '字幕设置' }).click();
+    const select = page.getByLabel('字幕轨道');
+    await expect(select.locator('option')).toHaveText(['English auto-generated']);
+    await expect(page.locator('.bbt-video-overlay')).toContainText(`译文 ${sources[0].cues[0].text}`);
+    await page.evaluate(() => fixtureTracks[0].remove());
+    await expect.poll(() => page.evaluate(() => video.textTracks.length)).toBe(1);
+    await expect(select.locator('option')).toHaveText(['clone']);
+    assert.notEqual(await select.inputValue(), '', 'removing the canonical DOM track must select the remaining clone');
+    await select.selectOption({ label: 'clone' });
+    await page.evaluate(() => { video.currentTime = 2.5; video.dispatchEvent(new Event('timeupdate')); });
+    await expect(page.locator('.bbt-video-overlay')).toHaveAttribute('data-state', 'ready');
+    await expect(page.locator('.bbt-video-overlay')).toContainText(sources[0].cues[0].text);
+    await expect(page.locator('.bbt-video-overlay')).toContainText(sources[0].cues[1].text);
+    assert.ok(await page.evaluate(() => requests.filter((message) => message.type === 'babata.translate').flatMap((message) => message.batch).some((item) => item.text.includes('Synthetic stage 1 ') && item.text.includes('Synthetic stage 2 '))), 'the remaining clone must actually translate its rolling caption');
+    await page.getByLabel('字幕显示模式').selectOption('off');
+    await expect(page.locator('.bbt-video-overlay')).toBeHidden();
+    assert.equal(await page.evaluate(() => fixtureTracks[1].track.mode), 'showing');
+    assert.deepEqual(errors, []);
   });
 
   await t.test('reinjecting scripts is idempotent and a replacement world tears down the old video controller', async () => {
