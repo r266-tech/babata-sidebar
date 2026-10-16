@@ -117,6 +117,9 @@ const FIRST_BATCH_SIZE = 4;
 let completedBatches = 0;
 const TRANSLATION_BATCH_CHAR_BUDGET = 6000;
 const FLUSH_DEBOUNCE_MS = 24;
+// Brief tab switches and scroll reversals should keep the same subscription.
+// The companion independently bounds any remaining orphaned provider work.
+const DEPARTURE_CANCEL_DELAY_MS = 180;
 // Keep provider work bounded. Farther paragraphs stay observed, and queue
 // saturation triggers an incremental refill instead of evicting visible text.
 const QUEUE_MAX = 5000;
@@ -189,8 +192,9 @@ function scheduleViewportPush() {
 function setupAttentionWatchers() {
   const onVisibilityChange = () => {
     pushAttention({ kind: "attention", visibility: document.visibilityState });
-    if (document.visibilityState === "hidden") { cancelPageRequests(); cancelScanTasks(); }
+    if (document.visibilityState === "hidden") cancelScanTasks();
     else { observeNew(document.body, "rerun"); scheduleFlush(0); }
+    updateBatchCancellation();
   };
   const onFocus = () => pushAttention({ kind: "attention", focus: "yes" });
   const onBlur = () => pushAttention({ kind: "attention", focus: "no" });
@@ -1618,6 +1622,21 @@ function releaseQueueItem(hash: string, item: QueueItem) {
   item.elements.forEach((element) => inFlightElements.delete(element));
 }
 
+function finishQueueItem(hash: string, item: QueueItem): boolean {
+  if (queue.get(hash) !== item || !item.parts.every((part) => part.translated !== undefined)) return false;
+  const translated = item.parts.map((part) => part.translated).join("");
+  cacheTranslation(hash, translated);
+  releaseQueueItem(hash, item);
+  for (const element of item.elements) {
+    if (!element.isConnected) continue;
+    const current = sourceTextForTranslation(element);
+    if (hashText(normalizeForHash(current), TARGET_LANG) === hash) {
+      if (hasVisibleSurface(element)) injectTranslation(element, translated);
+    } else processCandidate(element, "mo_char");
+  }
+  return true;
+}
+
 function doProcessCandidate(el: HTMLElement, src: TraceSource) {
   if (!active || mode === "off" || document.visibilityState === "hidden" || !el.isConnected) return;
   if (isIgnoredElement(el)) { clearCandidateState(el); return; }
@@ -1668,7 +1687,10 @@ function doProcessCandidate(el: HTMLElement, src: TraceSource) {
     injectTranslation(el, translated);
     return;
   }
-  queue.set(fresh, { el, elements: new Set([el]), text, requestText, visible: isActuallyVisible(el), parts });
+  const item = { el, elements: new Set([el]), text, requestText, visible: isActuallyVisible(el), parts };
+  queue.set(fresh, item);
+  attachPendingChunkOwners([item]);
+  updateBatchCancellation();
   trace(src, el, fresh, "enqueue", text);
   scheduleFlush();
 }
@@ -1680,10 +1702,61 @@ function isActuallyVisible(el: HTMLElement): boolean {
 }
 
 const batchOwners = new Map<AbortController, QueueItem[]>();
+const batchCancellationTimers = new Map<AbortController, number>();
+const chunkFlights = new Map<string, { text: string; controller: AbortController }>();
+
+function attachPendingChunkOwners(items: Iterable<QueueItem> = queue.values()) {
+  for (const item of items) {
+    for (const part of item.parts) {
+      const flight = chunkFlights.get(part.hash);
+      if (!flight || flight.text !== part.text || part.translated !== undefined) continue;
+      part.inFlight = true;
+      const owners = batchOwners.get(flight.controller);
+      if (owners && !owners.includes(item)) owners.push(item);
+    }
+  }
+}
+
+function hasVisibleSurface(el: HTMLElement): boolean {
+  if (!el.isConnected || isIgnoredElement(el)) return false;
+  // Replace mode intentionally hides the source while its generated sibling
+  // remains visible. Use that sibling when refreshing an existing translation.
+  const translated = injectedTranslations.get(el);
+  for (let node: HTMLElement | null = translated?.isConnected ? translated : el; node; node = node.parentElement) {
+    if (isHidden(node)) return false;
+  }
+  return true;
+}
+
+function batchStillNeeded(owners: QueueItem[]): boolean {
+  return document.visibilityState !== "hidden" && owners.some((item) =>
+    [...item.elements].some((element) => hasVisibleSurface(element) && isElementNearViewport(element)));
+}
+
+function clearBatchCancellation(controller: AbortController) {
+  const timer = batchCancellationTimers.get(controller);
+  if (timer !== undefined) clearTimeout(timer);
+  batchCancellationTimers.delete(controller);
+}
+
+function updateBatchCancellation() {
+  for (const [controller, owners] of batchOwners) {
+    if (batchStillNeeded(owners)) { clearBatchCancellation(controller); continue; }
+    if (controller.signal.aborted || batchCancellationTimers.has(controller)) continue;
+    batchCancellationTimers.set(controller, window.setTimeout(() => {
+      batchCancellationTimers.delete(controller);
+      const current = batchOwners.get(controller);
+      if (current && !batchStillNeeded(current)) controller.abort();
+    }, DEPARTURE_CANCEL_DELAY_MS));
+  }
+}
+
 function cancelPageRequests() {
+  for (const controller of batchCancellationTimers.keys()) clearBatchCancellation(controller);
   for (const controller of activeRequests) controller.abort();
   activeRequests.clear();
   batchOwners.clear();
+  chunkFlights.clear();
   queue.clear();
   inFlightHashes.clear();
   inFlightElements = new WeakSet();
@@ -1700,29 +1773,36 @@ function scheduleFlush(delayMs = FLUSH_DEBOUNCE_MS) {
 interface SelectedPart { ownerHash: string; item: QueueItem; part: TranslationPart }
 function flush() {
   flushTimer = null;
-  if (!active || mode === "off") return;
+  if (!active || mode === "off" || document.visibilityState === "hidden") return;
   while (activeRequests.size < MAX_PARALLEL_BATCHES) {
+    attachPendingChunkOwners();
     const candidates: Array<[string, QueueItem]> = [];
     for (const [hash, item] of queue) {
       for (const element of item.elements) {
         if (!element.isConnected || isIgnoredElement(element)) { item.elements.delete(element); inFlightElements.delete(element); }
       }
-      const live = [...item.elements].find((element) => isElementNearViewport(element));
+      for (const part of item.parts) {
+        if (part.translated === undefined && !part.inFlight) part.translated = cachedTranslation(part.hash);
+      }
+      if (finishQueueItem(hash, item)) continue;
+      const live = [...item.elements].find((element) => hasVisibleSurface(element) && isElementNearViewport(element));
       if (live) { item.el = live; item.visible = isActuallyVisible(live); candidates.push([hash, item]); }
       else if (!item.parts.some((part) => part.inFlight)) releaseQueueItem(hash, item);
     }
     candidates.sort((a, b) => Number(b[1].visible) - Number(a[1].visible));
     const selected: SelectedPart[] = [];
+    const selectedHashes = new Set<string>();
     const size = completedBatches === 0 ? FIRST_BATCH_SIZE : BATCH_SIZE;
     let chars = 0;
     let retryAt = Infinity;
     const now = Date.now();
     for (const [ownerHash, item] of candidates) {
       for (const part of item.parts) {
-        if (part.translated !== undefined || part.inFlight) continue;
+        if (part.translated !== undefined || part.inFlight || chunkFlights.has(part.hash) || selectedHashes.has(part.hash)) continue;
         if (part.retryAt > now) { retryAt = Math.min(retryAt, part.retryAt); continue; }
         if (selected.length >= size || (selected.length && chars + part.text.length > TRANSLATION_BATCH_CHAR_BUDGET)) break;
         part.inFlight = true;
+        selectedHashes.add(part.hash);
         selected.push({ ownerHash, item, part });
         chars += part.text.length;
       }
@@ -1734,7 +1814,9 @@ function flush() {
     }
     const controller = new AbortController();
     activeRequests.add(controller);
-    batchOwners.set(controller, selected.map(({ item }) => item));
+    batchOwners.set(controller, Array.from(new Set(selected.map(({ item }) => item))));
+    for (const { part } of selected) chunkFlights.set(part.hash, { text: part.text, controller });
+    attachPendingChunkOwners();
     void runBatch(selected, controller, lifecycle);
   }
 }
@@ -1744,63 +1826,68 @@ async function runBatch(selected: SelectedPart[], controller: AbortController, g
     const response = await requestTranslation({
       site: location.hostname, url: location.href, target: TARGET_LANG,
       priority: selected.some(({ item }) => item.visible) ? "visible" : "prefetch",
-      // Repeated chunks are separate positions in the paragraph but one wire
-      // item. Keep selected intact so every position receives the shared result.
-      batch: Array.from(new Map(selected.map(({ part }) => [part.hash, { hash: part.hash, text: part.text }])).values()),
+      // A chunk has one in-flight wire item across all paragraph owners.
+      batch: selected.map(({ part }) => ({ hash: part.hash, text: part.text })),
     }, { signal: controller.signal });
     if (!active || generation !== lifecycle || controller.signal.aborted) return;
     completedBatches++;
     const results = new Map((response.results || []).filter((item) => typeof item?.translated === "string" && item.translated.trim()).map((item) => [item.hash, item.translated]));
     const errors = new Map((response.errors || []).map((error) => [error.hash, error]));
-    for (const { ownerHash, item, part } of selected) {
-      if (queue.get(ownerHash) !== item || part.translated !== undefined) continue;
+    const sources = new Map(selected.map(({ part }) => [part.hash, part.text]));
+    for (const { part } of selected) {
       const translated = results.get(part.hash);
-      if (translated !== undefined) {
-        // Fan out to every equal chunk in this paragraph, including chunks not
-        // selected yet. Array order remains the source order when reassembled.
-        for (const sibling of item.parts) {
-          if (sibling.hash === part.hash && sibling.text === part.text) sibling.translated = translated;
+      if (translated !== undefined) cacheTranslation(part.hash, translated);
+    }
+    // Owners can join after dispatch. Apply the outcome to every matching
+    // position while retaining each paragraph's original assembly order.
+    for (const [ownerHash, item] of queue) {
+      for (const part of item.parts) {
+        if (part.translated !== undefined || sources.get(part.hash) !== part.text) continue;
+        const translated = results.get(part.hash);
+        if (translated !== undefined) {
+          part.translated = translated;
+          continue;
         }
-        cacheTranslation(part.hash, translated);
-        continue;
-      }
-      const error = errors.get(part.hash);
-      part.attempts++;
-      const retryable = error?.retryable ?? response.retryable ?? true;
-      const limit = response.ok ? MISSING_RESULT_MAX_RETRIES : TRANSPORT_MAX_RETRIES;
-      if (!retryable || part.attempts > limit) {
-        rejectedHashes.add(ownerHash);
-        while (rejectedHashes.size > CACHE_MAX) rejectedHashes.delete(rejectedHashes.values().next().value!);
-        releaseQueueItem(ownerHash, item);
-        trace("mo_add", item.el, ownerHash, "transport_drop", item.text);
-      } else {
+        const error = errors.get(part.hash);
+        part.attempts++;
+        const retryable = error?.retryable ?? response.retryable ?? true;
+        const limit = response.ok ? MISSING_RESULT_MAX_RETRIES : TRANSPORT_MAX_RETRIES;
+        if (!retryable || part.attempts > limit) {
+          rejectedHashes.add(ownerHash);
+          while (rejectedHashes.size > CACHE_MAX) rejectedHashes.delete(rejectedHashes.values().next().value!);
+          releaseQueueItem(ownerHash, item);
+          trace("mo_add", item.el, ownerHash, "transport_drop", item.text);
+          break;
+        }
         part.retryAt = Date.now() + (error?.retry_after_ms ?? response.retry_after_ms
           ?? Math.min(TRANSPORT_RETRY_BASE_MS * 2 ** (part.attempts - 1), TRANSPORT_RETRY_MAX_MS));
       }
-    }
-    for (const [hash, item] of new Map(selected.map(({ ownerHash, item }) => [ownerHash, item]))) {
-      if (queue.get(hash) !== item || !item.parts.every((part) => part.translated !== undefined)) continue;
-      const translated = item.parts.map((part) => part.translated).join("");
-      cacheTranslation(hash, translated);
-      releaseQueueItem(hash, item);
-      for (const element of item.elements) {
-        if (!element.isConnected) continue;
-        const current = sourceTextForTranslation(element);
-        if (hashText(normalizeForHash(current), TARGET_LANG) === hash) injectTranslation(element, translated);
-        else processCandidate(element, "mo_char");
-      }
+      finishQueueItem(ownerHash, item);
     }
   } catch {
     if (!controller.signal.aborted && generation === lifecycle) {
-      for (const { ownerHash, item, part } of selected) {
-        if (queue.get(ownerHash) !== item) continue;
-        part.attempts++;
-        if (part.attempts > TRANSPORT_MAX_RETRIES) { rejectedHashes.add(ownerHash); releaseQueueItem(ownerHash, item); }
-        else part.retryAt = Date.now() + Math.min(TRANSPORT_RETRY_BASE_MS * 2 ** (part.attempts - 1), TRANSPORT_RETRY_MAX_MS);
+      const sources = new Map(selected.map(({ part }) => [part.hash, part.text]));
+      for (const [ownerHash, item] of queue) {
+        for (const part of item.parts) {
+          if (part.translated !== undefined || sources.get(part.hash) !== part.text) continue;
+          part.attempts++;
+          if (part.attempts > TRANSPORT_MAX_RETRIES) { rejectedHashes.add(ownerHash); releaseQueueItem(ownerHash, item); break; }
+          part.retryAt = Date.now() + Math.min(TRANSPORT_RETRY_BASE_MS * 2 ** (part.attempts - 1), TRANSPORT_RETRY_MAX_MS);
+        }
       }
     }
   } finally {
     selected.forEach(({ part }) => { part.inFlight = false; });
+    const released = new Map<string, string>();
+    for (const { part } of selected) {
+      if (chunkFlights.get(part.hash)?.controller !== controller) continue;
+      chunkFlights.delete(part.hash);
+      released.set(part.hash, part.text);
+    }
+    for (const item of queue.values()) {
+      for (const part of item.parts) if (released.get(part.hash) === part.text) part.inFlight = false;
+    }
+    clearBatchCancellation(controller);
     activeRequests.delete(controller);
     batchOwners.delete(controller);
     if (active && generation === lifecycle && mode !== "off") {
@@ -1829,9 +1916,7 @@ function makeIO() {
       }
       if (entry.isIntersecting) processCandidate(el, "io");
     }
-    for (const [controller, owners] of batchOwners) {
-      if (owners.every((item) => ![...item.elements].some((element) => element.isConnected && isElementNearViewport(element)))) controller.abort();
-    }
+    updateBatchCancellation();
     scheduleFlush(0);
     scheduleViewportPush();
   }, { rootMargin: `${VISIBLE_PRIORITY_MARGIN_PX}px`, threshold: 0 });
@@ -1988,6 +2073,7 @@ function observeMutations(root: ParentNode = document.body) {
           }
         }
       }
+      updateBatchCancellation();
     });
   }
   if (observedMutationRoots.has(root)) return;

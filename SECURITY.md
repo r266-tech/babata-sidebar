@@ -62,7 +62,10 @@ entries by source text, target, model, provider, credential identity digest, and
 prompt version; client-supplied hashes are not trusted as content identity.
 Translation metrics retain aggregate counts and a bounded sample of durations,
 without webpage content or URLs. Cancelling a subscriber aborts shared provider
-work only when no other subscriber still needs it.
+work only when no other subscriber still needs it, after a configurable
+400 ms grace period for short tab/viewport changes. No queued provider request
+starts while it has no subscribers. In-flight work may finish during that
+window and populate the same bounded memory cache; no disk cache is created.
 
 Chat and debug history remains local, can contain page content, and is scoped
 by browser client and conversation. Request cancellation stops the model process

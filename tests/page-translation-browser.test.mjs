@@ -32,7 +32,7 @@ await test('page translation scheduling and source ownership in an isolated brow
             requests.push(message);
             if (message.type !== 'babata.translate') return { ok: true };
             if (new Set(message.batch.map((item) => item.hash)).size !== message.batch.length) return { ok: false, results: [], retryable: false, error: 'duplicate_hash: batch hashes must be unique' };
-            if (responseMode === 'repeat-race' && requests.filter((item) => item.type === 'babata.translate').length === 2) return { ok: false, results: [], retryable: false, error: 'A duplicate in-flight transport failed after another subscription succeeded' };
+            if (responseMode === 'repeat-race' && requests.slice(0, -1).filter((item) => item.type === 'babata.translate').some((previous) => previous.batch.some((item) => message.batch.some((current) => current.hash === item.hash)))) return { ok: false, results: [], retryable: false, error: 'A repeated chunk must reuse the first in-flight request' };
             if (responseMode === 'hold') return await new Promise((resolve) => pendingReplies.push({ message, resolve }));
             if (responseMode === 'permanent') return { ok: false, results: [], retryable: false, errors: message.batch.map((item) => ({ hash: item.hash, code: 'invalid_provider', message: 'Invalid provider', retryable: false })) };
             if (responseMode === 'partial' && !window.partialSent) {

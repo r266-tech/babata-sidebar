@@ -9,6 +9,22 @@ import { captionTextKey, cuesFromTextTrack, type CaptionSource } from "./video-c
 import { SubtitleTranslationScheduler } from "./video-translation-scheduler";
 import { VideoTranscription } from "./video-asr";
 
+const videoWindow = window as Window & { __babataVideoTranslateBooted?: boolean };
+if (!videoWindow.__babataVideoTranslateBooted) bootVideoTranslation();
+
+function bootVideoTranslation(): void {
+if (document.documentElement?.getAttribute("data-bbt-video-translate-version") !== "2"
+  && document.querySelector('bbt-video-controls[data-bbt-video],.bbt-video-overlay[data-bbt-youtube-subtitles="1"],#bbt-youtube-subtitle-overlay[data-bbt-youtube-subtitles="1"]')) return;
+const TEARDOWN_EVENT = "babata:video-translate-teardown";
+document.dispatchEvent(new Event(TEARDOWN_EVENT));
+videoWindow.__babataVideoTranslateBooted = true;
+let destroyed = false;
+const cleanups: Array<() => void> = [];
+function listen(target: EventTarget, type: string, listener: EventListener, options?: AddEventListenerOptions | boolean): void {
+  target.addEventListener(type, listener, options);
+  cleanups.push(() => target.removeEventListener(type, listener, options));
+}
+
 const FONT_KEY = "babata.subtitle_font_scale";
 const OVERLAY_ID = "bbt-youtube-subtitle-overlay";
 const ACTIVE_CLASS = "bbt-youtube-subtitle-active";
@@ -94,11 +110,14 @@ class VideoSubtitleController {
   private savedTrackModes = new Map<TextTrack, TextTrackMode>();
   private watchedTracks = new Map<TextTrack, () => void>();
   private trackSnapshots = new Map<TextTrack, string>();
+  private cueSnapshots = new WeakMap<TextTrackCue, string>();
   private sourceSignature = "";
   private mediaKey: string;
   private asrCues: CaptionCue[] = [];
   private asrDelayMs = 0;
   private resizeObserver: ResizeObserver;
+  private visibilityObserver: IntersectionObserver;
+  private visible = false;
   private fullscreenTrack: TextTrack | undefined;
   private fullscreenKey = "";
 
@@ -194,9 +213,11 @@ class VideoSubtitleController {
       } catch (error) { this.setStatus(error instanceof Error ? error.message : "无法启动听译。"); }
       finally { this.asrButton.disabled = false; }
     };
-    this.resizeObserver = new ResizeObserver(() => this.updateLayout());
+    this.resizeObserver = new ResizeObserver(() => { this.updateLayout(); this.refreshVisibility(); });
     this.resizeObserver.observe(video);
     this.resizeObserver.observe(this.player);
+    this.visibilityObserver = new IntersectionObserver(() => this.refreshVisibility());
+    this.visibilityObserver.observe(video);
     this.attachToPlayer();
     this.setScale(fontScale);
     this.applyMode();
@@ -214,7 +235,9 @@ class VideoSubtitleController {
     video.textTracks.addEventListener("removetrack", this.refreshTracks);
     video.textTracks.addEventListener("change", this.refreshTracks);
     document.addEventListener("fullscreenchange", this.onFullscreen);
+    document.addEventListener("visibilitychange", this.onVisibility);
     this.refreshTracks();
+    this.refreshVisibility();
   }
 
   setScale(scale: number): void {
@@ -234,13 +257,13 @@ class VideoSubtitleController {
   }
 
   private applyMode(): void {
-    this.scheduler.setEnabled(this.mode !== "off" && !suspended);
     this.modeSelect.value = this.mode;
     const label = this.mode === "off" ? "原生" : this.mode === "bilingual" ? "双语" : "译文";
     this.modeButton.textContent = `字幕 · ${label}`;
     this.modeButton.setAttribute("aria-label", `字幕模式：${label}，点击切换`);
     this.modeButton.setAttribute("aria-pressed", String(this.mode !== "off"));
     if (this.mode === "off") {
+      this.scheduler.setEnabled(false);
       this.hide();
       this.stopClock();
       this.restoreTracks();
@@ -248,6 +271,7 @@ class VideoSubtitleController {
     } else {
       this.refreshTracks();
       this.syncNativeTrack();
+      this.schedule(true);
       this.queueRender();
       this.startClock();
     }
@@ -305,8 +329,23 @@ class VideoSubtitleController {
       const first = cues[0] as VTTCue;
       const last = cues[cues.length - 1] as VTTCue;
       const snapshot = `${cues.length}:${first.startTime}:${first.text}:${last.startTime}:${last.endTime}:${last.text}`;
-      if (this.trackSnapshots.get(track) === snapshot) continue;
+      const fingerprint = (cue: TextTrackCue) => `${cue.startTime}:${cue.endTime}:${(cue as VTTCue).text}`;
+      const active = Array.from(track.activeCues ?? []);
+      // Some custom players expose cues without activeCues. Inspect only the
+      // current raw cue by binary search instead of rescanning the transcript.
+      if (!active.length) {
+        let low = 0;
+        let high = cues.length;
+        while (low < high) {
+          const middle = (low + high) >>> 1;
+          if (cues[middle].startTime <= this.video.currentTime) low = middle + 1;
+          else high = middle;
+        }
+        if (low > 0 && cues[low - 1].endTime > this.video.currentTime) active.push(cues[low - 1]);
+      }
+      if (this.trackSnapshots.get(track) === snapshot && active.every((cue) => this.cueSnapshots.get(cue) === fingerprint(cue))) continue;
       this.trackSnapshots.set(track, snapshot);
+      for (const cue of Array.from(cues)) this.cueSnapshots.set(cue, fingerprint(cue));
       this.installSource({ id: trackId(track), label: track.label || track.language || `字幕 ${tracks.indexOf(track) + 1}`, language: track.language, cues: cuesFromTextTrack(track), track }, track === preferred && (!this.sourceId || this.sourceId.startsWith("track:")));
     }
     if (this.sourceId.startsWith("track:") && !this.sources.has(this.sourceId)) {
@@ -351,15 +390,43 @@ class VideoSubtitleController {
 
   private effectiveTime(): number { return Math.max(0, this.video.currentTime * 1000 - (this.sourceId === "asr" ? this.asrDelayMs : 0)); }
 
+  refreshVisibility = (): void => {
+    if (this.disposed) return;
+    const rect = this.video.getBoundingClientRect();
+    const visible = rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0
+      && rect.top < innerHeight && rect.left < innerWidth
+      && this.video.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+    if (visible === this.visible) return;
+    this.visible = visible;
+    this.onVisibility();
+  };
+
+  private canTranslate(): boolean {
+    return this.visible && document.visibilityState !== "hidden" && !suspended && !this.disposed && this.mode !== "off";
+  }
+
+  private onVisibility = (): void => {
+    this.schedule(true);
+    if (this.canTranslate()) { this.queueRender(); this.startClock(); }
+    else {
+      this.stopClock();
+      // A background tab keeps its last surface for a stable return. A player
+      // hidden by the page must not leave captions floating over other content.
+      if (document.visibilityState !== "hidden") this.hide();
+    }
+  };
+
   private schedule(force = false): void {
-    if (this.seeking || this.mode === "off" || suspended || !this.sourceId) return;
+    if (!this.canTranslate()) { if (this.scheduler.enabled) this.scheduler.setEnabled(false); return; }
+    if (this.seeking || !this.sourceId) return;
     const time = this.effectiveTime();
     const index = this.scheduler.timeline.indexAt(time);
-    const key = `${index}:${this.video.playbackRate}`;
+    const prefetch = !this.video.paused && !this.video.ended;
+    const key = `${index}:${this.video.playbackRate}:${prefetch}`;
     if (!force && key === this.lastSchedule && performance.now() - this.lastScheduledAt < 600) return;
     this.lastSchedule = key;
     this.lastScheduledAt = performance.now();
-    this.scheduler.update(time, this.video.playbackRate);
+    this.scheduler.setEnabled(true, time, this.video.playbackRate, prefetch);
   }
 
   private queueRender(): void {
@@ -370,6 +437,7 @@ class VideoSubtitleController {
 
   private render(): void {
     if (suspended || navigating || this.mode === "off" || !this.video.isConnected) { this.hide(); return; }
+    if (!this.canTranslate()) { if (document.visibilityState !== "hidden") this.hide(); return; }
     this.attachToPlayer();
     this.schedule();
     const index = this.scheduler.timeline.indexAt(this.effectiveTime());
@@ -389,7 +457,7 @@ class VideoSubtitleController {
       this.overlay.dataset.state = translated ? "ready" : "pending";
     }
     this.overlay.style.display = "flex";
-    this.player.classList.add(ACTIVE_CLASS);
+    if (!this.player.classList.contains(ACTIVE_CLASS)) this.player.classList.add(ACTIVE_CLASS);
     this.renderNativeFullscreen(cue, text, bilingual);
   }
 
@@ -432,7 +500,8 @@ class VideoSubtitleController {
 
   private renderNativeFullscreen(cue: CaptionCue, text: string, bilingual: boolean): void {
     if (document.fullscreenElement !== this.video) { this.clearFullscreenTrack(); return; }
-    this.fullscreenTrack ??= this.video.addTextTrack("subtitles", "babata", "zh");
+    this.fullscreenTrack ??= Array.from(this.video.textTracks).find((track) => track.label === "babata")
+      || this.video.addTextTrack("subtitles", "babata", "zh");
     const key = `${cue.startMs}:${cue.endMs}:${text}:${bilingual}`;
     if (key !== this.fullscreenKey) {
       for (const existing of Array.from(this.fullscreenTrack.cues ?? [])) this.fullscreenTrack.removeCue(existing);
@@ -457,7 +526,7 @@ class VideoSubtitleController {
   }
 
   private startClock(): void {
-    if (this.disposed || this.mode === "off" || suspended || this.video.paused || this.video.ended || this.frame || this.videoFrame) return;
+    if (!this.canTranslate() || this.video.paused || this.video.ended || this.frame || this.videoFrame) return;
     if (typeof this.video.requestVideoFrameCallback === "function") {
       this.videoFrame = this.video.requestVideoFrameCallback(() => { this.videoFrame = 0; this.render(); this.startClock(); });
     } else {
@@ -472,20 +541,21 @@ class VideoSubtitleController {
     this.videoFrame = 0;
   }
 
-  private onTime = () => { this.schedule(); this.queueRender(); };
+  private onTime = () => { this.refreshVisibility(); this.schedule(); this.queueRender(); };
   private onFullscreen = () => { this.updateLayout(); this.queueRender(); };
-  private onPlay = () => { this.onTime(); this.startClock(); };
-  private onPause = () => { this.stopClock(); this.queueRender(); };
+  private onPlay = () => { this.refreshVisibility(); this.schedule(true); this.queueRender(); this.startClock(); };
+  private onPause = () => { this.stopClock(); this.schedule(true); this.queueRender(); };
   private onSeeking = () => {
     this.seeking = true;
-    this.scheduler.cancel();
+    this.scheduler.setDispatchPaused(true);
     if (this.asr.active || this.asrButton.disabled) this.stopAsr("已停止听译，请在新位置重新开启。");
     this.queueRender();
   };
   private onSeeked = () => {
     this.seeking = false;
-    this.scheduler.seek(this.effectiveTime(), this.video.playbackRate);
+    this.scheduler.setDispatchPaused(false);
     this.lastSchedule = "";
+    this.schedule(true);
     this.queueRender();
   };
   private onLoaded = () => {
@@ -506,6 +576,8 @@ class VideoSubtitleController {
 
   reset(): void {
     this.clearCaptionState();
+    this.seeking = false;
+    this.scheduler.setDispatchPaused(false);
     this.sources.clear();
     this.trackSnapshots.clear();
     this.asrCues = [];
@@ -538,6 +610,7 @@ class VideoSubtitleController {
     this.overlay.remove();
     this.controls.remove();
     this.resizeObserver.disconnect();
+    this.visibilityObserver.disconnect();
     if (this.previousPosition !== undefined) this.player.style.position = this.previousPosition;
     const events: Array<[string, EventListener]> = [
       ["timeupdate", this.onTime], ["play", this.onPlay], ["pause", this.onPause], ["ended", this.onPause],
@@ -547,6 +620,7 @@ class VideoSubtitleController {
     for (const [name, handler] of events) this.video.removeEventListener(name, handler);
     for (const name of ["addtrack", "removetrack", "change"]) this.video.textTracks.removeEventListener(name, this.refreshTracks);
     document.removeEventListener("fullscreenchange", this.onFullscreen);
+    document.removeEventListener("visibilitychange", this.onVisibility);
     for (const [track, listener] of this.watchedTracks) track.removeEventListener("cuechange", listener);
   }
 }
@@ -600,7 +674,8 @@ function processCaptionResponse(rawUrl: string, body: string, capturedPage?: str
   }, youtube);
 }
 
-window.addEventListener("message", (event) => {
+listen(window, "message", (rawEvent) => {
+  const event = rawEvent as MessageEvent;
   if (event.source !== window || event.data?.source !== "babata-youtube-subtitles-main") return;
   const data = event.data as { type?: string; url?: string; response?: string; pageUrl?: string };
   if (data.type === "babata.youtube_caption_ready") { requestLastCaption(); return; }
@@ -618,7 +693,7 @@ async function refreshSettings(): Promise<void> {
   const sequence = ++settingsSequence;
   try {
     const settings = await chrome.storage.local.get([STORAGE_TRANSLATION_MODE, STORAGE_ALWAYS_TRANSLATE_HOSTS, STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS, FONT_KEY]);
-    if (sequence !== settingsSequence) return;
+    if (destroyed || sequence !== settingsSequence) return;
     globalMode = effectiveTranslationModeForHost(settings[STORAGE_TRANSLATION_MODE], settings[STORAGE_ALWAYS_TRANSLATE_HOSTS], location.hostname, settings[STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS]);
     const scale = Number(settings[FONT_KEY]);
     fontScale = Number.isFinite(scale) ? Math.max(0.7, Math.min(1.6, scale)) : 1;
@@ -629,6 +704,10 @@ async function refreshSettings(): Promise<void> {
 const observer = new MutationObserver((records) => {
   let cleanup = false;
   for (const record of records) {
+    if (record.type === "attributes" && record.target instanceof Element) {
+      for (const [video, controller] of controllers) if (record.target.contains(video)) controller.refreshVisibility();
+      continue;
+    }
     for (const node of record.addedNodes) {
       if (!(node instanceof Element) || node.closest("bbt-video-controls,.bbt-video-overlay")) continue;
       if (node instanceof HTMLTrackElement) controllers.get(node.parentElement as HTMLVideoElement)?.refreshTracks();
@@ -641,23 +720,48 @@ const observer = new MutationObserver((records) => {
 });
 
 function begin(): void {
-  if (!document.documentElement) return;
+  if (destroyed || !document.documentElement) return;
+  document.documentElement.setAttribute("data-bbt-video-translate-version", "2");
   discover();
-  observer.observe(document.documentElement, { childList: true, subtree: true });
+  observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "style", "hidden"] });
   requestLastCaption();
 }
 if (document.documentElement) begin();
-else document.addEventListener("DOMContentLoaded", begin, { once: true });
-document.addEventListener("load", (event) => { if (event.target instanceof HTMLTrackElement) controllers.get(event.target.parentElement as HTMLVideoElement)?.refreshTracks(); }, true);
-document.addEventListener("yt-navigate-start", () => { navigating = true; resetPage(); });
-document.addEventListener("yt-navigate-finish", () => { navigating = false; if (pageKey !== currentPageKey()) resetPage(); discover(); requestLastCaption(); });
-window.addEventListener("popstate", () => { if (pageKey !== currentPageKey()) resetPage(); });
-window.addEventListener("pagehide", () => { suspended = true; for (const controller of controllers.values()) controller.suspend(); });
-window.addEventListener("pageshow", () => { suspended = false; for (const controller of controllers.values()) controller.resume(); requestLastCaption(); void refreshSettings(); });
-chrome.storage.onChanged.addListener((changes, area) => {
+else listen(document, "DOMContentLoaded", begin, { once: true });
+listen(document, "load", (event) => { if (event.target instanceof HTMLTrackElement) controllers.get(event.target.parentElement as HTMLVideoElement)?.refreshTracks(); }, true);
+const onVisibilityMotionEnd = (event: Event) => {
+  if (!(event.target instanceof Element)) return;
+  for (const [video, controller] of controllers) if (event.target.contains(video)) controller.refreshVisibility();
+};
+listen(document, "transitionend", onVisibilityMotionEnd, true);
+listen(document, "animationend", onVisibilityMotionEnd, true);
+listen(document, "yt-navigate-start", () => { navigating = true; resetPage(); });
+listen(document, "yt-navigate-finish", () => { navigating = false; if (pageKey !== currentPageKey()) resetPage(); discover(); requestLastCaption(); });
+listen(window, "popstate", () => { if (pageKey !== currentPageKey()) resetPage(); });
+listen(window, "pagehide", () => { suspended = true; for (const controller of controllers.values()) controller.suspend(); });
+listen(window, "pageshow", () => { suspended = false; for (const controller of controllers.values()) controller.resume(); requestLastCaption(); void refreshSettings(); });
+const onStorageChanged = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
   if (area === "local" && [STORAGE_TRANSLATION_MODE, STORAGE_ALWAYS_TRANSLATE_HOSTS, STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS, FONT_KEY].some((key) => key in changes)) void refreshSettings();
-});
-chrome.runtime.onMessage.addListener((message) => {
+};
+chrome.storage.onChanged.addListener(onStorageChanged);
+cleanups.push(() => chrome.storage.onChanged.removeListener(onStorageChanged));
+const onRuntimeMessage = (message: { type?: string; scope?: string }) => {
   if (message?.type === "babata.translation_config_changed") for (const controller of controllers.values()) controller.invalidate(message.scope ?? "all");
+};
+chrome.runtime.onMessage.addListener(onRuntimeMessage);
+cleanups.push(() => chrome.runtime.onMessage.removeListener(onRuntimeMessage));
+listen(document, TEARDOWN_EVENT, () => {
+  if (destroyed) return;
+  destroyed = true;
+  settingsSequence += 1;
+  observer.disconnect();
+  for (const controller of controllers.values()) controller.dispose();
+  controllers.clear();
+  recentCaptions.clear();
+  for (const cleanup of cleanups.splice(0)) { try { cleanup(); } catch { /* An old extension world may already be invalidated. */ } }
+  document.getElementById("bbt-youtube-subtitle-style")?.remove();
+  document.documentElement?.removeAttribute("data-bbt-video-translate-version");
+  videoWindow.__babataVideoTranslateBooted = false;
 });
 void refreshSettings();
+}

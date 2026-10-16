@@ -59,6 +59,36 @@ await test('seek cancels obsolete requests and immediately dispatches the new pl
   scheduler.cancel();
 });
 
+await test('nearby seek and equivalent sources retain useful in-flight batches without resubmitting text', () => {
+  const network = transport();
+  const scheduler = new SubtitleTranslationScheduler(network.translate, () => {});
+  scheduler.setSource('native', cues(), 'en');
+  scheduler.update(0);
+  for (const time of [100, 200, 300]) scheduler.seek(time);
+  scheduler.setSource('network', cues(), 'en');
+  scheduler.update(300);
+  assert.equal(network.calls.length, 2);
+  assert.ok(network.calls.every(({ signal }) => !signal.aborted));
+  scheduler.cancel();
+});
+
+await test('paused scheduling only requests the current cue and enabling uses the supplied playhead', () => {
+  const network = transport();
+  const scheduler = new SubtitleTranslationScheduler(network.translate, () => {});
+  scheduler.setSource('track', cues(), 'en');
+  scheduler.update(0, 1, false);
+  assert.equal(network.calls.length, 1);
+  assert.equal(network.calls[0].batch.length, 1);
+  scheduler.setEnabled(false);
+  scheduler.setEnabled(true, 100_000, 1, false);
+  assert.equal(network.calls.length, 2);
+  assert.equal(network.calls[1].batch[0].text, 'Caption number 50.');
+  scheduler.update(100_000, 1, true);
+  assert.equal(network.calls.length, 3);
+  assert.equal(network.calls[2].batch[0].text, 'Caption number 51.');
+  scheduler.cancel();
+});
+
 await test('Chinese captions remain native and never call the provider; configuration changes invalidate finished cache', async () => {
   const network = transport();
   const scheduler = new SubtitleTranslationScheduler(network.translate, () => {});

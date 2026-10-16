@@ -104,10 +104,10 @@ const providerScheduler = createProviderScheduler({
 });
 const providerMetrics = { attempts: 0, retries: 0, rate_limits: 0, prompt_tokens: 0, completion_tokens: 0 };
 const translationEngine = createTranslationEngine({
-  complete: async ({ provider, target, batch, signal, priority }) => completionData(provider, [
+  complete: async ({ provider, target, batch, signal, priority, isNeeded, onDemandChange }) => completionData(provider, [
     { role: "system", content: TRANSLATION_SYSTEM_PROMPT },
     { role: "user", content: JSON.stringify({ target, batch }) },
-  ], {}, signal, priority),
+  ], {}, signal, priority, isNeeded, onDemandChange),
   maxBatchItems: TRANSLATE_BATCH_MAX,
   maxItemChars: envInt("BABATA_TRANSLATE_ITEM_MAX_CHARS", 16000, 1, 1000000),
   maxBatchChars: envInt("BABATA_TRANSLATE_BATCH_MAX_CHARS", 24000, 1, 1000000),
@@ -115,6 +115,7 @@ const translationEngine = createTranslationEngine({
   cacheMaxBytes: envInt("BABATA_TRANSLATE_CACHE_MAX_BYTES", 16 * 1024 * 1024, 0, 512 * 1024 * 1024),
   cacheTtlMs: envInt("BABATA_TRANSLATE_CACHE_TTL_MS", 1800000, 0, 86400000),
   maxPendingItems: envInt("BABATA_TRANSLATE_PENDING_MAX_ITEMS", 4096, 1, 100000),
+  cancelGraceMs: envInt("BABATA_TRANSLATE_CANCEL_GRACE_MS", 400, 0, 2000),
 });
 let configWriteChain = Promise.resolve();
 
@@ -466,12 +467,12 @@ function sameProviderDestination(next, current) {
 }
 
 async function providerFetch(provider, endpoint, init = {}) {
-  const { priority = "visible", ...request } = init;
+  const { priority = "visible", isNeeded, onDemandChange, ...request } = init;
   const bucket = createHash("sha256").update(JSON.stringify([providerUrl(provider.base_url, "chat/completions"), provider.model, provider.api_key || ""])).digest("hex");
   for (let attempt = 0; ; attempt += 1) {
     request.signal?.throwIfAborted();
     try {
-      return await providerScheduler.run(() => providerFetchAttempt(provider, endpoint, request), { signal: request.signal, priority, bucket });
+      return await providerScheduler.run(() => providerFetchAttempt(provider, endpoint, request), { signal: request.signal, priority, bucket, isNeeded, onDemandChange });
     } catch (error) {
       request.signal?.throwIfAborted();
       if (error.code === "provider_rate_limited" || (error.code === "provider_http_error" && error.retry_after_ms)) {
@@ -595,12 +596,14 @@ function providerError(data) {
   return text(data.message);
 }
 
-async function completionData(provider, messages, extra = {}, signal, priority = "visible") {
+async function completionData(provider, messages, extra = {}, signal, priority = "visible", isNeeded, onDemandChange) {
   if (!provider.model) throw httpError(400, "model is required");
   const data = await providerFetch(provider, "chat/completions", {
     method: "POST",
     signal,
     priority,
+    isNeeded,
+    onDemandChange,
     body: JSON.stringify({
       model: provider.model,
       messages,

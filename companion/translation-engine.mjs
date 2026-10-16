@@ -110,6 +110,7 @@ export function createTranslationEngine({
   cacheMaxBytes = 16 * 1024 * 1024,
   cacheTtlMs = 30 * 60_000,
   maxPendingItems = 4096,
+  cancelGraceMs = 400,
   promptVersion = TRANSLATION_PROMPT_VERSION,
 } = {}) {
   if (typeof complete !== "function") throw new TypeError("Translation completion callback is required");
@@ -178,23 +179,44 @@ export function createTranslationEngine({
     return priority;
   }
 
+  function hasSubscribers(group) {
+    return group.jobs.some((job) => job.subscribers.size > 0);
+  }
+
+  function clearCancellation(group) {
+    clearTimeout(group.cancelTimer);
+    group.cancelTimer = undefined;
+  }
+
+  function cancelUnusedGroup(group) {
+    clearCancellation(group);
+    if (group.finished || hasSubscribers(group)) return;
+    for (const item of group.jobs) if (pending.get(item.key) === item) pending.delete(item.key);
+    group.controller.abort();
+  }
+
   function unsubscribe(job, id) {
     job.subscribers.delete(id);
     if (job.done || job.subscribers.size) return;
     const group = job.group;
     if (!group) {
       if (pending.get(job.key) === job) pending.delete(job.key);
-    } else if (!group.finished && group.jobs.every((item) => !item.subscribers.size)) {
+    } else if (!group.finished && !hasSubscribers(group)) {
       // Keep an unsubscribed item attachable while another item still needs the
-      // same provider batch. Only the final subscriber cancels shared work.
-      for (const item of group.jobs) if (pending.get(item.key) === item) pending.delete(item.key);
-      group.controller.abort();
+      // same provider batch. A brief final-subscriber gap can also rejoin work
+      // already sent upstream, without an abort followed by a duplicate call.
+      if (cancelGraceMs <= 0) cancelUnusedGroup(group);
+      else if (!group.cancelTimer) group.cancelTimer = setTimeout(() => cancelUnusedGroup(group), cancelGraceMs);
     }
   }
 
   function subscribe(job, signal, priority) {
     const id = Symbol();
     job.subscribers.set(id, priority);
+    if (job.group) {
+      clearCancellation(job.group);
+      for (const notify of job.group.demandListeners) notify();
+    }
     return new Promise((resolve, reject) => {
       let settled = false;
       const finish = (callback, value) => {
@@ -217,17 +239,27 @@ export function createTranslationEngine({
   async function dispatch(jobs, provider, target, force) {
     const live = jobs.filter((job) => job.subscribers.size);
     if (!live.length) return;
-    const group = { jobs: live, controller: new AbortController(), finished: false };
+    const group = { jobs: live, controller: new AbortController(), finished: false, demandListeners: new Set() };
     for (const job of live) job.group = group;
     const batch = live.map((job) => ({ hash: job.id, text: job.text }));
     let outcomes;
     counters.provider_batches += 1;
     try {
-      const response = await complete({ provider, target, batch, signal: group.controller.signal, priority: () => priorityFor(group) });
+      const response = await complete({
+        provider, target, batch, signal: group.controller.signal,
+        priority: () => priorityFor(group),
+        isNeeded: () => hasSubscribers(group),
+        onDemandChange: (notify) => {
+          group.demandListeners.add(notify);
+          return () => group.demandListeners.delete(notify);
+        },
+      });
       outcomes = validateTranslationResponse(response.content, batch, response.finishReason);
     } catch (error) {
       outcomes = new Map(live.map((job) => [job.id, { error: publicTranslationError(error) }]));
     }
+    clearCancellation(group);
+    group.demandListeners.clear();
     group.finished = true;
     for (const job of live) {
       job.done = true;
@@ -235,7 +267,9 @@ export function createTranslationEngine({
       const outcome = outcomes.get(job.id);
       if (outcome.translated) {
         counters.translated_items += 1;
-        if (!force && job.subscribers.size) remember(job.key, outcome.translated);
+        // The provider already translated every validated item in this batch.
+        // Keep successful orphan items too, unless the batch was truly aborted.
+        if (!force && !group.controller.signal.aborted) remember(job.key, outcome.translated);
       } else counters.failed_items += 1;
       job.resolve(outcome);
     }
@@ -305,6 +339,7 @@ export function createTranslationEngine({
         cache_max_entries: cacheMaxEntries,
         cache_max_bytes: cacheMaxBytes,
         cache_ttl_ms: cacheTtlMs,
+        cancel_grace_ms: cancelGraceMs,
         max_batch_items: maxBatchItems,
         max_item_chars: maxItemChars,
         max_batch_chars: maxBatchChars,

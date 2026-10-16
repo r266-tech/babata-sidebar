@@ -4,16 +4,17 @@ import { build } from 'esbuild';
 import { chromium, expect } from '@playwright/test';
 
 const bundle = (await build({ entryPoints: ['src/content/youtube-subtitles.ts'], bundle: true, write: false, format: 'iife' })).outputFiles[0].text;
+const captureBundle = (await build({ entryPoints: ['src/content/youtube-subtitles-main.ts'], bundle: true, write: false, format: 'iife' })).outputFiles[0].text;
 
 await test('video captions and explicit audio transcription in Chromium', { timeout: 90_000 }, async (t) => {
   const browser = await chromium.launch({ headless: true, args: ['--autoplay-policy=no-user-gesture-required'] });
   t.after(() => browser.close());
 
-  async function fixture({ cueCount = 80, language = 'en', mode = 'replace', response = 'echo', realMedia = false } = {}) {
+  async function fixture({ cueCount = 80, language = 'en', mode = 'replace', response = 'echo', realMedia = false, playing = false } = {}) {
     const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
     await page.route('https://video.test/**', (route) => route.fulfill({ contentType: 'text/html', body: '<!doctype html><html><head><style>body{margin:0}main{width:700px;height:950px;padding:25px}video{display:block;width:640px;height:360px;background:#222}</style></head><body><main><video id="video" muted></video></main></body></html>' }));
     await page.goto('https://video.test/watch');
-    await page.evaluate(async ({ cueCount, language, mode, response, realMedia }) => {
+    await page.evaluate(async ({ cueCount, language, mode, response, realMedia, playing }) => {
       window.requests = [];
       window.pendingReplies = [];
       window.storageListeners = [];
@@ -23,7 +24,7 @@ await test('video captions and explicit audio transcription in Chromium', { time
       window.answer = (message) => ({ ok: true, complete: true, results: message.batch.map((item) => ({ hash: item.hash, translated: `译文 ${item.text}` })) });
       window.chrome = {
         runtime: {
-          onMessage: { addListener: (fn) => runtimeListeners.push(fn), removeListener() {} },
+          onMessage: { addListener: (fn) => runtimeListeners.push(fn), removeListener: (fn) => { const at = runtimeListeners.indexOf(fn); if (at >= 0) runtimeListeners.splice(at, 1); } },
           sendMessage: async (message) => {
             requests.push(message);
             if (message.type === 'babata.transcribe.capabilities') return { ok: true, available: true, max_chunk_seconds: 1, max_bytes: 4 * 1024 * 1024 };
@@ -33,7 +34,7 @@ await test('video captions and explicit audio transcription in Chromium', { time
             return answer(message);
           },
         },
-        storage: { local: { get: async () => settings, set: async (values) => Object.assign(settings, values) }, onChanged: { addListener: (fn) => storageListeners.push(fn), removeListener() {} } },
+        storage: { local: { get: async () => settings, set: async (values) => Object.assign(settings, values) }, onChanged: { addListener: (fn) => storageListeners.push(fn), removeListener: (fn) => { const at = storageListeners.indexOf(fn); if (at >= 0) storageListeners.splice(at, 1); } } },
       };
       window.video = document.getElementById('video');
       if (realMedia) {
@@ -54,11 +55,12 @@ await test('video captions and explicit audio transcription in Chromium', { time
         await video.play();
       } else {
         Object.defineProperty(video, 'currentTime', { value: 0, writable: true });
+        Object.defineProperty(video, 'paused', { value: !playing, writable: true });
         window.nativeTrack = video.addTextTrack('subtitles', 'English source', language);
         nativeTrack.mode = 'showing';
         for (let index = 0; index < cueCount; index++) nativeTrack.addCue(new VTTCue(index * 2, (index + 1) * 2, language.startsWith('zh') ? `中文第 ${index} 条字幕。` : `Caption number ${index}.`));
       }
-    }, { cueCount, language, mode, response, realMedia });
+    }, { cueCount, language, mode, response, realMedia, playing });
     const errors = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.addScriptTag({ content: bundle });
@@ -66,7 +68,7 @@ await test('video captions and explicit audio transcription in Chromium', { time
   }
 
   await t.test('current cue publishes before held prefetch, stays in one surface, and avoids retranslation on replay', async () => {
-    const { page, errors } = await fixture({ response: 'hold' });
+    const { page, errors } = await fixture({ response: 'hold', playing: true });
     const overlay = page.locator('.bbt-video-overlay');
     await expect(overlay).toContainText('Caption number 0.');
     await expect(overlay).toHaveAttribute('data-state', 'pending');
@@ -94,7 +96,7 @@ await test('video captions and explicit audio transcription in Chromium', { time
   });
 
   await t.test('seek cancels old subscriptions, switch to native restores the original track, and disable cancels work', async () => {
-    const { page, errors } = await fixture({ response: 'hold' });
+    const { page, errors } = await fixture({ response: 'hold', playing: true });
     await expect.poll(() => page.evaluate(() => pendingReplies.length)).toBe(2);
     assert.equal(await page.evaluate(() => nativeTrack.mode), 'hidden');
     await page.evaluate(() => { video.dispatchEvent(new Event('seeking')); video.currentTime = 100; video.dispatchEvent(new Event('seeked')); });
@@ -130,6 +132,212 @@ await test('video captions and explicit audio transcription in Chromium', { time
     assert.equal(await page.evaluate(() => captureCalls), 0);
     await page.getByRole('button', { name: '字幕设置' }).click();
     await expect(page.getByRole('status')).toContainText('请亲自点击');
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('paused videos request only the visible current cue and play restores bounded prefetch', async () => {
+    const { page, errors } = await fixture();
+    await expect(page.locator('.bbt-video-overlay')).toContainText('译文 Caption number 0.');
+    await page.evaluate(() => {
+      for (const [name, style] of [['hidden', 'display:none'], ['below', 'margin-top:4000px']]) {
+        const host = document.createElement('section'); host.id = name; host.style.cssText = style;
+        const child = document.createElement('video'); child.style.cssText = 'width:640px;height:360px';
+        Object.defineProperty(child, 'currentTime', { value: 0, writable: true });
+        Object.defineProperty(child, 'paused', { value: true, writable: true });
+        const track = child.addTextTrack('subtitles', name, 'en'); track.mode = 'showing';
+        for (let index = 0; index < 80; index++) track.addCue(new VTTCue(index * 2, index * 2 + 1.8, `${name} caption ${index}.`));
+        host.append(child); document.body.append(host);
+      }
+    });
+    await expect(page.locator('bbt-video-controls')).toHaveCount(3);
+    await page.waitForTimeout(150);
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').flatMap((m) => m.batch).length), 1);
+    await page.locator('#below video').scrollIntoViewIfNeeded();
+    await expect(page.locator('#below .bbt-video-overlay')).toContainText('译文 below caption 0.');
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').flatMap((m) => m.batch).length), 2);
+    await page.locator('#below video').evaluate((node) => { node.paused = false; node.dispatchEvent(new Event('play')); });
+    await expect.poll(() => page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').flatMap((m) => m.batch).filter((item) => item.text.startsWith('below')).length)).toBe(18);
+    await page.locator('#below video').evaluate((node) => { node.paused = true; node.dispatchEvent(new Event('pause')); node.currentTime = 100; node.dispatchEvent(new Event('timeupdate')); });
+    await expect(page.locator('#below .bbt-video-overlay')).toContainText('译文 below caption 50.');
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').flatMap((m) => m.batch).filter((item) => item.text.startsWith('below')).length), 19);
+    assert.equal(await page.evaluate(() => requests.some((m) => m.batch?.some((item) => item.text.startsWith('hidden')))), false);
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('same-cue seeks reuse pending work and off-on starts at the current position', async () => {
+    const { page, errors } = await fixture({ response: 'hold' });
+    await expect.poll(() => page.evaluate(() => pendingReplies.length)).toBe(1);
+    for (const time of [0.1, 0.2, 0.3]) await page.evaluate((time) => { video.dispatchEvent(new Event('seeking')); video.currentTime = time; video.dispatchEvent(new Event('seeked')); }, time);
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').length), 1);
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate.cancel').length), 0);
+    await page.getByRole('button', { name: '字幕设置' }).click();
+    await page.getByLabel('字幕显示模式').selectOption('off');
+    await page.evaluate(() => { video.currentTime = 100; video.dispatchEvent(new Event('timeupdate')); });
+    await page.getByLabel('字幕显示模式').selectOption('replace');
+    await expect(page.locator('.bbt-video-overlay')).toContainText('Caption number 50.');
+    const texts = await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').flatMap((m) => m.batch).map((item) => item.text));
+    assert.deepEqual(texts, ['Caption number 0.', 'Caption number 50.']);
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('a completed old batch cannot dispatch more of the old window while seeking', async () => {
+    const { page, errors } = await fixture({ response: 'hold', playing: true });
+    await expect.poll(() => page.evaluate(() => pendingReplies.length)).toBe(2);
+    await page.evaluate(() => {
+      video.dispatchEvent(new Event('seeking')); video.currentTime = 100;
+      const { message, resolve } = pendingReplies.shift(); resolve(answer(message));
+    });
+    await page.waitForTimeout(100);
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').length), 2);
+    await page.evaluate(() => video.dispatchEvent(new Event('seeked')));
+    await expect.poll(() => page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').length)).toBe(4);
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate')[2].batch[0].text), 'Caption number 50.');
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('a media reset during seek releases dispatch suspension without requiring the old seeked event', async () => {
+    const { page, errors } = await fixture({ response: 'hold' });
+    await expect.poll(() => page.evaluate(() => pendingReplies.length)).toBe(1);
+    await page.evaluate(() => {
+      video.dispatchEvent(new Event('seeking'));
+      Object.defineProperty(video, 'currentSrc', { value: 'https://video.test/second.mp4', configurable: true });
+      nativeTrack.cues[0].text = 'The new media starts with this caption.';
+      video.dispatchEvent(new Event('loadedmetadata'));
+    });
+    await expect.poll(() => page.evaluate(() => pendingReplies.length)).toBe(2);
+    assert.equal(await page.evaluate(() => pendingReplies.at(-1).message.batch[0].text), 'The new media starts with this caption.');
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate.cancel').length), 1);
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('document hidden state suspends pending work and visibility resumes at the current cue', async () => {
+    const { page, errors } = await fixture({ response: 'hold', playing: true });
+    await expect.poll(() => page.evaluate(() => pendingReplies.length)).toBe(2);
+    await page.evaluate(() => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+      document.dispatchEvent(new Event('visibilitychange')); video.currentTime = 100; video.dispatchEvent(new Event('timeupdate'));
+    });
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate.cancel').length), 2);
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').length), 2);
+    await page.evaluate(() => {
+      video.paused = true; Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await expect.poll(() => page.evaluate(() => pendingReplies.length)).toBe(3);
+    assert.deepEqual(await page.evaluate(() => pendingReplies.at(-1).message.batch.map((item) => item.text)), ['Caption number 50.']);
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('hiding the video itself removes floating captions and restores them from cache on reveal', async () => {
+    const { page, errors } = await fixture();
+    await expect(page.locator('.bbt-video-overlay')).toContainText('译文 Caption number 0.');
+    const count = await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').length);
+    for (const property of ['visibility', 'display']) {
+      await page.locator('video').evaluate((node, property) => { node.style[property] = property === 'display' ? 'none' : 'hidden'; }, property);
+      await expect(page.locator('.bbt-video-overlay')).toBeHidden();
+      await page.locator('video').evaluate((node, property) => { node.style[property] = ''; }, property);
+      await expect(page.locator('.bbt-video-overlay')).toBeVisible();
+      await expect(page.locator('.bbt-video-overlay')).toContainText('译文 Caption number 0.');
+    }
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').length), count);
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('a paused video revealed by its own or an ancestor opacity transition starts at the current cue', async () => {
+    const { page, errors } = await fixture();
+    await expect(page.locator('.bbt-video-overlay')).toContainText('译文 Caption number 0.');
+    for (const ancestor of [false, true]) {
+      await page.evaluate((ancestor) => {
+        const target = ancestor ? video.parentElement : video;
+        target.style.transition = ''; target.style.opacity = '0';
+      }, ancestor);
+      await expect(page.locator('.bbt-video-overlay')).toBeHidden();
+      await page.evaluate((ancestor) => {
+        video.currentTime += 2; video.dispatchEvent(new Event('timeupdate'));
+        const target = ancestor ? video.parentElement : video;
+        target.style.transition = 'opacity 100ms linear';
+        void target.offsetWidth; target.style.opacity = '1';
+      }, ancestor);
+      await expect(page.locator('.bbt-video-overlay')).toBeVisible();
+      await expect(page.locator('.bbt-video-overlay')).toContainText(`译文 Caption number ${ancestor ? 2 : 1}.`);
+    }
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').flatMap((m) => m.batch).length), 3);
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('a corrected middle native cue replaces its cached translation without retranslating unchanged cues', async () => {
+    const { page, errors } = await fixture({ cueCount: 3 });
+    await expect(page.locator('.bbt-video-overlay')).toContainText('译文 Caption number 0.');
+    await page.evaluate(() => { video.currentTime = 2; video.dispatchEvent(new Event('timeupdate')); });
+    await expect(page.locator('.bbt-video-overlay')).toContainText('译文 Caption number 1.');
+    await page.evaluate(() => { nativeTrack.cues[1].text = 'The corrected middle caption.'; nativeTrack.dispatchEvent(new Event('cuechange')); });
+    await expect(page.locator('.bbt-video-overlay')).toContainText('译文 The corrected middle caption.');
+    const texts = await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').flatMap((m) => m.batch).map((item) => item.text));
+    assert.deepEqual(texts, ['Caption number 0.', 'Caption number 1.', 'The corrected middle caption.']);
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('reinjecting scripts is idempotent and a replacement world tears down the old video controller', async () => {
+    const { page, errors } = await fixture({ response: 'hold' });
+    await expect.poll(() => page.evaluate(() => pendingReplies.length)).toBe(1);
+    await page.addScriptTag({ content: bundle });
+    assert.equal(await page.evaluate(() => pendingReplies.length), 1);
+    await expect(page.locator('bbt-video-controls')).toHaveCount(1);
+    await page.evaluate(() => { window.__babataVideoTranslateBooted = false; });
+    await page.addScriptTag({ content: bundle });
+    await expect.poll(() => page.evaluate(() => pendingReplies.length)).toBe(2);
+    await expect(page.locator('bbt-video-controls')).toHaveCount(1);
+    await expect(page.locator('.bbt-video-overlay')).toHaveCount(1);
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate.cancel').length), 1);
+    assert.deepEqual(await page.evaluate(() => [runtimeListeners.length, storageListeners.length]), [1, 1]);
+    await page.evaluate(() => document.dispatchEvent(new Event('babata:video-translate-teardown')));
+    await expect(page.locator('bbt-video-controls,.bbt-video-overlay')).toHaveCount(0);
+    assert.deepEqual(await page.evaluate(() => [runtimeListeners.length, storageListeners.length]), [0, 0]);
+    assert.equal(await page.evaluate(() => nativeTrack.mode), 'showing');
+    assert.equal(await page.evaluate(() => window.__babataVideoTranslateBooted), false);
+    assert.equal(await page.evaluate(() => document.documentElement.hasAttribute('data-bbt-video-translate-version')), false);
+    await page.evaluate(() => {
+      const clone = video.cloneNode(); video.after(clone);
+      video.dispatchEvent(new Event('seeked')); document.dispatchEvent(new Event('visibilitychange'));
+      pendingReplies.splice(0).forEach(({ message, resolve }) => resolve(answer(message)));
+    });
+    await page.waitForTimeout(100);
+    await expect(page.locator('bbt-video-controls,.bbt-video-overlay')).toHaveCount(0);
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').length), 2);
+
+    await page.addScriptTag({ content: captureBundle });
+    await page.evaluate(() => { window.savedCaptureHooks = [window.fetch, XMLHttpRequest.prototype.open, XMLHttpRequest.prototype.send]; });
+    await page.addScriptTag({ content: captureBundle });
+    assert.equal(await page.evaluate(() => savedCaptureHooks.every((fn, at) => fn === [window.fetch, XMLHttpRequest.prototype.open, XMLHttpRequest.prototype.send][at])), true);
+    assert.equal(await page.evaluate(() => window.__babataVideoCaptionCaptureBooted), true);
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('legacy video controls require one page refresh instead of stacking another engine', async () => {
+    const { page, errors } = await fixture();
+    await expect(page.locator('.bbt-video-overlay')).toContainText('译文 Caption number 0.');
+    await page.evaluate(() => {
+      document.dispatchEvent(new Event('babata:video-translate-teardown'));
+      const legacy = document.createElement('bbt-video-controls'); legacy.dataset.bbtVideo = '1'; document.body.append(legacy);
+      window.originalFetchBeforeLegacy = window.fetch;
+    });
+    await page.addScriptTag({ content: bundle });
+    await page.addScriptTag({ content: captureBundle });
+    assert.equal(await page.evaluate(() => window.__babataVideoTranslateBooted), false);
+    assert.equal(await page.evaluate(() => window.__babataVideoCaptionCaptureBooted), undefined);
+    assert.equal(await page.evaluate(() => originalFetchBeforeLegacy === window.fetch), true);
+    await expect(page.locator('bbt-video-controls')).toHaveCount(1);
+    await expect(page.locator('.bbt-video-overlay')).toHaveCount(0);
     assert.deepEqual(errors, []);
     await page.close();
   });

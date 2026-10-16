@@ -170,21 +170,49 @@ Cache identity includes the provider, model, credential identity, target, source
 text, and prompt version. Changing a provider in settings invalidates page
 caches. Cached translations live in memory, not in a permanent browsing log.
 
+Caching is per text item, so identical text can be reused on different pages
+while new or edited comments still get translated. A cache hit in the page
+avoids even a companion request. After a page reload or a second visit, the
+companion may receive a lookup request but does not call the translation model
+again while its matching entry is available.
+
+| Cache | Default bound | Lifetime |
+| --- | --- | --- |
+| Page text | 5,000 items / 8 MiB | Current document; least recently used entries are evicted first. |
+| Video captions | 2,500 items per player | Current player; completed matching captions survive seeking and replay. |
+| Shared companion | 5,000 items / 16 MiB | 30 minutes from insertion; restarting the companion clears it. |
+
+These bounds mean a second visit usually reuses translation, but expiry,
+eviction, a companion restart, or changes to source/model/provider can require
+a new model call. The shared lifetime and capacity are configurable below.
+
+Brief viewport or tab changes keep in-flight page work reusable instead of
+cancelling and immediately resending it. Background pages do not start new
+translation requests. The companion also gives a shared request a bounded
+400 ms cancellation window for a returning reader; queued provider work does
+not start while it has no subscribers. Successful results from an already
+needed batch remain cacheable even if one reader has left.
+
 Source paragraphs stay readable while a translation is pending. Completed
 paragraphs replace their previous rendering together; intermediate model tokens
 are not inserted into the page. Links and emphasis use validated structural
 markers, and protected inline code is restored from the source DOM.
 
-Extension updates reconnect page translation in already-open HTTP(S) tabs.
+Extension updates reconnect page and caption translation in already-open HTTP(S) tabs.
 Recovery checks the current document before injecting missing code; it preserves
 the page, scroll position, and unsent inputs without reloading the website.
+Video scripts loaded before version 0.1.2 need a one-time page refresh to replace
+their legacy handlers safely. Such players are not given a second overlapping
+subtitle engine during automatic recovery.
 
 Video controls appear over supported HTML5 players. Choose a caption track, use
 the display-mode control, or import a local `.vtt`/`.srt` subtitle file. Current
-captions have priority over prefetch; seeking cancels work for the old playback
-window. Display mode can be changed per player; font size is saved as a shared
-subtitle preference. Captions already
-in the target language do not make translation requests.
+captions have priority over prefetch. Only players visible in a foreground tab
+start caption translation; paused players request only the current cue. Playing
+resumes bounded look-ahead. Seeking keeps useful in-flight cues and cancels
+batches outside the new playback window. Display mode can be changed per player;
+font size is saved as a shared subtitle preference. Captions already in the
+target language do not make translation requests.
 
 Caption coverage depends on the player exposing a text track or an accessible
 subtitle response. Generic support is not a claim that every site's proprietary
@@ -216,6 +244,7 @@ of claiming to have generated subtitles.
 | `BABATA_TRANSLATE_CACHE_MAX_ENTRIES` | `5000` | Companion cache entry limit; `0` disables caching. |
 | `BABATA_TRANSLATE_CACHE_MAX_BYTES` | `16777216` | Companion cache memory budget. |
 | `BABATA_TRANSLATE_CACHE_TTL_MS` | `1800000` | Translation lifetime in the companion cache. |
+| `BABATA_TRANSLATE_CANCEL_GRACE_MS` | `400` | Last-subscriber cancellation window, 0–2,000 ms; `0` cancels immediately. |
 | `BABATA_TRANSLATE_PENDING_MAX_ITEMS` | `4096` | Bound on unfinished shared translation items. |
 | `BABATA_PROVIDER_QUEUE_MAX` | `128` | Maximum provider operations waiting for a worker or rate budget. |
 | `BABATA_PROVIDER_QUEUE_TIMEOUT_MS` | `30000` | Maximum time an operation may wait in the queue. |

@@ -82,6 +82,10 @@ export function createProviderScheduler({ concurrency = 8, maxQueued = 128, queu
       let selected = -1;
       let nextReadyIn = Infinity;
       for (let index = 0; index < queue.length; index += 1) {
+        // A translation can briefly keep its shared work attachable after its
+        // final subscriber leaves. Never start an unused queued call or retry
+        // during that grace window; its owner will rejoin or abort it shortly.
+        if (queue[index].isNeeded?.() === false) continue;
         const wait = readyIn(bucketFor(queue[index].bucket, now), now);
         if (wait <= 0) { selected = index; break; }
         nextReadyIn = Math.min(nextReadyIn, wait);
@@ -89,13 +93,16 @@ export function createProviderScheduler({ concurrency = 8, maxQueued = 128, queu
       if (selected === -1) {
         // Waiting for this provider must not occupy a global worker. Another
         // provider can still start immediately when it joins the queue.
-        wakeTimer = setTimeout(drain, Math.max(1, Math.ceil(nextReadyIn)));
+        // Dormant entries wake only when their subscribers change or their
+        // cancellation/queue timeout fires. They need no polling timer.
+        if (Number.isFinite(nextReadyIn)) wakeTimer = setTimeout(drain, Math.max(1, Math.ceil(nextReadyIn)));
         return;
       }
       const [entry] = queue.splice(selected, 1);
       entry.queued = false;
       clearTimeout(entry.timer);
       entry.signal?.removeEventListener("abort", entry.onAbort);
+      entry.unsubscribeDemand?.();
       if (entry.signal?.aborted) { entry.reject(abortReason(entry.signal)); continue; }
       const bucket = bucketFor(entry.bucket, now);
       bucket.tokens -= 1;
@@ -105,7 +112,13 @@ export function createProviderScheduler({ concurrency = 8, maxQueued = 128, queu
       counters.peak_active = Math.max(counters.peak_active, active);
       recordDuration(queueDurations, performance.now() - entry.enqueuedAt);
       const started = performance.now();
-      Promise.resolve().then(entry.run).then((result) => {
+      // Start in the same turn as the demand check. Deferring the call itself
+      // lets a cancellation microtask remove the last subscriber in between,
+      // starting a provider request that nobody needs despite the queue gate.
+      let running;
+      try { running = entry.run(); }
+      catch (error) { running = Promise.reject(error); }
+      Promise.resolve(running).then((result) => {
         counters.completed += 1;
         entry.resolve(result);
       }, (error) => {
@@ -122,19 +135,19 @@ export function createProviderScheduler({ concurrency = 8, maxQueued = 128, queu
   }
 
   return {
-    run(run, { signal, priority = "visible", bucket = "default" } = {}) {
+    run(run, { signal, priority = "visible", bucket = "default", isNeeded, onDemandChange } = {}) {
       signal?.throwIfAborted();
       counters.submitted += 1;
       let state;
       const now = performance.now();
       try { state = bucketFor(bucket, now); }
       catch (error) { counters.rejected += 1; return Promise.reject(error); }
-      if (queue.length >= maxQueued && (active >= concurrency || readyIn(state, now) > 0)) {
+      if (queue.length >= maxQueued && (active >= concurrency || readyIn(state, now) > 0 || isNeeded?.() === false)) {
         counters.rejected += 1;
         return Promise.reject(translationError("Translation queue is full", 429, "queue_full", true, 1000));
       }
       return new Promise((resolve, reject) => {
-        const entry = { run, signal, priority, bucket, resolve, reject, sequence: sequence++, enqueuedAt: performance.now(), queued: true };
+        const entry = { run, signal, priority, bucket, isNeeded, resolve, reject, sequence: sequence++, enqueuedAt: performance.now(), queued: true };
         const remove = () => {
           if (!entry.queued) return false;
           entry.queued = false;
@@ -142,6 +155,7 @@ export function createProviderScheduler({ concurrency = 8, maxQueued = 128, queu
           if (index >= 0) queue.splice(index, 1);
           clearTimeout(entry.timer);
           signal?.removeEventListener("abort", entry.onAbort);
+          entry.unsubscribeDemand?.();
           return true;
         };
         entry.onAbort = () => {
@@ -159,6 +173,7 @@ export function createProviderScheduler({ concurrency = 8, maxQueued = 128, queu
           drain();
         }, queueTimeoutMs);
         signal?.addEventListener("abort", entry.onAbort, { once: true });
+        entry.unsubscribeDemand = onDemandChange?.(drain);
         queue.push(entry);
         counters.peak_queued = Math.max(counters.peak_queued, queue.length);
         drain();

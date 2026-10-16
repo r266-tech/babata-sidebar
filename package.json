@@ -1,7 +1,7 @@
 {
   "name": "babata-sidebar",
   "private": false,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Local-first AI browser sidebar with page translation and Codex, Claude Code, or Grok companion support.",
   "license": "MIT",
@@ -28,7 +28,7 @@
     "smoke:llm": "node scripts/smoke-llm.mjs",
     "smoke": "npm run smoke:companion && npm run test:browser",
     "test": "node --test tests/companion.test.mjs tests/runtime-config.test.mjs tests/chat-offscreen.test.mjs tests/chat-history.test.mjs tests/content.test.mjs tests/content-recovery.test.mjs tests/service-worker.test.mjs tests/scripts.test.mjs tests/translation-engine.test.mjs tests/translation-transport.test.mjs tests/transcription.test.mjs tests/video-translation.test.mjs",
-    "test:browser": "npm run build && node --test --test-concurrency=1 tests/browser.test.mjs tests/chat-browser.test.mjs tests/content-browser.test.mjs tests/content-recovery-browser.test.mjs tests/page-translation-browser.test.mjs tests/video-browser.test.mjs tests/translation-long-browser.test.mjs",
+    "test:browser": "npm run build && node --test --test-concurrency=1 tests/browser.test.mjs tests/chat-browser.test.mjs tests/content-browser.test.mjs tests/content-recovery-browser.test.mjs tests/page-translation-browser.test.mjs tests/request-economy-browser.test.mjs tests/video-browser.test.mjs tests/translation-long-browser.test.mjs",
     "check": "npm run typecheck && npm test && npm run build",
     "check:all": "npm run check && npm run test:browser"
   },

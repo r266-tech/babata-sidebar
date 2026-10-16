@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "babata",
   "short_name": "babata",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "babata 浏览器侧边栏 — chat / 整页双语 / 划词 / page agent / 浏览器管家",
   "minimum_chrome_version": "120",
   "icons": {

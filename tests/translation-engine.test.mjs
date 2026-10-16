@@ -80,7 +80,7 @@ await test('cancelling one subscriber preserves shared work; the last subscriber
 
   const last = new AbortController();
   let lastSignal;
-  const waiting = createTranslationEngine({ complete: ({ signal }) => {
+  const waiting = createTranslationEngine({ cancelGraceMs: 20, complete: ({ signal }) => {
     lastSignal = signal;
     return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
   } });
@@ -89,6 +89,8 @@ await test('cancelling one subscriber preserves shared work; the last subscriber
   await until(() => lastSignal);
   last.abort();
   await cancelled;
+  assert.equal(lastSignal.aborted, false, 'brief subscriber gaps retain already dispatched work');
+  await until(() => lastSignal.aborted);
   assert.equal(lastSignal.aborted, true);
   assert.equal(waiting.stats().pending_items, 0);
 });
@@ -111,6 +113,189 @@ await test('an orphaned item can rejoin a still-needed shared provider batch', a
   assert.equal(calls, 1);
 });
 
+await test('successful orphan items are cached when another subscriber keeps their batch alive', async () => {
+  const gate = deferred();
+  let calls = 0;
+  const engine = createTranslationEngine({ complete: async ({ batch }) => { calls++; await gate.promise; return responseFor(batch); } });
+  const controller = new AbortController();
+  const full = engine.translate(provider, { batch: [{ hash: 'a', text: 'Alpha' }, { hash: 'b', text: 'Beta' }] }, controller.signal);
+  const cancelled = assert.rejects(full, { name: 'AbortError' });
+  await until(() => calls === 1);
+  const alpha = engine.translate(provider, input('Alpha'));
+  controller.abort();
+  await cancelled;
+  gate.resolve();
+  await alpha;
+  assert.equal(engine.stats().cache_entries, 2, 'both validated items were already paid for');
+  await engine.translate(provider, input('Beta'));
+  assert.equal(calls, 1, 'revisiting the orphan does not repeat the provider call');
+});
+
+await test('the final subscriber can rejoin during a bounded cancellation grace without another provider call', async () => {
+  const gate = deferred();
+  let calls = 0;
+  let upstreamSignal;
+  const engine = createTranslationEngine({ cancelGraceMs: 40, complete: async ({ batch, signal }) => {
+    calls++;
+    upstreamSignal = signal;
+    await gate.promise;
+    return responseFor(batch);
+  } });
+  const controller = new AbortController();
+  const first = engine.translate(provider, input(), controller.signal);
+  const cancelled = assert.rejects(first, { name: 'AbortError' });
+  await until(() => calls === 1);
+  controller.abort();
+  await cancelled;
+  assert.equal(engine.stats().pending_items, 1);
+  const second = engine.translate(provider, input('Hello world.', 'rejoined'));
+  await delay(60);
+  assert.equal(upstreamSignal.aborted, false, 'new demand clears the old cancellation deadline');
+  gate.resolve();
+  assert.equal((await second).complete, true);
+  assert.equal(calls, 1);
+  assert.equal(engine.stats().pending_items, 0);
+});
+
+await test('success during the grace is cached and clears its timer; aborted late success never enters cache', async () => {
+  for (const abortBeforeCompletion of [false, true]) {
+    const gate = deferred();
+    let upstreamSignal;
+    const engine = createTranslationEngine({ cancelGraceMs: 25, complete: async ({ batch, signal }) => {
+      upstreamSignal = signal;
+      await gate.promise; // Deliberately model an upstream that ignores abort.
+      return responseFor(batch);
+    } });
+    const controller = new AbortController();
+    const work = engine.translate(provider, input(), controller.signal);
+    const cancelled = assert.rejects(work, { name: 'AbortError' });
+    await until(() => upstreamSignal);
+    controller.abort();
+    await cancelled;
+    if (abortBeforeCompletion) await until(() => upstreamSignal.aborted);
+    gate.resolve();
+    await until(() => engine.stats().translated_items === 1);
+    await delay(35);
+    assert.equal(upstreamSignal.aborted, abortBeforeCompletion);
+    assert.equal(engine.stats().cache_entries, abortBeforeCompletion ? 0 : 1);
+    assert.equal(engine.stats().pending_items, 0);
+  }
+});
+
+await test('unused queued work waits for subscriber demand, then rejoins or cancels without a provider call', async () => {
+  for (const rejoin of [false, true]) {
+    const scheduler = createProviderScheduler({ concurrency: 1 });
+    const gate = deferred();
+    const blocker = scheduler.run(() => gate.promise);
+    let calls = 0;
+    const engine = createTranslationEngine({ cancelGraceMs: 50, complete: ({ batch, ...options }) => scheduler.run(() => {
+      calls++;
+      return responseFor(batch);
+    }, options) });
+    const controller = new AbortController();
+    const first = engine.translate(provider, input(), controller.signal);
+    const cancelled = assert.rejects(first, { name: 'AbortError' });
+    await until(() => scheduler.stats().queued === 1);
+    controller.abort();
+    await cancelled;
+    gate.resolve();
+    await blocker;
+    await delay(10);
+    assert.equal(calls, 0, 'a free worker must not dispatch an unused queued item');
+    if (rejoin) {
+      assert.equal((await engine.translate(provider, input())).complete, true);
+      assert.equal(calls, 1, 'subscriber notification wakes the existing queue entry');
+    } else {
+      await until(() => scheduler.stats().queued === 0);
+      assert.equal(calls, 0);
+    }
+    assert.equal(engine.stats().pending_items, 0);
+    assert.equal(scheduler.stats().queued, 0);
+  }
+});
+
+await test('dormant scheduler entries remain bounded and release their demand listeners when removed', async () => {
+  const scheduler = createProviderScheduler({ concurrency: 2, maxQueued: 1 });
+  const controller = new AbortController();
+  const listeners = new Set();
+  const options = { signal: controller.signal, isNeeded: () => false, onDemandChange: (notify) => {
+    listeners.add(notify);
+    return () => listeners.delete(notify);
+  } };
+  const dormant = scheduler.run(() => assert.fail('unused work was dispatched'), options);
+  const rejected = assert.rejects(dormant, { name: 'AbortError' });
+  assert.equal(listeners.size, 1);
+  await assert.rejects(scheduler.run(() => assert.fail('queue overflow'), options), { code: 'queue_full' });
+  assert.equal(scheduler.stats().queued, 1);
+  controller.abort();
+  await rejected;
+  assert.equal(scheduler.stats().queued, 0);
+  assert.equal(listeners.size, 0);
+});
+
+await test('provider startup has no cancellation microtask gap and a quick rejoin still shares its success', async () => {
+  const scheduler = createProviderScheduler({ concurrency: 1 });
+  const gate = deferred();
+  const neededAtStart = [];
+  const engine = createTranslationEngine({ cancelGraceMs: 50, complete: ({ batch, ...options }) => scheduler.run(async () => {
+    neededAtStart.push(options.isNeeded());
+    await gate.promise;
+    return responseFor(batch);
+  }, options) });
+  const controller = new AbortController();
+  const first = engine.translate(provider, input(), controller.signal);
+  const cancelled = assert.rejects(first, { name: 'AbortError' });
+  queueMicrotask(() => controller.abort());
+  await cancelled;
+  assert.deepEqual(neededAtStart, [true], 'a provider call starts while it is still needed, never in a later cancellation gap');
+  const rejoined = engine.translate(provider, input());
+  gate.resolve();
+  assert.equal((await rejoined).complete, true, 'the grace must not turn a legitimate rejoin into a failed request');
+  assert.equal(neededAtStart.length, 1);
+
+  const beforeDispatch = new AbortController();
+  const unused = engine.translate(provider, input('Cancelled before dispatch'), beforeDispatch.signal);
+  const unusedCancelled = assert.rejects(unused, { name: 'AbortError' });
+  beforeDispatch.abort();
+  await unusedCancelled;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(neededAtStart.length, 1, 'cancellation before dispatch produces no provider call');
+  assert.equal(engine.stats().pending_items, 0);
+  assert.equal(scheduler.stats().active, 0);
+});
+
+await test('a synchronous provider throw releases its scheduler slot and preserves queue progress', async () => {
+  const scheduler = createProviderScheduler({ concurrency: 1 });
+  const failed = scheduler.run(() => { throw new Error('synchronous fixture failure'); });
+  const next = scheduler.run(() => 'next result');
+  await assert.rejects(failed, /synchronous fixture failure/);
+  assert.equal(await next, 'next result');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduler.stats().active, 0);
+  assert.equal(scheduler.stats().queued, 0);
+});
+
+await test('zero grace restores immediate cancellation and a different provider cannot rejoin old work', async () => {
+  const signals = [];
+  const engine = createTranslationEngine({ cancelGraceMs: 0, complete: ({ signal }) => {
+    signals.push(signal);
+    return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  } });
+  const firstController = new AbortController();
+  const secondController = new AbortController();
+  const first = engine.translate(provider, input(), firstController.signal);
+  const second = engine.translate({ ...provider, model: 'changed-model' }, input(), secondController.signal);
+  const rejected = [assert.rejects(first, { name: 'AbortError' }), assert.rejects(second, { name: 'AbortError' })];
+  await until(() => signals.length === 2);
+  firstController.abort();
+  assert.equal(signals[0].aborted, true);
+  assert.equal(signals[1].aborted, false);
+  secondController.abort();
+  await Promise.all(rejected);
+  assert.equal(engine.stats().cache_entries, 0);
+  assert.equal(engine.stats().pending_items, 0);
+});
+
 await test('cache identity isolates provider, key, model, language and exact source; force bypasses it', async () => {
   let calls = 0;
   const engine = createTranslationEngine({ complete: async ({ batch }) => { calls++; return responseFor(batch); } });
@@ -123,6 +308,7 @@ await test('cache identity isolates provider, key, model, language and exact sou
   assert.equal(calls, 6);
   await engine.translate(provider, input(), undefined, { force: true });
   assert.equal(calls, 7);
+  assert.equal(engine.stats().cache_entries, 6, 'forced capability probes never populate the reuse cache');
   assert.doesNotMatch(JSON.stringify(engine.stats()), /private-test-key|Hello|provider\.test/);
 });
 
@@ -250,6 +436,73 @@ await test('token bucket paces requests independently from concurrent worker lim
   assert.ok(arrivals[1] >= 35, 'second request waits for refill even though workers are free');
   assert.ok(arrivals[2] >= 85, 'sustained request rate obeys the token bucket');
   assert.equal(scheduler.stats().peak_active, 1);
+});
+
+await test('HTTP subscriber gaps reuse dispatched work and unused retries never reach the provider', async (t) => {
+  let hits = 0;
+  let mode = 'success';
+  let gate = deferred();
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    const batch = JSON.parse(JSON.parse(Buffer.concat(chunks).toString()).messages.at(-1).content).batch;
+    hits++;
+    await gate.promise;
+    if (res.destroyed) return;
+    res.setHeader('content-type', 'application/json');
+    if (mode === 'failure') { res.writeHead(503); res.end('{"error":"temporary fixture failure"}'); return; }
+    res.end(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: responseFor(batch).content } }] }));
+  });
+  upstream.listen(0, '127.0.0.1'); await once(upstream, 'listening');
+  const server = await startCompanion({ BABATA_PROVIDER_TIMEOUT_MS: '2000', BABATA_TRANSLATE_CANCEL_GRACE_MS: '100', BABATA_PROVIDER_RETRY_BASE_MS: '5' });
+  t.after(async () => { gate.resolve(); await server.close(); upstream.closeAllConnections(); await new Promise((resolve) => upstream.close(resolve)); });
+  const config = { base_url: `http://127.0.0.1:${upstream.address().port}/v1`, model: 'subscriber-fixture', api_key: '' };
+  const stats = async () => (await (await server.request('/translate/stats')).json());
+  async function untilStats(check) {
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) { if (check(await stats())) return; await delay(5); }
+    assert.fail('companion state did not settle');
+  }
+
+  const firstController = new AbortController();
+  const first = server.post('/translate', { ...config, ...input('Brief subscriber gap') }, { signal: firstController.signal });
+  const cancelledFirst = assert.rejects(first, { name: 'AbortError' });
+  await until(() => hits === 1);
+  firstController.abort();
+  await cancelledFirst;
+  await untilStats((state) => state.translation.cancelled_subscriptions === 1);
+  const rejoined = server.post('/translate', { ...config, ...input('Brief subscriber gap', 'new-client-hash') }).then((response) => response.json());
+  await untilStats((state) => state.translation.coalesced_items === 1);
+  gate.resolve();
+  assert.equal((await rejoined).complete, true);
+  assert.equal(hits, 1, 'brief transport cancellation reuses the actual upstream call');
+
+  gate = deferred();
+  const orphanController = new AbortController();
+  const full = server.post('/translate', { ...config, batch: [{ hash: 'a', text: 'Shared item' }, { hash: 'b', text: 'Orphan item' }] }, { signal: orphanController.signal });
+  const cancelledFull = assert.rejects(full, { name: 'AbortError' });
+  await until(() => hits === 2);
+  const shared = server.post('/translate', { ...config, ...input('Shared item') }).then((response) => response.json());
+  await untilStats((state) => state.translation.coalesced_items === 2);
+  orphanController.abort();
+  await cancelledFull;
+  await untilStats((state) => state.translation.cancelled_subscriptions === 3);
+  gate.resolve();
+  assert.equal((await shared).complete, true);
+  assert.equal((await (await server.post('/translate', { ...config, ...input('Orphan item') })).json()).complete, true);
+  assert.equal(hits, 2, 'the orphan already translated in the shared batch is cached');
+
+  gate = deferred(); mode = 'failure';
+  const retryController = new AbortController();
+  const retry = server.post('/translate', { ...config, ...input('Abandoned before retry') }, { signal: retryController.signal });
+  const cancelledRetry = assert.rejects(retry, { name: 'AbortError' });
+  await until(() => hits === 3);
+  retryController.abort();
+  await cancelledRetry;
+  await untilStats((state) => state.translation.cancelled_subscriptions === 4);
+  gate.resolve();
+  await untilStats((state) => state.translation.pending_items === 0 && state.provider.queued === 0 && state.provider.active === 0);
+  assert.equal(hits, 3, 'a retry with no remaining subscribers never reaches upstream');
+  assert.equal((await stats()).translation.cache_entries, 3, 'failed/cancelled work does not enter cache');
 });
 
 await test('HTTP provider test, partial errors, caching, retry metadata and stats use the real server path', async (t) => {

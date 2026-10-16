@@ -28,17 +28,20 @@ export class SubtitleTranslationScheduler {
   private queue: CaptionCue[] = [];
   private latestTime = 0;
   private rate = 1;
+  private prefetch = true;
+  private dispatchPaused = false;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private translate: Translate, private onUpdate: (error?: string) => void, readonly target = "zh") {}
 
   setSource(id: string, cues: CaptionCue[], language = ""): void {
-    // Track changes invalidate ownership. Appending live cues keeps existing
-    // requests and finished cache entries, avoiding a restart every cuechange.
-    if (id !== this.sourceId || language !== this.language) this.cancel();
+    // Identical text has the same ownership across track IDs. Preserve useful
+    // requests when a site swaps its native/network representation of a track.
+    if (id !== this.sourceId || language !== this.language) this.queue = [];
     this.sourceId = id;
     this.language = language;
     this.timeline = new CaptionTimeline(cues);
+    this.pruneRequests(new Set(this.timeline.cues.map((cue) => this.key(cue))));
   }
 
   translated(cue: CaptionCue): string | undefined {
@@ -48,15 +51,25 @@ export class SubtitleTranslationScheduler {
 
   key(cue: CaptionCue): string { return captionTextKey(cue.text, this.target, this.language); }
 
-  setEnabled(enabled: boolean): void {
+  setEnabled(enabled: boolean, timeMs = this.latestTime, rate = this.rate, prefetch = this.prefetch): void {
     this.enabled = enabled;
     if (!enabled) this.cancel();
-    else this.update(this.latestTime, this.rate);
+    else this.update(timeMs, rate, prefetch);
   }
 
   seek(timeMs: number, rate = 1): void {
-    this.cancel();
-    this.update(timeMs, rate);
+    this.update(timeMs, rate, this.prefetch);
+  }
+
+  setDispatchPaused(paused: boolean): void {
+    this.dispatchPaused = paused;
+    if (paused) {
+      this.queue = [];
+      clearTimeout(this.retryTimer);
+      this.retryTimer = undefined;
+    }
+    // Resuming never dispatches the stale playhead. The caller supplies its
+    // final seek position in the next update before any new work can start.
   }
 
   cancel(): void {
@@ -73,23 +86,28 @@ export class SubtitleTranslationScheduler {
     this.cancel();
     this.translations.clear();
     this.failures.clear();
-    this.update(this.latestTime, this.rate);
+    this.update(this.latestTime, this.rate, this.prefetch);
   }
 
-  update(timeMs: number, rate = 1): void {
+  update(timeMs: number, rate = 1, prefetch = this.prefetch): void {
     this.latestTime = timeMs;
     this.rate = Number.isFinite(rate) && rate > 0 ? rate : 1;
-    if (!this.enabled) return;
+    this.prefetch = prefetch;
+    if (!this.enabled || this.dispatchPaused) return;
     const active = this.timeline.indexAt(timeMs);
-    const center = active >= 0 ? active : this.timeline.nextIndex(timeMs);
-    if (center < 0) { this.queue = []; return; }
+    const center = active >= 0 ? active : prefetch ? this.timeline.nextIndex(timeMs) : -1;
+    const candidates: CaptionCue[] = [];
+    for (let at = center; at >= 0 && at < this.timeline.cues.length && at < center + (prefetch ? 36 : 1); at += 1) {
+      const cue = this.timeline.cues[at];
+      if (cue.startMs > timeMs + 35_000 * this.rate) break;
+      candidates.push(cue);
+    }
+    this.pruneRequests(new Set(candidates.map((cue) => this.key(cue))));
     const now = Date.now();
     const seen = new Set<string>();
     this.queue = [];
     let nextRetry = Infinity;
-    for (let at = center; at < this.timeline.cues.length && at < center + 36; at += 1) {
-      const cue = this.timeline.cues[at];
-      if (cue.startMs > timeMs + 35_000 * this.rate) break;
+    for (const cue of candidates) {
       const key = this.key(cue);
       if (seen.has(key) || this.translated(cue) !== undefined || this.pending.has(key)) continue;
       seen.add(key);
@@ -100,13 +118,22 @@ export class SubtitleTranslationScheduler {
     }
     clearTimeout(this.retryTimer);
     this.retryTimer = Number.isFinite(nextRetry)
-      ? setTimeout(() => this.update(this.latestTime, this.rate), Math.max(20, nextRetry - now))
+      ? setTimeout(() => this.update(this.latestTime, this.rate, this.prefetch), Math.max(20, nextRetry - now))
       : undefined;
     this.pump();
   }
 
+  private pruneRequests(needed: Set<string>): void {
+    for (const controller of this.controllers) {
+      if ([...this.pending].some(([key, owner]) => owner === controller && needed.has(key))) continue;
+      controller.abort();
+      this.controllers.delete(controller);
+      for (const [key, owner] of this.pending) if (owner === controller) this.pending.delete(key);
+    }
+  }
+
   private pump(): void {
-    while (this.enabled && this.controllers.size < 2 && this.queue.length) {
+    while (this.enabled && !this.dispatchPaused && this.controllers.size < 2 && this.queue.length) {
       const current = this.timeline.cues[this.timeline.indexAt(this.latestTime)];
       const urgent = current && this.key(this.queue[0]) === this.key(current);
       const batch: CaptionCue[] = [];
@@ -157,7 +184,7 @@ export class SubtitleTranslationScheduler {
     } finally {
       this.controllers.delete(controller);
       for (const item of batch) if (this.pending.get(item.hash) === controller) this.pending.delete(item.hash);
-      if (generation === this.generation && !controller.signal.aborted) this.update(this.latestTime, this.rate);
+      if (generation === this.generation && !controller.signal.aborted) this.update(this.latestTime, this.rate, this.prefetch);
     }
   }
 

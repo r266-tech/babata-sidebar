@@ -1,3 +1,10 @@
+const captionWindow = window as Window & { __babataVideoCaptionCaptureBooted?: boolean };
+if (!captionWindow.__babataVideoCaptionCaptureBooted) installCaptionCapture();
+
+function installCaptionCapture(): void {
+if (typeof document !== "undefined" && document.documentElement?.getAttribute("data-bbt-video-translate-version") !== "2"
+  && document.querySelector('bbt-video-controls[data-bbt-video],.bbt-video-overlay[data-bbt-youtube-subtitles="1"],#bbt-youtube-subtitle-overlay[data-bbt-youtube-subtitles="1"]')) return;
+captionWindow.__babataVideoCaptionCaptureBooted = true;
 const BBT_YT_CAPTION_MESSAGE = "babata.youtube_caption_response";
 const MAX_CAPTION_BYTES = 2_000_000;
 const lastCaptions = new Map<string, { url: string; response: string; pageUrl: string }>();
@@ -88,4 +95,5 @@ window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   }
   return response;
 };
+}
 export {};
