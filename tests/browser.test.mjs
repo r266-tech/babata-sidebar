@@ -140,7 +140,7 @@ await test('built extension in an isolated Chromium profile', { timeout: 120_000
     await reader.close();
   });
 
-  await t.test('YouTube rejects malformed/stale captions, clears navigation, and obeys the site switch', async () => {
+  await t.test('YouTube rejects malformed/stale captions, clears navigation, and obeys its independent global switch', async () => {
     const youtube = await context.newPage();
     let captionBody = '';
     await youtube.route('https://www.youtube.com/**', (route) => route.request().url().includes('/api/timedtext')
@@ -164,12 +164,19 @@ await test('built extension in an isolated Chromium profile', { timeout: 120_000
     await expect(youtube.locator('#bbt-youtube-subtitle-overlay')).toBeHidden();
     await worker.evaluate(() => chrome.storage.local.set({ 'babata.translation_always_disabled_hosts': ['youtube.com'] }));
     await expect(youtube.locator('html')).toHaveAttribute('data-bbt-mode', 'off');
-    const before = requests.length;
+    const beforeSiteChange = requests.length;
     await caption('video-two', JSON.stringify({ events: [{ tStartMs: 0, dDurationMs: 10000, segs: [{ utf8: 'Hello from video two.' }] }] }));
+    await expect(youtube.locator('#bbt-youtube-subtitle-overlay')).toBeVisible();
+    await expect.poll(() => requests.length).toBeGreaterThan(beforeSiteChange);
+    await worker.evaluate(() => chrome.storage.local.set({ 'babata.video_translation_enabled': false }));
+    await expect(youtube.locator('#bbt-youtube-subtitle-overlay')).toBeHidden();
+    const before = requests.length;
+    await caption('video-two', JSON.stringify({ events: [{ tStartMs: 0, dDurationMs: 10000, segs: [{ utf8: 'New video captions must stay native while globally disabled.' }] }] }));
     await youtube.waitForTimeout(500);
     assert.equal(requests.length, before);
     await expect(youtube.locator('#bbt-youtube-subtitle-overlay')).toBeHidden();
     await youtube.close();
+    await worker.evaluate(() => chrome.storage.local.set({ 'babata.video_translation_enabled': true }));
   });
 
   await t.test('sidebar sends selected CPU and fresh metadata; a cleared chat stays empty after reload', async () => {

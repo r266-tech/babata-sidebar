@@ -201,9 +201,19 @@ markers, and protected inline code is restored from the source DOM.
 Extension updates reconnect page and caption translation in already-open HTTP(S) tabs.
 Recovery checks the current document before injecting missing code; it preserves
 the page, scroll position, and unsent inputs without reloading the website.
+The floating widget also upgrades automatically; an open page-chat popup is
+kept intact until closed so its unsent draft survives the update.
 Video scripts loaded before version 0.1.2 need a one-time page refresh to replace
 their legacy handlers safely. Such players are not given a second overlapping
 subtitle engine during automatic recovery.
+
+The floating widget's translation settings include a **Video translation**
+global switch, enabled by default. It persists across browser sessions and
+updates all open tabs and embedded players. It is independent of the website's
+page-translation setting. Switching it off cancels subtitle work, stops any
+active audio transcription, and restores native captions. Switching it back on
+resumes caption translation; audio transcription still requires an explicit
+click on the player's Listen/Translate control.
 
 Video controls appear over supported HTML5 players. Choose a caption track, use
 the display-mode control, or import a local `.vtt`/`.srt` subtitle file. Current

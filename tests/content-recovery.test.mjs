@@ -10,14 +10,15 @@ const { createTranslationContentRecovery, translationContentFiles, recoveryConte
 const loader = 'assets/babata-translate.ts-loader-fixture.js';
 const videoLoader = 'assets/youtube-subtitles.ts-loader-fixture.js';
 const mainLoader = 'assets/youtube-subtitles-main.ts-fixture.js';
+const widgetLoader = 'assets/babata-widget.ts-loader-fixture.js';
 const manifest = { content_scripts: [
   { js: [videoLoader], all_frames: true },
   { js: [mainLoader], all_frames: true, world: 'MAIN' },
-  { js: ['assets/babata-widget.ts-loader-fixture.js'] },
+  { js: [widgetLoader] },
   { js: [loader], all_frames: true, match_about_blank: true },
 ] };
 const pageManifest = { content_scripts: [{ js: [loader] }] };
-const state = (overrides = {}) => ({ page: false, video: false, legacyVideo: false, ...overrides });
+const state = (overrides = {}) => ({ page: false, video: false, legacyVideo: false, widget: false, ...overrides });
 const normalTab = { id: 7, url: 'https://example.test/thread', active: true, discarded: false };
 const deferred = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };
 
@@ -44,13 +45,13 @@ await test('recovery resolves only the translation entry from source and built m
   assert.deepEqual(Array.from(translationContentFiles({ content_scripts: [{ js: ['src/content/babata-translate.ts'] }] })), ['src/content/babata-translate.ts']);
   assert.deepEqual(Array.from(translationContentFiles({ content_scripts: [{ js: [loader], world: 'MAIN' }] })), []);
   assert.deepEqual(Array.from(translationContentFiles({})), []);
-  assert.deepEqual(JSON.parse(JSON.stringify(recoveryContentFiles(manifest))), { page: [loader], video: [videoLoader], main: [mainLoader] });
+  assert.deepEqual(JSON.parse(JSON.stringify(recoveryContentFiles(manifest))), { page: [loader], video: [videoLoader], main: [mainLoader], widget: [widgetLoader] });
   assert.deepEqual(JSON.parse(JSON.stringify(recoveryContentFiles({ content_scripts: [
-    { js: ['src/content/babata-translate.ts', 'src/content/youtube-subtitles.ts'] },
+    { js: ['src/content/babata-translate.ts', 'src/content/youtube-subtitles.ts', 'src/content/babata-widget.ts'] },
     { js: ['src/content/youtube-subtitles-main.ts'], world: 'MAIN' },
     { js: [videoLoader], world: 'MAIN' },
     { js: [mainLoader] },
-  ] }))), { page: ['src/content/babata-translate.ts'], video: ['src/content/youtube-subtitles.ts'], main: ['src/content/youtube-subtitles-main.ts'] });
+  ] }))), { page: ['src/content/babata-translate.ts'], video: ['src/content/youtube-subtitles.ts'], main: ['src/content/youtube-subtitles-main.ts'], widget: ['src/content/babata-widget.ts'] });
 });
 
 await test('recovery probes isolated state and injects only missing documents', async () => {
@@ -64,6 +65,8 @@ await test('recovery probes isolated state and injects only missing documents', 
     assert.deepEqual(runProbe({}), state(), 'a stale DOM mode attribute is not a health signal');
     assert.equal(runProbe({}, true).legacyVideo, true);
     assert.equal(runProbe({}, true, '2').legacyVideo, false, 'new controllers support cross-context teardown');
+    assert.equal(runProbe({ __babataWidgetBooted: true }).widget, true);
+    assert.equal(runProbe({ __babataWidgetRecoveryWaiting: true }).widget, true, 'a pending popup-safe upgrade must not be injected repeatedly');
     return [
       { frameId: 0, documentId: 'running-main', result: state({ page: true }) },
       { frameId: 1, documentId: 'missing-child', result: state() },
@@ -106,7 +109,7 @@ await test('page, video and MAIN capture recover independently in their original
     ];
   } });
   const report = await h.recoverTab(7);
-  assert.deepEqual(JSON.parse(JSON.stringify(report)), { tabId: 7, injected: { page: 1, video: 1, main: 2 }, needs_refresh: [] });
+  assert.deepEqual(JSON.parse(JSON.stringify(report)), { tabId: 7, injected: { page: 1, video: 1, main: 2, widget: 0 }, needs_refresh: [] });
   const injected = h.calls.filter((call) => call.files).map((call) => ({ document: call.target.documentIds[0], world: call.world, files: Array.from(call.files) }));
   assert.deepEqual(injected.filter((item) => item.files.includes(loader)), [{ document: 'missing-page', world: 'ISOLATED', files: [loader] }]);
   assert.deepEqual(injected.filter((item) => item.files.includes(videoLoader)), [{ document: 'missing-video', world: 'ISOLATED', files: [videoLoader] }]);
@@ -122,7 +125,7 @@ await test('legacy video controllers require one refresh while page text and saf
     ] });
   const report = await h.recoverTab(7);
   assert.deepEqual(JSON.parse(JSON.stringify(report.needs_refresh)), [{ documentId: 'legacy-video', reason: 'legacy_video_context' }]);
-  assert.deepEqual(JSON.parse(JSON.stringify(report.injected)), { page: 2, video: 1, main: 1 });
+  assert.deepEqual(JSON.parse(JSON.stringify(report.injected)), { page: 2, video: 1, main: 1, widget: 0 });
   const legacyCalls = h.calls.filter((call) => call.target.documentIds?.[0] === 'legacy-video');
   assert.equal(legacyCalls.length, 1);
   assert.deepEqual(Array.from(legacyCalls[0].files), [loader]);
@@ -134,7 +137,7 @@ await test('current-version stale DOM can recover and a surviving MAIN hook is n
     ? [{ documentId: 'reload-document', result: true }]
     : [{ documentId: 'reload-document', result: state() }] });
   const report = await h.recoverTab(7);
-  assert.deepEqual(JSON.parse(JSON.stringify(report.injected)), { page: 1, video: 1, main: 0 });
+  assert.deepEqual(JSON.parse(JSON.stringify(report.injected)), { page: 1, video: 1, main: 0, widget: 0 });
   assert.equal(report.needs_refresh.length, 0);
 });
 
@@ -145,9 +148,30 @@ await test('MAIN probe errors or a replacement document never redirect injection
     return [{ documentId: 'replacement', result: false }];
   } });
   const report = await h.recoverTab(7);
-  assert.deepEqual(JSON.parse(JSON.stringify(report.injected)), { page: 2, video: 2, main: 0 });
+  assert.deepEqual(JSON.parse(JSON.stringify(report.injected)), { page: 2, video: 2, main: 0, widget: 0 });
   assert.equal(h.calls.some((call) => call.files?.includes(mainLoader)), false);
   assert.equal(h.calls.some((call) => call.target.documentIds?.includes('replacement')), false);
+});
+
+await test('widget recovery is top-frame only, document-bound and independent of legacy video blockers', async () => {
+  const h = host({ currentManifest: manifest, probe: (spec) => spec.world === 'MAIN'
+    ? [{ documentId: spec.target.documentIds[0], result: true }]
+    : [
+      { frameId: 0, documentId: 'top-document', result: state({ page: true, video: true, legacyVideo: true }) },
+      { frameId: 3, documentId: 'child-document', result: state({ page: true, video: true }) },
+    ] });
+  const report = await h.recoverTab(7);
+  const injections = h.calls.filter((call) => call.files?.includes(widgetLoader));
+  assert.equal(injections.length, 1);
+  assert.deepEqual(Array.from(injections[0].target.documentIds), ['top-document']);
+  assert.equal(injections[0].world, 'ISOLATED');
+  assert.equal(report.injected.widget, 1);
+  assert.equal(report.needs_refresh[0].reason, 'legacy_video_context');
+
+  const healthy = host({ currentManifest: { content_scripts: [{ js: [widgetLoader] }] }, probe: () => [
+    { frameId: 0, documentId: 'top-document', result: state({ widget: true }) },
+  ] });
+  assert.equal((await healthy.recoverTab(7)).injected.widget, 0);
 });
 
 await test('simultaneous installation and activation share one recovery and release the flight', async () => {

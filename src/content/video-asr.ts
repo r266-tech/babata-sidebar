@@ -69,6 +69,8 @@ export class VideoTranscription {
       this.onStatus("正在听译，字幕约有 12–20 秒延迟。", true);
       this.recordChunk();
     } catch (error) {
+      // A stopped attempt may reject after a newer explicit start has begun.
+      if (token !== this.generation) return;
       this.stop();
       throw error;
     }

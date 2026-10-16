@@ -1,7 +1,7 @@
 /// <reference types="chrome" />
 import {
-  STORAGE_TRANSLATION_MODE, STORAGE_ALWAYS_TRANSLATE_HOSTS, STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
-  effectiveTranslationModeForHost, type TranslationMode,
+  STORAGE_TRANSLATION_MODE, STORAGE_VIDEO_TRANSLATION,
+  isVideoTranslationEnabled, normalizeTranslationRenderMode, type TranslationMode,
 } from "../translation-settings";
 import { requestTranslation } from "./translation-client";
 import { parseCaptionBody, type CaptionCue } from "./youtube-captions";
@@ -26,13 +26,17 @@ function listen(target: EventTarget, type: string, listener: EventListener, opti
 }
 
 const FONT_KEY = "babata.subtitle_font_scale";
+const DEFAULT_STATUS = "开启网站字幕、导入字幕，或使用听译。";
+const DISABLED_STATUS = "视频翻译已全局关闭，可在浮窗“翻译设置”中重新开启。";
 const OVERLAY_ID = "bbt-youtube-subtitle-overlay";
 const ACTIVE_CLASS = "bbt-youtube-subtitle-active";
 const controllers = new Map<HTMLVideoElement, VideoSubtitleController>();
 const trackIds = new WeakMap<TextTrack, number>();
 let nextTrack = 1;
 let nextController = 1;
-let globalMode: TranslationMode = "off";
+let globalMode: TranslationMode = "replace";
+// Do not dispatch before the initial stored policy is known.
+let globalVideoEnabled = false;
 let fontScale = 1;
 let suspended = false;
 let navigating = false;
@@ -95,8 +99,13 @@ class VideoSubtitleController {
   private scaleInput: HTMLInputElement;
   private status: HTMLElement;
   private asrButton: HTMLButtonElement;
+  private importButton: HTMLButtonElement;
+  private fileInput: HTMLInputElement;
+  private asrStarting = false;
+  private asrStartSequence = 0;
+  private interactionGeneration = 0;
   private sourceId = "";
-  private mode: TranslationMode = globalMode;
+  private mode: TranslationMode = globalVideoEnabled ? globalMode : "off";
   private manualMode: TranslationMode | undefined;
   private frame = 0;
   private videoFrame = 0;
@@ -131,6 +140,7 @@ class VideoSubtitleController {
     );
     this.scheduler.enabled = this.mode !== "off";
     this.asr = new VideoTranscription(video, (cues, language, chunkStart) => {
+      if (!globalVideoEnabled || this.disposed) return;
       this.asrCues = [...this.asrCues, ...cues].filter((cue) => cue.endMs >= this.video.currentTime * 1000 - 5 * 60_000);
       this.asrDelayMs = Math.max(this.asrDelayMs, this.video.currentTime * 1000 - chunkStart + 100);
       this.installSource({ id: "asr", label: "实时听译（有延迟）", language, cues: this.asrCues }, true);
@@ -158,6 +168,7 @@ class VideoSubtitleController {
       :host{font:13px/1.4 system-ui,sans-serif;color:#fff;color-scheme:dark;}
       *{box-sizing:border-box}button,select,input{font:inherit}button,select{color:#fff;background:#20252e;border:1px solid #ffffff38;border-radius:7px;padding:6px 9px;cursor:pointer}
       button:hover,select:hover{background:#343c49}button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid #8bc5ff;outline-offset:2px}
+      button:disabled,select:disabled,input:disabled{opacity:.5;cursor:not-allowed}
       .toolbar{display:flex;gap:3px;justify-content:flex-end;white-space:nowrap}.toggle{background:#18222ee6;opacity:.85}.toggle:hover{opacity:1}
       .panel{position:absolute;right:0;top:37px;width:248px;padding:12px;border:1px solid #ffffff24;border-radius:11px;background:#151a22f5;box-shadow:0 8px 25px #0005}
       .panel[hidden]{display:none}label{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:0 0 9px}select{max-width:155px;min-width:100px}input[type=range]{width:145px}
@@ -174,6 +185,8 @@ class VideoSubtitleController {
     this.scaleInput = shadow.querySelector<HTMLInputElement>(".scale")!;
     this.status = shadow.querySelector<HTMLElement>(".status")!;
     this.asrButton = shadow.querySelector<HTMLButtonElement>(".asr")!;
+    this.importButton = shadow.querySelector<HTMLButtonElement>(".import")!;
+    this.fileInput = shadow.querySelector<HTMLInputElement>(".file")!;
     const settings = shadow.querySelector<HTMLButtonElement>(".settings")!;
     const panel = shadow.querySelector<HTMLElement>(".panel")!;
     settings.onclick = () => { panel.hidden = !panel.hidden; settings.setAttribute("aria-expanded", String(!panel.hidden)); };
@@ -182,36 +195,53 @@ class VideoSubtitleController {
     for (const type of ["click", "dblclick", "pointerdown", "keydown"]) shadow.addEventListener(type, (event) => event.stopPropagation());
     this.modeButton.onclick = () => this.chooseMode(this.mode === "off" ? "replace" : this.mode === "replace" ? "bilingual" : "off");
     this.modeSelect.onchange = () => this.chooseMode(this.modeSelect.value as TranslationMode);
-    this.sourceSelect.onchange = () => { const source = this.sources.get(this.sourceSelect.value); if (source) this.selectSource(source); };
+    this.sourceSelect.onchange = () => {
+      if (!globalVideoEnabled || this.disposed) return;
+      const source = this.sources.get(this.sourceSelect.value);
+      if (source) this.selectSource(source);
+    };
     this.scaleInput.oninput = () => {
       const scale = Number(this.scaleInput.value);
       fontScale = scale;
       for (const controller of controllers.values()) controller.setScale(scale);
       void chrome.storage.local.set({ [FONT_KEY]: scale });
     };
-    const file = shadow.querySelector<HTMLInputElement>(".file")!;
-    shadow.querySelector<HTMLButtonElement>(".import")!.onclick = () => file.click();
+    const file = this.fileInput;
+    this.importButton.onclick = () => { if (globalVideoEnabled && !this.disposed) file.click(); };
     file.onchange = async () => {
+      if (!globalVideoEnabled || this.disposed) return;
       const selected = file.files?.[0];
       if (!selected) return;
+      file.value = "";
       if (selected.size > 2_000_000) { this.setStatus("字幕文件不能超过 2 MB。"); return; }
+      const generation = this.interactionGeneration;
       const cues = parseCaptionBody(await selected.text());
+      if (!globalVideoEnabled || this.disposed || generation !== this.interactionGeneration) return;
       if (!cues.length) { this.setStatus("未识别到有效的 VTT、SRT 或 JSON3 字幕。"); return; }
       this.installSource({ id: `file:${selected.name}`, label: selected.name, language: "", cues }, true);
       if (this.mode === "off") this.chooseMode("replace");
       this.setStatus(`已载入 ${cues.length} 条字幕。`);
-      file.value = "";
     };
     this.asrButton.onclick = async (event) => {
+      if (!globalVideoEnabled || this.disposed || suspended) return;
       if (this.asr.active) { this.stopAsr("已停止听译。"); return; }
+      if (this.asrStarting) return;
       if (!event.isTrusted) { this.setStatus("请亲自点击“听译”以授权采集此视频的音轨。"); return; }
+      const sequence = ++this.asrStartSequence;
+      this.asrStarting = true;
       this.asrButton.disabled = true;
       try {
         await this.asr.start();
-        if (this.disposed || !this.asr.active) return;
+        if (!globalVideoEnabled || this.disposed || sequence !== this.asrStartSequence || !this.asr.active) return;
         if (this.mode === "off") this.chooseMode("replace");
-      } catch (error) { this.setStatus(error instanceof Error ? error.message : "无法启动听译。"); }
-      finally { this.asrButton.disabled = false; }
+      } catch (error) {
+        if (sequence === this.asrStartSequence) this.setStatus(error instanceof Error ? error.message : "无法启动听译。");
+      } finally {
+        if (sequence === this.asrStartSequence) {
+          this.asrStarting = false;
+          this.asrButton.disabled = !globalVideoEnabled;
+        }
+      }
     };
     this.resizeObserver = new ResizeObserver(() => { this.updateLayout(); this.refreshVisibility(); });
     this.resizeObserver.observe(video);
@@ -246,28 +276,34 @@ class VideoSubtitleController {
   }
 
   setGlobalMode(mode: TranslationMode): void {
-    this.mode = mode === "off" ? "off" : this.manualMode ?? mode;
+    this.mode = globalVideoEnabled ? this.manualMode ?? mode : "off";
+    if (!globalVideoEnabled) this.interactionGeneration += 1;
     this.applyMode();
   }
 
   private chooseMode(mode: TranslationMode): void {
+    if (!globalVideoEnabled || this.disposed) return;
     this.manualMode = mode;
     this.mode = mode;
     this.applyMode();
   }
 
   private applyMode(): void {
+    for (const control of [this.modeButton, this.modeSelect, this.sourceSelect, this.importButton, this.fileInput]) control.disabled = !globalVideoEnabled;
+    this.asrButton.disabled = !globalVideoEnabled || this.asrStarting;
     this.modeSelect.value = this.mode;
-    const label = this.mode === "off" ? "原生" : this.mode === "bilingual" ? "双语" : "译文";
+    const label = !globalVideoEnabled ? "已关闭" : this.mode === "off" ? "原生" : this.mode === "bilingual" ? "双语" : "译文";
     this.modeButton.textContent = `字幕 · ${label}`;
-    this.modeButton.setAttribute("aria-label", `字幕模式：${label}，点击切换`);
+    this.modeButton.setAttribute("aria-label", globalVideoEnabled ? `字幕模式：${label}，点击切换` : "视频翻译已全局关闭");
     this.modeButton.setAttribute("aria-pressed", String(this.mode !== "off"));
+    if (!globalVideoEnabled) this.setStatus(DISABLED_STATUS);
+    else if (this.status.textContent === DISABLED_STATUS) this.setStatus(DEFAULT_STATUS);
     if (this.mode === "off") {
       this.scheduler.setEnabled(false);
       this.hide();
       this.stopClock();
       this.restoreTracks();
-      this.stopAsr(this.asr.active || this.asrButton.disabled ? "已停止听译。" : undefined);
+      this.stopAsr(this.asr.active || this.asrStarting ? "已停止听译。" : undefined);
     } else {
       this.refreshTracks();
       this.syncNativeTrack();
@@ -293,7 +329,7 @@ class VideoSubtitleController {
     this.sourceSelect.value = source.id;
     if (changed && source.id !== "asr") {
       this.asrDelayMs = 0;
-      if (this.asr.active || this.asrButton.disabled) this.stopAsr("已切换字幕轨道，听译已停止。");
+      if (this.asr.active || this.asrStarting) this.stopAsr("已切换字幕轨道，听译已停止。");
     }
     this.scheduler.setSource(source.id, source.cues, source.language);
     this.lastSchedule = "";
@@ -402,7 +438,7 @@ class VideoSubtitleController {
   };
 
   private canTranslate(): boolean {
-    return this.visible && document.visibilityState !== "hidden" && !suspended && !this.disposed && this.mode !== "off";
+    return globalVideoEnabled && this.visible && document.visibilityState !== "hidden" && !suspended && !this.disposed && this.mode !== "off";
   }
 
   private onVisibility = (): void => {
@@ -548,7 +584,7 @@ class VideoSubtitleController {
   private onSeeking = () => {
     this.seeking = true;
     this.scheduler.setDispatchPaused(true);
-    if (this.asr.active || this.asrButton.disabled) this.stopAsr("已停止听译，请在新位置重新开启。");
+    if (this.asr.active || this.asrStarting) this.stopAsr("已停止听译，请在新位置重新开启。");
     this.queueRender();
   };
   private onSeeked = () => {
@@ -597,12 +633,15 @@ class VideoSubtitleController {
   }
 
   private stopAsr(message?: string): void {
+    this.asrStartSequence += 1;
+    this.asrStarting = false;
     this.asr.stop();
     this.asrButton.textContent = "听译（无字幕）";
+    this.asrButton.disabled = !globalVideoEnabled;
     if (message) this.setStatus(message);
   }
 
-  private setStatus(message: string): void { this.status.textContent = message; }
+  private setStatus(message: string): void { this.status.textContent = globalVideoEnabled ? message : DISABLED_STATUS; }
 
   dispose(): void {
     this.disposed = true;
@@ -692,13 +731,18 @@ function resetPage(): void {
 async function refreshSettings(): Promise<void> {
   const sequence = ++settingsSequence;
   try {
-    const settings = await chrome.storage.local.get([STORAGE_TRANSLATION_MODE, STORAGE_ALWAYS_TRANSLATE_HOSTS, STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS, FONT_KEY]);
+    const settings = await chrome.storage.local.get([STORAGE_TRANSLATION_MODE, STORAGE_VIDEO_TRANSLATION, FONT_KEY]);
     if (destroyed || sequence !== settingsSequence) return;
-    globalMode = effectiveTranslationModeForHost(settings[STORAGE_TRANSLATION_MODE], settings[STORAGE_ALWAYS_TRANSLATE_HOSTS], location.hostname, settings[STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS]);
+    globalVideoEnabled = isVideoTranslationEnabled(settings[STORAGE_VIDEO_TRANSLATION]);
+    globalMode = normalizeTranslationRenderMode(settings[STORAGE_TRANSLATION_MODE]);
     const scale = Number(settings[FONT_KEY]);
     fontScale = Number.isFinite(scale) ? Math.max(0.7, Math.min(1.6, scale)) : 1;
     for (const controller of controllers.values()) { controller.setGlobalMode(globalMode); controller.setScale(fontScale); }
-  } catch { globalMode = "off"; for (const controller of controllers.values()) controller.setGlobalMode("off"); }
+  } catch {
+    if (destroyed || sequence !== settingsSequence) return;
+    globalVideoEnabled = false;
+    for (const controller of controllers.values()) controller.setGlobalMode(globalMode);
+  }
 }
 
 const observer = new MutationObserver((records) => {
@@ -741,7 +785,13 @@ listen(window, "popstate", () => { if (pageKey !== currentPageKey()) resetPage()
 listen(window, "pagehide", () => { suspended = true; for (const controller of controllers.values()) controller.suspend(); });
 listen(window, "pageshow", () => { suspended = false; for (const controller of controllers.values()) controller.resume(); requestLastCaption(); void refreshSettings(); });
 const onStorageChanged = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
-  if (area === "local" && [STORAGE_TRANSLATION_MODE, STORAGE_ALWAYS_TRANSLATE_HOSTS, STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS, FONT_KEY].some((key) => key in changes)) void refreshSettings();
+  if (area !== "local") return;
+  // Closing the global gate must cancel immediately, even if storage reads are slow.
+  if (STORAGE_VIDEO_TRANSLATION in changes && !isVideoTranslationEnabled(changes[STORAGE_VIDEO_TRANSLATION].newValue)) {
+    globalVideoEnabled = false;
+    for (const controller of controllers.values()) controller.setGlobalMode(globalMode);
+  }
+  if ([STORAGE_TRANSLATION_MODE, STORAGE_VIDEO_TRANSLATION, FONT_KEY].some((key) => key in changes)) void refreshSettings();
 };
 chrome.storage.onChanged.addListener(onStorageChanged);
 cleanups.push(() => chrome.storage.onChanged.removeListener(onStorageChanged));

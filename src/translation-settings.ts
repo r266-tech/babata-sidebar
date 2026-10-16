@@ -3,10 +3,16 @@ export type TranslationRenderMode = Exclude<TranslationMode, "off">;
 
 export const STORAGE_TRANSLATION_MODE = "babata.translation_mode";
 export const STORAGE_SELECTION_TRANSLATION = "babata.selection_translation_enabled";
+export const STORAGE_VIDEO_TRANSLATION = "babata.video_translation_enabled";
 export const STORAGE_ALWAYS_TRANSLATE_HOSTS = "babata.translation_always_hosts";
 export const STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS = "babata.translation_always_disabled_hosts";
 export const DEFAULT_TRANSLATION_RENDER_MODE: TranslationRenderMode = "replace";
 export const DEFAULT_ALWAYS_TRANSLATE_HOST_ENABLED = true;
+export const DEFAULT_VIDEO_TRANSLATION_ENABLED = true;
+
+export function isVideoTranslationEnabled(value: unknown): boolean {
+  return value !== false;
+}
 
 export function normalizeTranslationRenderMode(v: unknown): TranslationRenderMode {
   if (v === "bilingual") return "bilingual";

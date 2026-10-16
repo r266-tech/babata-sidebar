@@ -5,9 +5,12 @@ import {
   STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
   STORAGE_ALWAYS_TRANSLATE_HOSTS,
   STORAGE_SELECTION_TRANSLATION,
+  STORAGE_VIDEO_TRANSLATION,
+  DEFAULT_VIDEO_TRANSLATION_ENABLED,
   STORAGE_TRANSLATION_MODE as STORAGE_MODE,
   effectiveTranslationModeForHost,
   isAlwaysTranslateHost,
+  isVideoTranslationEnabled,
   normalizeHostList,
   normalizeHostname,
   normalizeTranslationRenderMode as normalizeMode,
@@ -34,6 +37,7 @@ type PageTargetContext = { tab_id?: number; window_id?: number };
 
 const HOST_ID = "__babata_widget_host__";
 const TEARDOWN_EVENT = "babata:widget-teardown";
+const widgetWindow = window as Window & { __babataWidgetBooted?: boolean; __babataWidgetRecoveryWaiting?: boolean };
 const STORAGE_POS = "babata.widget.pos";
 const CLEAN_READ_STYLE_ID = "__babata_clean_read_style__";
 const CLEAN_READ_ROOT_ID = "__babata_clean_read_root__";
@@ -70,6 +74,7 @@ let widgetState: {
   openChatPopup: ((opts?: OpenChatPopupOptions) => void) | null;
   mode: TranslationRenderMode;
   selectionTranslationEnabled: boolean;
+  videoTranslationEnabled: boolean;
   alwaysTranslateHosts: string[];
   alwaysTranslateDisabledHosts: string[];
   currentHost: string;
@@ -155,6 +160,7 @@ async function currentPageTargetContext(): Promise<PageTargetContext | null> {
 async function loadPersisted(): Promise<{
   mode: TranslationRenderMode;
   selectionTranslationEnabled: boolean;
+  videoTranslationEnabled: boolean;
   alwaysTranslateHosts: string[];
   alwaysTranslateDisabledHosts: string[];
   currentHost: string;
@@ -165,6 +171,7 @@ async function loadPersisted(): Promise<{
     chrome.storage.local.get([
       STORAGE_MODE,
       STORAGE_SELECTION_TRANSLATION,
+      STORAGE_VIDEO_TRANSLATION,
       STORAGE_ALWAYS_TRANSLATE_HOSTS,
       STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
       STORAGE_POS,
@@ -174,6 +181,7 @@ async function loadPersisted(): Promise<{
     return {
       mode: DEFAULT_MODE,
       selectionTranslationEnabled: DEFAULT_SELECTION_TRANSLATION_ENABLED,
+      videoTranslationEnabled: DEFAULT_VIDEO_TRANSLATION_ENABLED,
       alwaysTranslateHosts: [],
       alwaysTranslateDisabledHosts: [],
       currentHost,
@@ -183,6 +191,7 @@ async function loadPersisted(): Promise<{
   return {
     mode: normalizeMode(got[STORAGE_MODE]),
     selectionTranslationEnabled: got[STORAGE_SELECTION_TRANSLATION] === true,
+    videoTranslationEnabled: isVideoTranslationEnabled(got[STORAGE_VIDEO_TRANSLATION]),
     alwaysTranslateHosts: normalizeHostList(got[STORAGE_ALWAYS_TRANSLATE_HOSTS]),
     alwaysTranslateDisabledHosts: normalizeHostList(got[STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS]),
     currentHost,
@@ -222,6 +231,28 @@ function createWidget() {
   // 当前 frame 是顶 frame 才注入 (避免 iframe 内重复 widget).
   if (window.top !== window.self) return;
   if (!document.documentElement) return;
+  if (widgetWindow.__babataWidgetBooted || widgetWindow.__babataWidgetRecoveryWaiting) return;
+
+  const previousHost = document.getElementById(HOST_ID);
+  if (previousHost) {
+    let previousShadow: ShadowRoot | null = previousHost.shadowRoot;
+    try { previousShadow = chrome.dom?.openOrClosedShadowRoot(previousHost) ?? previousShadow; } catch { /* Preserve an unreadable existing popup. */ }
+    if (!previousShadow || previousShadow.querySelector(".chat-popup")) {
+      // Replacing a widget with an open page chat would detach its iframe and
+      // discard the draft. Upgrade after that popup closes, without touching it.
+      widgetWindow.__babataWidgetRecoveryWaiting = true;
+      const observer = new MutationObserver(() => {
+        if (previousHost.isConnected && (!previousShadow || previousShadow.querySelector(".chat-popup"))) return;
+        observer.disconnect();
+        widgetWindow.__babataWidgetRecoveryWaiting = false;
+        createWidget();
+      });
+      if (previousShadow) observer.observe(previousShadow, { childList: true });
+      observer.observe(document.documentElement, { childList: true });
+      return;
+    }
+  }
+  widgetWindow.__babataWidgetBooted = true;
 
   document.dispatchEvent(new CustomEvent(TEARDOWN_EVENT));
   document.getElementById(HOST_ID)?.remove();
@@ -386,12 +417,16 @@ function createWidget() {
     }
 
     .popover {
+      position: fixed;
       background: #fff;
       border-radius: 14px;
       box-shadow: 0 8px 28px rgba(0,0,0,.16);
       border: 1px solid rgba(0,0,0,.06);
       padding: 14px 16px;
-      min-width: 220px;
+      box-sizing: border-box;
+      width: min(254px, calc(100vw - 24px));
+      max-height: calc(100vh - 24px);
+      overflow-y: auto;
     }
     .popover h4 { margin: 0 0 10px; font-size: 13px; font-weight: 600; color: #1c1c1c; }
     .popover label {
@@ -401,6 +436,7 @@ function createWidget() {
     .popover input[type=radio],
     .popover input[type=checkbox] { margin: 4px 0 0 0; accent-color: #c66a4a; }
     .popover .divider { height: 1px; background: rgba(0,0,0,.08); margin: 8px 0; }
+    .popover .setting-hint { color: #666; font-size: 11px; margin-top: 3px; line-height: 1.4; }
 
     .stack {
       display: flex;
@@ -668,6 +704,7 @@ function createWidget() {
     openChatPopup: null,
     mode: DEFAULT_MODE,
     selectionTranslationEnabled: DEFAULT_SELECTION_TRANSLATION_ENABLED,
+    videoTranslationEnabled: DEFAULT_VIDEO_TRANSLATION_ENABLED,
     alwaysTranslateHosts: [],
     alwaysTranslateDisabledHosts: [],
     currentHost: normalizeHostname(location.hostname),
@@ -677,6 +714,7 @@ function createWidget() {
   const onResize = () => {
     if (widgetState) applyPos(widgetState.root, widgetState.pos);
     refreshBubbleMetrics();
+    positionPopover();
   };
   window.addEventListener("resize", onResize);
   cleanupFns.push(() => window.removeEventListener("resize", onResize));
@@ -692,10 +730,12 @@ function createWidget() {
     );
     const selection = popover.querySelector<HTMLInputElement>('[data-setting="selection"]');
     if (selection) selection.checked = widgetState.selectionTranslationEnabled;
+    const video = popover.querySelector<HTMLInputElement>('[data-setting="video"]');
+    if (video) video.checked = widgetState.videoTranslationEnabled;
   };
   const onSettingsChanged = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
     if (area !== "local" || !widgetState || cleanedUp) return;
-    if ([STORAGE_MODE, STORAGE_ALWAYS_TRANSLATE_HOSTS, STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS, STORAGE_SELECTION_TRANSLATION].some((key) => changes[key])) settingsRevision += 1;
+    if ([STORAGE_MODE, STORAGE_ALWAYS_TRANSLATE_HOSTS, STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS, STORAGE_SELECTION_TRANSLATION, STORAGE_VIDEO_TRANSLATION].some((key) => changes[key])) settingsRevision += 1;
     if (changes[STORAGE_MODE]) widgetState.mode = normalizeMode(changes[STORAGE_MODE].newValue);
     if (changes[STORAGE_ALWAYS_TRANSLATE_HOSTS]) {
       widgetState.alwaysTranslateHosts = normalizeHostList(changes[STORAGE_ALWAYS_TRANSLATE_HOSTS].newValue);
@@ -705,6 +745,9 @@ function createWidget() {
     }
     if (changes[STORAGE_SELECTION_TRANSLATION]) {
       widgetState.selectionTranslationEnabled = changes[STORAGE_SELECTION_TRANSLATION].newValue === true;
+    }
+    if (changes[STORAGE_VIDEO_TRANSLATION]) {
+      widgetState.videoTranslationEnabled = isVideoTranslationEnabled(changes[STORAGE_VIDEO_TRANSLATION].newValue);
     }
     syncPopover();
   };
@@ -1072,6 +1115,7 @@ function createWidget() {
   const settingsBtn = document.createElement("button");
   settingsBtn.className = "btn btn-secondary btn-collapsible";
   settingsBtn.title = "翻译设置";
+  settingsBtn.setAttribute("aria-expanded", "false");
   settingsBtn.appendChild(svg("M3 8h10 M3 4h10 M3 12h10", { size: 14, stroke: 1.4 }));
   btnStack.appendChild(settingsBtn);
 
@@ -1179,6 +1223,7 @@ function createWidget() {
     widgetState.pos = { right, top: top / window.innerHeight };
     applyPos(widgetState.root, widgetState.pos);
     refreshBubbleMetrics();
+    positionPopover();
   };
   document.addEventListener("mousemove", onDragMove);
   cleanupFns.push(() => document.removeEventListener("mousemove", onDragMove));
@@ -1218,11 +1263,23 @@ function createWidget() {
   });
 
   // settings popover toggle
+  function positionPopover() {
+    if (!popover) return;
+    const anchor = settingsBtn.getBoundingClientRect();
+    const panel = popover.getBoundingClientRect();
+    const left = Math.max(12, Math.min(window.innerWidth - panel.width - 12, anchor.right - panel.width));
+    const below = anchor.bottom + 8;
+    const top = below + panel.height <= window.innerHeight - 12
+      ? below : Math.max(12, Math.min(window.innerHeight - panel.height - 12, anchor.top - panel.height - 8));
+    popover.style.left = `${left}px`;
+    popover.style.top = `${top}px`;
+  }
   const closePopover = () => {
     if (!popover) return;
     popover.remove();
     popover = null;
     root.classList.remove("expanded");
+    settingsBtn.setAttribute("aria-expanded", "false");
   };
   settingsBtn.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -1234,6 +1291,8 @@ function createWidget() {
     btnStack.insertBefore(popover, settingsBtn);
     // popover 打开时强制保持展开 — 鼠标移开 widget 也别 collapse 否则 popover 漂浮无依托.
     root.classList.add("expanded");
+    settingsBtn.setAttribute("aria-expanded", "true");
+    positionPopover();
   });
 
   const onDocumentClick = (e: MouseEvent) => {
@@ -1255,6 +1314,7 @@ function createWidget() {
     const {
       mode,
       selectionTranslationEnabled,
+      videoTranslationEnabled,
       alwaysTranslateHosts,
       alwaysTranslateDisabledHosts,
       currentHost,
@@ -1264,6 +1324,7 @@ function createWidget() {
     if (revision === settingsRevision) {
       widgetState.mode = mode;
       widgetState.selectionTranslationEnabled = selectionTranslationEnabled;
+      widgetState.videoTranslationEnabled = videoTranslationEnabled;
       widgetState.alwaysTranslateHosts = alwaysTranslateHosts;
       widgetState.alwaysTranslateDisabledHosts = alwaysTranslateDisabledHosts;
     }
@@ -1272,6 +1333,7 @@ function createWidget() {
     applyPos(widgetState.root, pos);
     refreshBubbleMetrics();
     syncPopover();
+    positionPopover();
   })();
 }
 
@@ -1518,6 +1580,38 @@ function renderPopover(): HTMLDivElement {
   selectionBlock.appendChild(selectionHead);
   selectionLabel.appendChild(selectionBlock);
   pop.appendChild(selectionLabel);
+
+  const videoLabel = document.createElement("label");
+  const videoCheckbox = document.createElement("input");
+  videoCheckbox.type = "checkbox";
+  videoCheckbox.dataset.setting = "video";
+  videoCheckbox.checked = widgetState?.videoTranslationEnabled ?? DEFAULT_VIDEO_TRANSLATION_ENABLED;
+  videoCheckbox.setAttribute("aria-describedby", "babata-video-setting-hint");
+  videoCheckbox.addEventListener("change", async () => {
+    if (!widgetState) return;
+    const state = widgetState;
+    const enabled = videoCheckbox.checked;
+    videoCheckbox.disabled = true;
+    const saved = await safeChromePromise(async () => {
+      await chrome.storage.local.set({ [STORAGE_VIDEO_TRANSLATION]: enabled });
+      return true;
+    });
+    if (widgetState !== state) return;
+    if (!saved) showBubble("视频翻译设置未保存，请稍后重试。", 5000);
+    videoCheckbox.checked = state.videoTranslationEnabled;
+    videoCheckbox.disabled = false;
+  });
+  videoLabel.appendChild(videoCheckbox);
+  const videoBlock = document.createElement("div");
+  const videoHead = document.createElement("div");
+  videoHead.textContent = "视频翻译";
+  const videoHint = document.createElement("div");
+  videoHint.id = "babata-video-setting-hint";
+  videoHint.className = "setting-hint";
+  videoHint.textContent = "全局生效，所有网站和标签页";
+  videoBlock.append(videoHead, videoHint);
+  videoLabel.appendChild(videoBlock);
+  pop.appendChild(videoLabel);
   return pop;
 }
 

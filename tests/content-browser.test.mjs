@@ -8,6 +8,34 @@ import path from 'node:path';
 import { chromium, expect } from '@playwright/test';
 import { startCompanion, root } from './companion-fixture.mjs';
 
+// CDP reads the real closed shadow roots; production widget isolation stays intact.
+async function widgetControl(session, selector, action = 'read') {
+  const { root } = await session.send('DOM.getDocument', { depth: -1, pierce: true });
+  function find(node) {
+    const attrs = Object.fromEntries(Array.from({ length: (node.attributes?.length || 0) / 2 }, (_, i) => [node.attributes[i * 2], node.attributes[i * 2 + 1]]));
+    if (Object.entries(selector).every(([key, value]) => attrs[key] === value)) return node;
+    for (const child of [...(node.children || []), ...(node.shadowRoots || [])]) {
+      const found = find(child);
+      if (found) return found;
+    }
+    return null;
+  }
+  const node = find(root);
+  assert.ok(node, `widget control not found: ${JSON.stringify(selector)}`);
+  const { object } = await session.send('DOM.resolveNode', { nodeId: node.nodeId });
+  try {
+    const { result, exceptionDetails } = await session.send('Runtime.callFunctionOn', {
+      objectId: object.objectId,
+      functionDeclaration: action === 'click' ? 'function() { this.click(); return this.checked; }'
+        : action === 'geometry' ? 'function() { return this.getBoundingClientRect().toJSON(); }'
+          : 'function() { return { checked: this.checked, disabled: this.disabled, label: this.closest("label")?.textContent }; }',
+      returnByValue: true,
+    });
+    assert.equal(exceptionDetails, undefined);
+    return result.value;
+  } finally { await session.send('Runtime.releaseObject', { objectId: object.objectId }); }
+}
+
 await test('content lifecycle and site settings in an isolated Chromium profile', { timeout: 90_000 }, async (t) => {
   const companion = await startCompanion({ BABATA_PROVIDER_TIMEOUT_MS: '10000' });
   const profile = await mkdtemp(path.join(os.tmpdir(), 'babata-content-browser-'));
@@ -107,32 +135,7 @@ await test('content lifecycle and site settings in an isolated Chromium profile'
     const other = await browser.newPage();
     await other.goto('https://beta.test/article');
     await expect(other.locator('#base + .bbt-tr')).toContainText('译文');
-    // CDP reads the real closed shadow roots; production widget isolation stays intact.
     const sessions = await Promise.all([page, other].map((tab) => browser.newCDPSession(tab)));
-    async function widgetControl(session, selector, action = 'read') {
-      const { root } = await session.send('DOM.getDocument', { depth: -1, pierce: true });
-      function find(node) {
-        const attrs = Object.fromEntries(Array.from({ length: (node.attributes?.length || 0) / 2 }, (_, i) => [node.attributes[i * 2], node.attributes[i * 2 + 1]]));
-        if (Object.entries(selector).every(([key, value]) => attrs[key] === value)) return node;
-        for (const child of [...(node.children || []), ...(node.shadowRoots || [])]) {
-          const found = find(child);
-          if (found) return found;
-        }
-        return null;
-      }
-      const node = find(root);
-      assert.ok(node, `widget control not found: ${JSON.stringify(selector)}`);
-      const { object } = await session.send('DOM.resolveNode', { nodeId: node.nodeId });
-      try {
-        const { result, exceptionDetails } = await session.send('Runtime.callFunctionOn', {
-          objectId: object.objectId,
-          functionDeclaration: action === 'click' ? 'function() { this.click(); return this.checked; }' : 'function() { return { checked: this.checked, disabled: this.disabled }; }',
-          returnByValue: true,
-        });
-        assert.equal(exceptionDetails, undefined);
-        return result.value;
-      } finally { await session.send('Runtime.releaseObject', { objectId: object.objectId }); }
-    }
     await Promise.all(sessions.map((session) => widgetControl(session, { title: '翻译设置' }, 'click')));
     await Promise.all(sessions.map((session) => widgetControl(session, { 'data-setting': 'always' }, 'click')));
     await expect.poll(() => worker.evaluate(async () => (await chrome.storage.local.get('babata.translation_always_disabled_hosts'))['babata.translation_always_disabled_hosts'])).toEqual(['alpha.test', 'beta.test']);
@@ -149,6 +152,127 @@ await test('content lifecycle and site settings in an isolated Chromium profile'
       await session.detach();
     }
     await other.close();
+  });
+
+  await t.test('the global video switch synchronizes tabs, persists for new pages, and leaves webpage translation independent', async (t) => {
+    const tabs = [];
+    const sessions = [];
+    t.after(async () => {
+      for (const session of sessions) await session.detach().catch(() => {});
+      for (const tab of tabs) await tab.close();
+    });
+    // With the key absent, both the widget and the video runtime use enabled.
+    await worker.evaluate(() => chrome.storage.local.remove('babata.video_translation_enabled'));
+    async function videoPage(name) {
+      const tab = await browser.newPage();
+      tabs.push(tab);
+      await tab.route(`https://video-${name}.test/**`, (route) => route.fulfill({ contentType: 'text/html', body: `<!doctype html><html><head><style>
+        body{margin:16px}video{display:block;width:480px;height:270px;background:#222}
+        </style></head><body><main><p id="video-article">The video switch must leave this article paragraph translated on this site.</p>
+        <video id="video" muted></video></main><script>
+          window.video=document.getElementById('video');
+          window.nativeTrack=video.addTextTrack('subtitles','Original English subtitles','en');
+          nativeTrack.mode='showing';
+          nativeTrack.addCue(new VTTCue(0,30,'Global video settings fixture ${name} caption number 0.'));
+        </script></body></html>` }));
+      await tab.goto(`https://video-${name}.test/watch`);
+      await expect(tab.locator('#__babata_widget_host__')).toHaveCount(1);
+      // Method overrides live in an isolated world's DOM wrappers. Install this
+      // capture spy in the extension world, where the actual ASR code runs.
+      await worker.evaluate(async (url) => {
+        const [target] = await chrome.tabs.query({ url });
+        await chrome.scripting.executeScript({ target: { tabId: target.id }, func: () => {
+          document.documentElement.setAttribute('data-test-capture-calls', '0');
+          document.querySelector('video').captureStream = () => {
+            const root = document.documentElement;
+            root.setAttribute('data-test-capture-calls', String(Number(root.getAttribute('data-test-capture-calls')) + 1));
+            throw new Error('Audio capture must require an explicit user action');
+          };
+        } });
+      }, tab.url());
+      const session = await browser.newCDPSession(tab);
+      sessions.push(session);
+      await widgetControl(session, { title: '翻译设置' }, 'click');
+      return { tab, session };
+    }
+    const first = await videoPage('one');
+    const second = await videoPage('two');
+    for (const { tab, session } of [first, second]) {
+      await tab.bringToFront();
+      await expect(tab.locator('#video-article + .bbt-tr')).toContainText('译文');
+      await expect(tab.locator('.bbt-video-overlay')).toContainText('译文 Global video settings fixture');
+      assert.equal(await tab.evaluate(() => nativeTrack.mode), 'hidden');
+      const control = await widgetControl(session, { 'data-setting': 'video' });
+      assert.equal(control.checked, true);
+      assert.match(control.label, /视频翻译/);
+    }
+
+    // Disabling this site's webpage translation does not disable its video.
+    await first.tab.bringToFront();
+    await widgetControl(first.session, { 'data-setting': 'always' }, 'click');
+    await expect(first.tab.locator('html')).toHaveAttribute('data-bbt-mode', 'off');
+    await expect(first.tab.locator('#video-article + .bbt-tr')).toBeHidden();
+    await expect(first.tab.locator('#video-article')).toBeVisible();
+    await first.tab.evaluate(() => { nativeTrack.cues[0].text = 'Global video settings fixture one caption number 1.'; nativeTrack.dispatchEvent(new Event('cuechange')); });
+    await expect(first.tab.locator('.bbt-video-overlay')).toContainText('译文 Global video settings fixture one caption number 1.');
+
+    await widgetControl(first.session, { 'data-setting': 'video' }, 'click');
+    await expect.poll(() => worker.evaluate(async () => (await chrome.storage.local.get('babata.video_translation_enabled'))['babata.video_translation_enabled'])).toBe(false);
+    const videoRequestsWhenDisabled = requests.filter(({ text }) => text.startsWith('Global video settings fixture')).length;
+    for (const [index, { tab, session }] of [first, second].entries()) {
+      await expect.poll(async () => (await widgetControl(session, { 'data-setting': 'video' })).checked).toBe(false);
+      await expect(tab.locator('.bbt-video-overlay')).toBeHidden();
+      await expect.poll(() => tab.evaluate(() => nativeTrack.mode)).toBe('showing');
+      await tab.evaluate((name) => { nativeTrack.cues[0].text = `Global video settings fixture ${name} caption number 2.`; nativeTrack.dispatchEvent(new Event('cuechange')); }, index === 0 ? 'one' : 'two');
+    }
+    await expect(second.tab.locator('#video-article + .bbt-tr')).toContainText('译文');
+    const third = await videoPage('three');
+    await expect(third.tab.locator('#video-article + .bbt-tr')).toContainText('译文');
+    await expect.poll(async () => (await widgetControl(third.session, { 'data-setting': 'video' })).checked).toBe(false);
+    await expect(third.tab.locator('.bbt-video-overlay')).toBeHidden();
+    assert.equal(await third.tab.evaluate(() => nativeTrack.mode), 'showing');
+    await third.tab.waitForTimeout(400);
+    assert.equal(requests.filter(({ text }) => text.startsWith('Global video settings fixture')).length, videoRequestsWhenDisabled, 'disabled videos and newly opened pages must not issue caption requests');
+
+    // A different tab can re-enable all players without restoring the excluded
+    // webpage or implicitly enabling microphone/video-audio transcription.
+    await widgetControl(second.session, { 'data-setting': 'video' }, 'click');
+    await expect.poll(() => worker.evaluate(async () => (await chrome.storage.local.get('babata.video_translation_enabled'))['babata.video_translation_enabled'])).toBe(true);
+    for (const { tab, session } of [first, second, third]) {
+      await tab.bringToFront();
+      await expect.poll(async () => (await widgetControl(session, { 'data-setting': 'video' })).checked).toBe(true);
+      await expect(tab.locator('.bbt-video-overlay')).toContainText('译文 Global video settings fixture');
+      await expect.poll(() => tab.evaluate(() => nativeTrack.mode)).toBe('hidden');
+      await expect(tab.locator('html')).toHaveAttribute('data-test-capture-calls', '0');
+      await expect(tab.locator('bbt-video-controls button.asr')).toHaveText('听译（无字幕）');
+    }
+    await expect(first.tab.locator('.bbt-video-overlay')).toContainText('caption number 2.');
+    await expect(second.tab.locator('.bbt-video-overlay')).toContainText('caption number 2.');
+    await expect(first.tab.locator('#video-article + .bbt-tr')).toBeHidden();
+    await expect(second.tab.locator('#video-article + .bbt-tr')).toContainText('译文');
+    await expect(third.tab.locator('#video-article + .bbt-tr')).toContainText('译文');
+  });
+
+  await t.test('the expanded settings popover stays inside a narrow viewport near the bottom and after resizing', async (t) => {
+    await worker.evaluate(() => chrome.storage.local.set({ 'babata.widget.pos': { right: 18, top: 0.8 } }));
+    const narrow = await browser.newPage();
+    const session = await browser.newCDPSession(narrow);
+    t.after(async () => { await session.detach(); await narrow.close(); });
+    await narrow.setViewportSize({ width: 390, height: 600 });
+    await narrow.goto('https://narrow.test/article');
+    await expect(narrow.locator('#__babata_widget_host__')).toHaveCount(1);
+    await widgetControl(session, { title: '翻译设置' }, 'click');
+    async function assertInsideViewport(width, height) {
+      await expect.poll(async () => {
+        const box = await widgetControl(session, { class: 'popover' }, 'geometry');
+        return box.width > 0 && box.height > 0 && box.left >= 0 && box.top >= 0 && box.right <= width && box.bottom <= height;
+      }).toBe(true);
+      const video = await widgetControl(session, { 'data-setting': 'video' }, 'geometry');
+      assert.ok(video.left >= 0 && video.top >= 0 && video.right <= width && video.bottom <= height, 'the video switch must stay visible inside the viewport');
+    }
+    await assertInsideViewport(390, 600);
+    await narrow.setViewportSize({ width: 320, height: 420 });
+    await assertInsideViewport(320, 420);
   });
   assert.deepEqual(errors, []);
 });

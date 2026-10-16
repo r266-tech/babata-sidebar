@@ -10,25 +10,41 @@ await test('video captions and explicit audio transcription in Chromium', { time
   const browser = await chromium.launch({ headless: true, args: ['--autoplay-policy=no-user-gesture-required'] });
   t.after(() => browser.close());
 
-  async function fixture({ cueCount = 80, language = 'en', mode = 'replace', response = 'echo', realMedia = false, playing = false } = {}) {
+  async function fixture({ cueCount = 80, language = 'en', mode = 'replace', response = 'echo', realMedia = false, playing = false, videoEnabled = true, disabledHosts = [], capabilities = 'echo', transcription = 'echo' } = {}) {
     const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
     await page.route('https://video.test/**', (route) => route.fulfill({ contentType: 'text/html', body: '<!doctype html><html><head><style>body{margin:0}main{width:700px;height:950px;padding:25px}video{display:block;width:640px;height:360px;background:#222}</style></head><body><main><video id="video" muted></video></main></body></html>' }));
     await page.goto('https://video.test/watch');
-    await page.evaluate(async ({ cueCount, language, mode, response, realMedia, playing }) => {
+    await page.evaluate(async ({ cueCount, language, mode, response, realMedia, playing, videoEnabled, disabledHosts, capabilities, transcription }) => {
       window.requests = [];
       window.pendingReplies = [];
+      window.pendingCapabilities = [];
+      window.pendingTranscriptions = [];
       window.storageListeners = [];
       window.runtimeListeners = [];
-      window.settings = { 'babata.translation_mode': mode };
+      window.settings = { 'babata.translation_mode': mode, 'babata.video_translation_enabled': videoEnabled, 'babata.translation_always_disabled_hosts': disabledHosts };
+      window.setSettings = (values) => {
+        Object.assign(settings, values);
+        const changes = Object.fromEntries(Object.entries(values).map(([key, newValue]) => [key, { newValue }]));
+        storageListeners.forEach((listener) => listener(changes, 'local'));
+      };
       window.responseMode = response;
+      window.capabilitiesMode = capabilities;
+      window.transcriptionMode = transcription;
       window.answer = (message) => ({ ok: true, complete: true, results: message.batch.map((item) => ({ hash: item.hash, translated: `译文 ${item.text}` })) });
+      window.transcriptionAnswer = (message) => ({ ok: true, text: 'A real audio chunk.', language: 'en', segments: [{ start: 0, end: message.duration_seconds, text: 'A real audio chunk.' }] });
       window.chrome = {
         runtime: {
           onMessage: { addListener: (fn) => runtimeListeners.push(fn), removeListener: (fn) => { const at = runtimeListeners.indexOf(fn); if (at >= 0) runtimeListeners.splice(at, 1); } },
           sendMessage: async (message) => {
             requests.push(message);
-            if (message.type === 'babata.transcribe.capabilities') return { ok: true, available: true, max_chunk_seconds: 1, max_bytes: 4 * 1024 * 1024 };
-            if (message.type === 'babata.transcribe') return { ok: true, text: 'A real audio chunk.', language: 'en', segments: [{ start: 0, end: message.duration_seconds, text: 'A real audio chunk.' }] };
+            if (message.type === 'babata.transcribe.capabilities') {
+              if (capabilitiesMode === 'hold') return await new Promise((resolve, reject) => pendingCapabilities.push({ resolve, reject }));
+              return { ok: true, available: true, max_chunk_seconds: 1, max_bytes: 4 * 1024 * 1024 };
+            }
+            if (message.type === 'babata.transcribe') {
+              if (transcriptionMode === 'hold') return await new Promise((resolve) => pendingTranscriptions.push({ message, resolve }));
+              return transcriptionAnswer(message);
+            }
             if (message.type !== 'babata.translate') return { ok: true };
             if (responseMode === 'hold') return await new Promise((resolve) => pendingReplies.push({ message, resolve }));
             return answer(message);
@@ -60,7 +76,7 @@ await test('video captions and explicit audio transcription in Chromium', { time
         nativeTrack.mode = 'showing';
         for (let index = 0; index < cueCount; index++) nativeTrack.addCue(new VTTCue(index * 2, (index + 1) * 2, language.startsWith('zh') ? `中文第 ${index} 条字幕。` : `Caption number ${index}.`));
       }
-    }, { cueCount, language, mode, response, realMedia, playing });
+    }, { cueCount, language, mode, response, realMedia, playing, videoEnabled, disabledHosts, capabilities, transcription });
     const errors = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.addScriptTag({ content: bundle });
@@ -110,12 +126,125 @@ await test('video captions and explicit audio transcription in Chromium', { time
     assert.equal(await page.evaluate(() => nativeTrack.mode), 'showing');
     await page.getByLabel('字幕显示模式').selectOption('bilingual');
     await expect(page.locator('.bbt-yt-subtitle-original')).toBeVisible();
-    await page.evaluate(() => {
-      settings['babata.translation_always_disabled_hosts'] = ['video.test'];
-      storageListeners.forEach((listener) => listener({ 'babata.translation_always_disabled_hosts': { newValue: ['video.test'] } }, 'local'));
-    });
+    await page.evaluate(() => setSettings({ 'babata.video_translation_enabled': false }));
     await expect(page.locator('.bbt-video-overlay')).toBeHidden();
     assert.equal(await page.evaluate(() => nativeTrack.mode), 'showing');
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('global off gates existing and newly discovered videos and cannot be bypassed through local controls', async () => {
+    const { page, errors } = await fixture({ videoEnabled: false });
+    await page.getByRole('button', { name: '字幕设置' }).click();
+    await expect(page.getByRole('status')).toContainText('视频翻译已全局关闭');
+    for (const label of ['字幕显示模式', '字幕轨道', '选择字幕文件']) await expect(page.getByLabel(label)).toBeDisabled();
+    for (const name of ['视频翻译已全局关闭', '导入字幕', '听译（无字幕）']) await expect(page.getByRole('button', { name, exact: true })).toBeDisabled();
+    const immediate = await page.evaluate(() => {
+      window.captureCalls = 0;
+      video.captureStream = () => { captureCalls++; throw new Error('Unexpected disabled audio capture'); };
+      const shadow = document.querySelector('bbt-video-controls').shadowRoot;
+      shadow.querySelector('.toggle').dispatchEvent(new MouseEvent('click'));
+      shadow.querySelector('.mode').value = 'bilingual';
+      shadow.querySelector('.mode').dispatchEvent(new Event('change'));
+      shadow.querySelector('.asr').dispatchEvent(new MouseEvent('click'));
+      shadow.querySelector('.import').dispatchEvent(new MouseEvent('click'));
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(['1\n00:00:00,000 --> 00:00:02,000\nDisabled imported caption.'], 'disabled.srt'));
+      shadow.querySelector('.file').files = transfer.files;
+      shadow.querySelector('.file').dispatchEvent(new Event('change'));
+      video.currentTime = 20; video.dispatchEvent(new Event('timeupdate'));
+      const secondHost = document.createElement('section');
+      window.secondVideo = document.createElement('video');
+      secondHost.style.cssText = 'position:fixed;left:20px;top:400px;width:300px;height:180px';
+      secondVideo.style.cssText = 'width:300px;height:180px';
+      Object.defineProperty(secondVideo, 'currentTime', { value: 0, writable: true });
+      Object.defineProperty(secondVideo, 'paused', { value: true, writable: true });
+      window.secondTrack = secondVideo.addTextTrack('subtitles', 'Second video', 'en');
+      secondTrack.mode = 'showing'; secondTrack.addCue(new VTTCue(0, 2, 'Newly discovered caption.'));
+      secondHost.append(secondVideo); document.body.append(secondHost);
+      return { requests: requests.length, captures: captureCalls, native: nativeTrack.mode };
+    });
+    assert.deepEqual(immediate, { requests: 0, captures: 0, native: 'showing' });
+    await expect(page.locator('bbt-video-controls')).toHaveCount(2);
+    await page.waitForTimeout(100);
+    assert.deepEqual(await page.evaluate(() => ({ requests: requests.length, native: nativeTrack.mode, second: secondTrack.mode })), { requests: 0, native: 'showing', second: 'showing' });
+    await expect(page.locator('.bbt-video-overlay').first()).toBeHidden();
+    await expect(page.locator('.bbt-video-overlay').last()).toBeHidden();
+    await page.evaluate(() => setSettings({ 'babata.video_translation_enabled': true }));
+    await expect(page.locator('.bbt-video-overlay').first()).toContainText('译文 Caption number 10.');
+    await expect(page.locator('.bbt-video-overlay').last()).toContainText('译文 Newly discovered caption.');
+    assert.equal(await page.evaluate(() => requests.some((message) => message.type.startsWith('babata.transcribe'))), false);
+    assert.equal(await page.evaluate(() => requests.some((message) => message.batch?.some((item) => item.text === 'Disabled imported caption.'))), false);
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('page host policy is independent and global off-on preserves each video display preference', async () => {
+    const { page, errors } = await fixture({ mode: 'off', disabledHosts: ['video.test'] });
+    await expect(page.locator('.bbt-video-overlay')).toContainText('译文 Caption number 0.');
+    await page.evaluate(() => setSettings({ 'babata.translation_always_disabled_hosts': [], 'babata.translation_always_hosts': ['video.test'] }));
+    await expect(page.locator('.bbt-video-overlay')).toBeVisible();
+    await page.getByRole('button', { name: '字幕设置' }).click();
+    await page.getByLabel('字幕显示模式').selectOption('bilingual');
+    await page.evaluate(() => setSettings({ 'babata.video_translation_enabled': false }));
+    await expect(page.locator('.bbt-video-overlay')).toBeHidden();
+    await page.evaluate(() => setSettings({ 'babata.video_translation_enabled': true, 'babata.translation_always_disabled_hosts': ['video.test'] }));
+    await expect(page.getByLabel('字幕显示模式')).toHaveValue('bilingual');
+    await expect(page.locator('.bbt-yt-subtitle-original')).toBeVisible();
+    await page.getByLabel('字幕显示模式').selectOption('off');
+    await page.evaluate(() => setSettings({ 'babata.video_translation_enabled': false }));
+    await expect(page.getByLabel('字幕显示模式')).toBeDisabled();
+    await page.evaluate(() => setSettings({ 'babata.video_translation_enabled': true }));
+    await expect(page.getByLabel('字幕显示模式')).toBeEnabled();
+    await expect(page.getByLabel('字幕显示模式')).toHaveValue('off');
+    await expect(page.locator('.bbt-video-overlay')).toBeHidden();
+    assert.equal(await page.evaluate(() => nativeTrack.mode), 'showing');
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('global off cancels in-flight subtitles synchronously while storage is slow and discards late replies', async () => {
+    const { page, errors } = await fixture({ response: 'hold', playing: true });
+    await expect.poll(() => page.evaluate(() => pendingReplies.length)).toBe(2);
+    const stopped = await page.evaluate(() => {
+      window.originalStorageGet = chrome.storage.local.get;
+      chrome.storage.local.get = () => new Promise((resolve) => { window.resolveStorage = resolve; });
+      setSettings({ 'babata.video_translation_enabled': false });
+      return { native: nativeTrack.mode, hidden: document.querySelector('.bbt-video-overlay').style.display, cancellations: requests.filter((m) => m.type === 'babata.translate.cancel').length };
+    });
+    assert.deepEqual(stopped, { native: 'showing', hidden: 'none', cancellations: 2 });
+    await page.evaluate(() => {
+      pendingReplies.splice(0).forEach(({ message, resolve }) => resolve(answer(message)));
+      video.currentTime = 100; video.dispatchEvent(new Event('timeupdate'));
+      video.dispatchEvent(new Event('seeked')); video.dispatchEvent(new Event('play'));
+      runtimeListeners.forEach((listener) => listener({ type: 'babata.translation_config_changed', scope: 'all' }));
+    });
+    await page.waitForTimeout(100);
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate').length), 2);
+    await expect(page.locator('.bbt-video-overlay')).toBeHidden();
+    await page.evaluate(() => { chrome.storage.local.get = originalStorageGet; resolveStorage({ ...settings }); });
+    await page.evaluate(() => { responseMode = 'echo'; setSettings({ 'babata.video_translation_enabled': true }); });
+    await expect(page.locator('.bbt-video-overlay')).toContainText('译文 Caption number 50.');
+    assert.equal(await page.evaluate(() => requests.filter((m) => m.type === 'babata.translate')[2].batch[0].text), 'Caption number 50.');
+    assert.equal(await page.evaluate(() => requests.some((m) => m.type.startsWith('babata.transcribe'))), false);
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('an import already reading when globally disabled cannot revive itself after off-on', async () => {
+    const { page, errors } = await fixture();
+    await expect(page.locator('.bbt-video-overlay')).toContainText('译文 Caption number 0.');
+    await page.evaluate(() => { File.prototype.text = () => new Promise((resolve) => { window.resolveImportedText = resolve; }); });
+    await page.getByLabel('选择字幕文件').setInputFiles({ name: 'late.srt', mimeType: 'text/plain', buffer: Buffer.from('pending') });
+    await expect.poll(() => page.evaluate(() => typeof resolveImportedText)).toBe('function');
+    await page.evaluate(() => setSettings({ 'babata.video_translation_enabled': false }));
+    await expect(page.locator('.bbt-video-overlay')).toBeHidden();
+    await page.evaluate(() => setSettings({ 'babata.video_translation_enabled': true }));
+    await expect(page.locator('.bbt-video-overlay')).toBeVisible();
+    await page.evaluate(() => resolveImportedText('1\n00:00:00,000 --> 00:00:02,000\nLate imported caption.'));
+    await page.waitForTimeout(100);
+    assert.equal(await page.evaluate(() => requests.some((m) => m.batch?.some((item) => item.text === 'Late imported caption.'))), false);
+    assert.equal(await page.getByLabel('字幕轨道').locator('option').filter({ hasText: 'late.srt' }).count(), 0);
     assert.deepEqual(errors, []);
     await page.close();
   });
@@ -423,6 +552,70 @@ await test('video captions and explicit audio transcription in Chromium', { time
     assert.equal(recorded.paused, false);
     assert.deepEqual(errors, []);
     await page.evaluate(() => { clearInterval(drawTimer); originalStream.getTracks().forEach((track) => track.stop()); void sourceContext.close(); });
+    await page.close();
+  });
+
+  await t.test('global off stops active audio capture, cancels transcription, and on never restarts it', async () => {
+    const { page, errors } = await fixture({ realMedia: true, cueCount: 0, transcription: 'hold' });
+    await page.evaluate(() => {
+      window.clonedTracks = [];
+      const clone = MediaStreamTrack.prototype.clone;
+      MediaStreamTrack.prototype.clone = function () { const track = clone.call(this); clonedTracks.push(track); return track; };
+    });
+    await page.getByRole('button', { name: '字幕设置' }).click();
+    await page.getByRole('button', { name: '听译（无字幕）', exact: true }).click();
+    await expect(page.getByRole('button', { name: '停止听译' })).toBeVisible();
+    await expect.poll(() => page.evaluate(() => pendingTranscriptions.length), { timeout: 10_000 }).toBeGreaterThanOrEqual(1);
+    const stopped = await page.evaluate(() => {
+      setSettings({ 'babata.video_translation_enabled': false });
+      const transcriptionIds = new Set(requests.filter((message) => message.type === 'babata.transcribe').map((message) => message.request_id));
+      return { cloneStates: clonedTracks.map((track) => track.readyState), sourceStates: originalStream.getAudioTracks().map((track) => track.readyState), cancellations: requests.filter((message) => message.type === 'babata.translate.cancel' && transcriptionIds.has(message.request_id)).length, transcriptions: transcriptionIds.size };
+    });
+    assert.ok(stopped.cloneStates.length > 0);
+    assert.ok(stopped.cloneStates.every((state) => state === 'ended'));
+    assert.deepEqual(stopped.sourceStates, ['live']);
+    assert.equal(stopped.cancellations, stopped.transcriptions);
+    await expect(page.getByRole('button', { name: '听译（无字幕）', exact: true })).toBeDisabled();
+    await expect(page.getByRole('status')).toContainText('视频翻译已全局关闭');
+    await page.evaluate(() => pendingTranscriptions.splice(0).forEach(({ message, resolve }) => resolve(transcriptionAnswer(message))));
+    await page.evaluate(() => setSettings({ 'babata.video_translation_enabled': true }));
+    await expect(page.getByRole('button', { name: '听译（无字幕）', exact: true })).toBeEnabled();
+    await page.waitForTimeout(1400);
+    assert.equal(await page.evaluate(() => requests.filter((message) => message.type === 'babata.transcribe').length), stopped.transcriptions);
+    assert.equal(await page.evaluate(() => requests.filter((message) => message.type === 'babata.transcribe.capabilities').length), 1);
+    assert.equal(await page.evaluate(() => requests.some((message) => message.type === 'babata.translate')), false);
+    assert.equal(await page.evaluate(() => video.paused), false);
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('global off cancels a pending ASR start and its late failure cannot stop a later explicit start', async () => {
+    const { page, errors } = await fixture({ realMedia: true, cueCount: 0, capabilities: 'hold' });
+    await page.evaluate(() => {
+      window.clonedTracks = [];
+      const clone = MediaStreamTrack.prototype.clone;
+      MediaStreamTrack.prototype.clone = function () { const track = clone.call(this); clonedTracks.push(track); return track; };
+    });
+    await page.getByRole('button', { name: '字幕设置' }).click();
+    await page.getByRole('button', { name: '听译（无字幕）', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => pendingCapabilities.length)).toBe(1);
+    await page.evaluate(() => setSettings({ 'babata.video_translation_enabled': false }));
+    assert.ok(await page.evaluate(() => clonedTracks.length > 0 && clonedTracks.every((track) => track.readyState === 'ended')));
+    await page.evaluate(() => setSettings({ 'babata.video_translation_enabled': true }));
+    await expect(page.getByRole('button', { name: '听译（无字幕）', exact: true })).toBeEnabled();
+    assert.equal(await page.evaluate(() => requests.filter((message) => message.type === 'babata.transcribe.capabilities').length), 1);
+    assert.equal(await page.evaluate(() => requests.some((message) => message.type === 'babata.transcribe')), false);
+    await page.evaluate(() => { capabilitiesMode = 'echo'; });
+    await page.getByRole('button', { name: '听译（无字幕）', exact: true }).click();
+    await expect(page.getByRole('button', { name: '停止听译' })).toBeEnabled();
+    await page.evaluate(() => pendingCapabilities.shift().reject(new Error('The cancelled capability lookup failed late.')));
+    await page.waitForTimeout(100);
+    await expect(page.getByRole('button', { name: '停止听译' })).toBeEnabled();
+    assert.equal(await page.evaluate(() => clonedTracks.at(-1).readyState), 'live');
+    await expect.poll(() => page.evaluate(() => requests.filter((message) => message.type === 'babata.transcribe').length), { timeout: 10_000 }).toBeGreaterThanOrEqual(1);
+    await page.getByRole('button', { name: '停止听译' }).click();
+    assert.deepEqual(await page.evaluate(() => originalStream.getAudioTracks().map((track) => track.readyState)), ['live']);
+    assert.deepEqual(errors, []);
     await page.close();
   });
 });

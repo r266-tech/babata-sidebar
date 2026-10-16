@@ -5,21 +5,23 @@ type RecoveryApi = Pick<typeof chrome, "runtime" | "tabs" | "scripting">;
 const TRANSLATION_ENTRY = /(?:^|\/)babata-translate(?:\.ts)?(?:-loader-[^/]+)?\.(?:js|ts)$/;
 const VIDEO_ENTRY = /(?:^|\/)youtube-subtitles(?:\.ts)?(?:-loader-[^/]+)?\.(?:js|ts)$/;
 const VIDEO_MAIN_ENTRY = /(?:^|\/)youtube-subtitles-main(?:\.ts)?(?:-(?:loader-)?[^/]+)?\.(?:js|ts)$/;
+const WIDGET_ENTRY = /(?:^|\/)babata-widget(?:\.ts)?(?:-loader-[^/]+)?\.(?:js|ts)$/;
 
 export type ContentRecoveryReport = {
   tabId: number;
-  injected: { page: number; video: number; main: number };
+  injected: { page: number; video: number; main: number; widget: number };
   needs_refresh: Array<{ documentId: string; reason: "legacy_video_context" }>;
 };
 
-export function recoveryContentFiles(manifest: chrome.runtime.Manifest): { page: string[]; video: string[]; main: string[] } {
-  const files = { page: [] as string[], video: [] as string[], main: [] as string[] };
+export function recoveryContentFiles(manifest: chrome.runtime.Manifest): { page: string[]; video: string[]; main: string[]; widget: string[] } {
+  const files = { page: [] as string[], video: [] as string[], main: [] as string[], widget: [] as string[] };
   for (const entry of manifest.content_scripts ?? []) {
     const main = "world" in entry && entry.world === "MAIN";
     for (const file of entry.js ?? []) {
       if (main && VIDEO_MAIN_ENTRY.test(file)) files.main.push(file);
       else if (!main && VIDEO_ENTRY.test(file)) files.video.push(file);
       else if (!main && TRANSLATION_ENTRY.test(file)) files.page.push(file);
+      else if (!main && WIDGET_ENTRY.test(file)) files.widget.push(file);
     }
   }
   return files;
@@ -31,10 +33,10 @@ export function translationContentFiles(manifest: chrome.runtime.Manifest): stri
   return recoveryContentFiles(manifest).page;
 }
 
-function probeTranslationEngines(): { page: boolean; video: boolean; legacyVideo: boolean } {
+function probeTranslationEngines(): { page: boolean; video: boolean; legacyVideo: boolean; widget: boolean } {
   // DOM attributes and translated text can outlive an invalidated extension
   // context. Read the current extension's isolated-world state instead.
-  const current = window as unknown as { __babataTranslateBooted?: boolean; __babataVideoTranslateBooted?: boolean };
+  const current = window as unknown as { __babataTranslateBooted?: boolean; __babataVideoTranslateBooted?: boolean; __babataWidgetBooted?: boolean; __babataWidgetRecoveryWaiting?: boolean };
   // Only our own DOM signatures indicate an old controller. A site's matching
   // CSS class alone must not make an otherwise recoverable document look old.
   const videoDom = document.querySelector('bbt-video-controls[data-bbt-video],.bbt-video-overlay[data-bbt-youtube-subtitles="1"],#bbt-youtube-subtitle-overlay[data-bbt-youtube-subtitles="1"]');
@@ -43,6 +45,7 @@ function probeTranslationEngines(): { page: boolean; video: boolean; legacyVideo
     page: current.__babataTranslateBooted === true,
     video: current.__babataVideoTranslateBooted === true,
     legacyVideo: Boolean(videoDom) && !canTeardown,
+    widget: current.__babataWidgetBooted === true || current.__babataWidgetRecoveryWaiting === true,
   };
 }
 
@@ -61,12 +64,12 @@ export function createTranslationContentRecovery(api: RecoveryApi) {
     const existing = inFlight.get(tabId);
     if (existing) return existing;
     const work = (async () => {
-      const report: ContentRecoveryReport = { tabId, injected: { page: 0, video: 0, main: 0 }, needs_refresh: [] };
+      const report: ContentRecoveryReport = { tabId, injected: { page: 0, video: 0, main: 0, widget: 0 }, needs_refresh: [] };
       try {
         const tab = await api.tabs.get(tabId);
         if (!eligibleTab(tab)) return report;
         const files = recoveryContentFiles(api.runtime.getManifest());
-        if (!files.page.length && !files.video.length && !files.main.length) return report;
+        if (!files.page.length && !files.video.length && !files.main.length && !files.widget.length) return report;
         const frames = await api.scripting.executeScript({
           target: { tabId, allFrames: true },
           world: "ISOLATED",
@@ -74,7 +77,7 @@ export function createTranslationContentRecovery(api: RecoveryApi) {
         });
         const documents = new Map(frames.filter((frame) => typeof frame.documentId === "string" && frame.documentId.length > 0
           && typeof frame.result?.page === "boolean" && typeof frame.result?.video === "boolean" && typeof frame.result?.legacyVideo === "boolean")
-          .map((frame) => [frame.documentId, frame.result!]));
+          .map((frame) => [frame.documentId, { ...frame.result!, frameId: frame.frameId }]));
         // A navigation or detached frame must not redirect injection to its
         // replacement document, nor prevent recovery of the other frames.
         await Promise.allSettled([...documents].map(async ([documentId, state]) => {
@@ -87,6 +90,7 @@ export function createTranslationContentRecovery(api: RecoveryApi) {
             } catch { /* Navigation must not redirect injection to a new document. */ }
           };
           if (!state.page) await inject("page", "ISOLATED");
+          if (state.frameId === 0 && state.widget === false) await inject("widget", "ISOLATED");
           if (state.legacyVideo) {
             report.needs_refresh.push({ documentId, reason: "legacy_video_context" });
             return; // Legacy controllers and MAIN hooks cannot be safely removed.
