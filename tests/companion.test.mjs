@@ -214,13 +214,18 @@ await test('isolated companion regressions', async (t) => {
     const provider = http.createServer(async (req, res) => {
       requests.push({ url: req.url, auth: req.headers.authorization });
       if (req.url.startsWith('/slow/')) { res.writeHead(200, { 'content-type': 'application/json' }); res.flushHeaders(); return; }
-      for await (const _ of req) { /* drain */ }
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
       res.setHeader('content-type', 'application/json');
       if (req.url.startsWith('/oversized/')) { res.setHeader('content-length', 17 * 1024 * 1024); res.flushHeaders(); return; }
       if (req.url.startsWith('/chunked-large/')) { res.write('x'.repeat(17 * 1024 * 1024)); res.end(); return; }
       if (req.url.startsWith('/bad-json/')) { res.writeHead(502); res.end('<html>upstream failed</html>'); return; }
       if (req.url.endsWith('/models')) res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
-      else res.end(JSON.stringify({ choices: [{ message: { content: '你好' } }] }));
+      else {
+        const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const input = JSON.parse(request.messages.at(-1).content);
+        res.end(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ results: input.batch.map((item) => ({ hash: item.hash, translated: `你好 ${item.text}` })) }) } }] }));
+      }
     });
     provider.listen(0, '127.0.0.1');
     await once(provider, 'listening');
@@ -244,7 +249,7 @@ await test('isolated companion regressions', async (t) => {
   });
 
   await t.test('provider concurrency is bounded and disconnect aborts the upstream request', async () => {
-    const bounded = await startCompanion({ BABATA_PROVIDER_TIMEOUT_MS: '4000', BABATA_PROVIDER_MAX_CONCURRENT: '2' });
+    const bounded = await startCompanion({ BABATA_PROVIDER_TIMEOUT_MS: '4000', BABATA_PROVIDER_MAX_CONCURRENT: '2', BABATA_PROVIDER_MAX_RETRIES: '0' });
     t.after(() => bounded.close());
     let opened = 0;
     let closed = 0;
@@ -258,19 +263,23 @@ await test('isolated companion regressions', async (t) => {
     await once(provider, 'listening');
     t.after(() => { provider.closeAllConnections(); provider.close(); });
     const body = { base_url: `http://127.0.0.1:${provider.address().port}/v1` };
-    const controllers = [new AbortController(), new AbortController()];
-    const calls = controllers.map((controller) => bounded.post('/translate/models', body, { signal: controller.signal }).catch(() => {}));
+    const controllers = [new AbortController(), new AbortController(), new AbortController()];
+    const calls = controllers.slice(0, 2).map((controller) => bounded.post('/translate/models', body, { signal: controller.signal }).catch(() => {}));
     await until(() => opened === 2);
-    assert.equal((await bounded.post('/translate/models', body)).status, 429);
+    calls.push(bounded.post('/translate/models', body, { signal: controllers[2].signal }).catch(() => {}));
+    await delay(60);
+    assert.equal(opened, 2, 'excess work waits instead of consuming another provider slot');
+    controllers[0].abort();
+    await until(() => opened === 3);
     controllers.forEach((controller) => controller.abort());
     await Promise.all(calls);
-    await until(() => closed === 2, 1500);
+    await until(() => closed === 3, 1500);
     const controller = new AbortController();
     const retry = bounded.post('/translate/models', body, { signal: controller.signal }).catch(() => {});
-    await until(() => opened === 3);
+    await until(() => opened === 4);
     controller.abort();
     await retry;
-    await until(() => closed === 3, 1500);
+    await until(() => closed === 4, 1500);
   });
 
   await t.test('a malformed saved provider URL can be repaired without forwarding its key', async () => {

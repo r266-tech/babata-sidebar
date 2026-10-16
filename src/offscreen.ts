@@ -1,5 +1,6 @@
 /// <reference types="chrome" />
 import { boundDebugPromptHistory } from "./chat-debug-history";
+import { abortTranslationRequests, handleOffscreenTranslation } from "./offscreen-translation";
 
 import {
   DEFAULT_SERVER_ORIGIN,
@@ -940,6 +941,7 @@ function reconnectToServerOrigin(origin: string) {
   connectionGeneration += 1;
   if (normalized !== activeServerOrigin) {
     for (const run of activeChatRuns.values()) run.controller.abort();
+    abortTranslationRequests();
   }
   bridgeConnectionId = "";
   activeServerOrigin = normalized;
@@ -963,6 +965,11 @@ function reconnectToServerOrigin(origin: string) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== "object") return;
   if (sender.id !== chrome.runtime.id || sender.tab) return;
+  const translation = handleOffscreenTranslation(msg as Record<string, unknown>);
+  if (translation) {
+    void translation.then(sendResponse, (error) => sendResponse?.({ ok: false, results: [], retryable: true, error: String(error?.message ?? error) }));
+    return true;
+  }
   const m = msg as { type?: string; payload?: string; origin?: string; connection_id?: string };
   if (m.type === "babata.server_origin.changed") {
     reconnectToServerOrigin(m.origin ?? DEFAULT_SERVER_ORIGIN);

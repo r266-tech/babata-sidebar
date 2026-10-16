@@ -15,7 +15,7 @@ await test('built extension in an isolated Chromium profile', { timeout: 120_000
   t.after(async () => { await context?.close(); await companion.close(); await rm(profile, { recursive: true, force: true }); });
   const requests = [];
   let pauseTranslation = false;
-  let releaseTranslation;
+  const heldTranslations = new Set();
   const provider = http.createServer(async (req, res) => {
     res.setHeader('content-type', 'application/json');
     if (req.url === '/v1/models') {
@@ -33,13 +33,13 @@ await test('built extension in an isolated Chromium profile', { timeout: 120_000
     const payload = JSON.parse(content);
     const batch = payload.batch || [];
     requests.push(batch);
-    if (pauseTranslation) await new Promise((resolve) => { releaseTranslation = resolve; });
+    if (pauseTranslation) await new Promise((resolve) => { heldTranslations.add(resolve); });
     res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ results: batch.map((item) => ({ hash: item.hash, translated: '译文 ' + item.text.replaceAll('Introduction', '介绍') })) }) } }] }));
+    res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ results: batch.map((item) => ({ hash: item.hash, translated: item.text === 'Hello, world.' ? '你好，世界。' : '译文 ' + item.text.replaceAll('Introduction', '介绍') })) }) } }] }));
   });
   provider.listen(0, '127.0.0.1');
   await once(provider, 'listening');
-  t.after(() => { releaseTranslation?.(); provider.closeAllConnections(); provider.close(); });
+  t.after(() => { for (const release of heldTranslations) release(); provider.closeAllConnections(); provider.close(); });
   await companion.post('/settings', { translation_provider: { base_url: `http://127.0.0.1:${provider.address().port}/v1`, model: 'test-model', api_key: '' } });
 
   const extensionPath = path.join(root, 'dist');
@@ -81,6 +81,7 @@ await test('built extension in an isolated Chromium profile', { timeout: 120_000
       const section = document.createElement('section');
       for (let i = 0; i < 60; i++) {
         const p = document.createElement('p');
+        p.id = `queued-${i}`;
         p.textContent = `Queued paragraph number ${i} has enough English text for translation.`;
         section.append(p);
       }
@@ -91,12 +92,18 @@ await test('built extension in an isolated Chromium profile', { timeout: 120_000
     await expect(page.locator('html')).toHaveAttribute('data-bbt-mode', 'off');
     const stoppedAt = requests.length;
     pauseTranslation = false;
-    releaseTranslation();
+    for (const release of heldTranslations) release();
+    heldTranslations.clear();
     await page.waitForTimeout(650);
     assert.equal(requests.length, stoppedAt);
     await expect(page.locator('#first')).toBeVisible();
     await worker.evaluate(() => chrome.storage.local.set({ 'babata.translation_always_disabled_hosts': [] }));
-    await expect.poll(() => page.locator('.bbt-tr').count(), { timeout: 15000 }).toBeGreaterThan(60);
+    await expect(page.locator('#queued-0 + .bbt-tr')).toContainText('译文');
+    // Offscreen paragraphs are now intentionally lazy. Reaching the end of
+    // the page must translate the newly visible content without eager work.
+    await page.locator('#queued-59').scrollIntoViewIfNeeded();
+    await expect(page.locator('#queued-59 + .bbt-tr')).toContainText('译文');
+    await page.evaluate(() => window.scrollTo(0, 0));
   });
 
   await t.test('page restoration restarts observers after teardown', async () => {

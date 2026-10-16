@@ -52,7 +52,7 @@ await test('caption capture ignores unrelated JSON/ASR URLs and failed responses
   class FakeXHR { open() {} send() {} }
   const body = JSON.stringify({ events: [] });
   const sandbox = vm.createContext({
-    URL, XMLHttpRequest: FakeXHR, location: { href: 'https://www.youtube.com/watch?v=test' },
+    URL, TextDecoder, XMLHttpRequest: FakeXHR, location: { href: 'https://www.youtube.com/watch?v=test' },
     window: {
       addEventListener() {}, postMessage: (message) => messages.push(message),
       fetch: async (url) => new Response(body, { status: url.includes('fail') ? 500 : 200 }),

@@ -48,6 +48,22 @@ permissions. A corrupt existing config is reported rather than overwritten.
 Changing the provider URL does not implicitly forward the previous provider's
 key, and provider HTTP redirects are rejected.
 
+Audio transcription has a separate optional provider configuration and the same
+key-storage rules. It starts only through a player's explicit transcription
+control. The extension captures the selected video's accessible audio tracks,
+not microphone or desktop audio. Chunks are bounded to 25 seconds and 4 MiB and
+forwarded in memory; the companion does not save audio recordings. The selected
+audio provider receives those chunks, and the selected translation provider
+receives the resulting caption text. Protected or inaccessible media is not
+bypassed.
+
+Page and caption translations use bounded in-memory caches. The companion keys
+entries by source text, target, model, provider, credential identity digest, and
+prompt version; client-supplied hashes are not trusted as content identity.
+Translation metrics retain aggregate counts and a bounded sample of durations,
+without webpage content or URLs. Cancelling a subscriber aborts shared provider
+work only when no other subscriber still needs it.
+
 Chat and debug history remains local, can contain page content, and is scoped
 by browser client and conversation. Request cancellation stops the model process
 tree. WebSocket payloads, model output, concurrent chat requests, and provider
@@ -69,6 +85,13 @@ Review `src/manifest.json` before loading the extension. In particular:
 - `host_permissions: <all_urls>` lets content scripts run broadly.
 - `scripting` reads page context and performs explicitly enabled browser actions.
 - `offscreen` keeps the connection and active chat stream alive while panels close.
+- The offscreen document also owns cancellable translation/transcription HTTP
+  requests, avoiding the service worker's long-fetch lifecycle limit.
+- Video caption scripts run in HTTP(S) frames. They observe HTML5 text tracks
+  and recognized caption responses; the network observer does not collect
+  arbitrary JSON, page requests, credentials, or video files. Audio capture uses
+  a video's existing media stream and requires no microphone or tab-capture
+  permission.
 - Unused debugger, downloads, alarms, notifications, webNavigation and contextMenus permissions are not requested.
 - Page snapshots and DOM queries redact password, hidden and one-time-code input values. This does not detect all sensitive text on a page.
 - `history` and `bookmarks` allow local browser state search.

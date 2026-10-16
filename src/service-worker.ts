@@ -10,6 +10,7 @@ import {
   updateAlwaysTranslateHostState,
 } from "./translation-settings";
 import {
+  DEFAULT_SERVER_ORIGIN,
   STORAGE_SERVER_ORIGIN,
   getServerOrigin,
   getBrowserClientId,
@@ -89,6 +90,83 @@ const sidepanelPorts = new Set<chrome.runtime.Port>();
 const storageWrites = new Map<string, Promise<unknown>>();
 let offscreenCreation: Promise<void> | undefined;
 const cleanReadRuns = new Map<number, { id: string; controller: AbortController }>();
+const translationRuns = new Map<string, { tabId?: number; controller: AbortController; requestId: string; owner: string; kind: string }>();
+
+function translationOwner(sender: chrome.runtime.MessageSender): string {
+  return sender.tab?.id === undefined
+    ? `extension:${sender.url ?? "worker"}`
+    : `tab:${sender.tab.id}:${sender.documentId ?? `frame:${sender.frameId ?? 0}`}`;
+}
+
+function cancelTabTranslations(tabId: number) {
+  for (const run of translationRuns.values()) if (run.tabId === tabId) run.controller.abort();
+  // The offscreen registry also covers requests from a previous worker lifetime.
+  void chrome.runtime.sendMessage({ type: "babata.offscreen.translation.cancel_tab", tab_id: tabId }).catch(() => {});
+}
+
+async function broadcastTranslationConfig(scope: string) {
+  if (!["translation", "transcription", "all"].includes(scope)) return;
+  for (const run of translationRuns.values()) if (scope === "all" || scope === run.kind) run.controller.abort();
+  await chrome.runtime.sendMessage({ type: "babata.offscreen.translation.cancel_scope", scope }).catch(() => {});
+  const tabs = await chrome.tabs.query({});
+  await Promise.all(tabs.filter((tab) => tab.id !== undefined && isPageUrl(tab.url)).map((tab) =>
+    chrome.tabs.sendMessage(tab.id!, { type: "babata.translation_config_changed", scope }).catch(() => {}),
+  ));
+}
+
+async function relayTranslation(message: Record<string, unknown>, sender: chrome.runtime.MessageSender): Promise<unknown> {
+  const requestId = typeof message.request_id === "string" && /^[\w-]{1,100}$/.test(message.request_id)
+    ? message.request_id : crypto.randomUUID();
+  const owner = translationOwner(sender);
+  const key = `${owner}:${requestId}`;
+  if (translationRuns.has(key)) return { ok: false, results: [], retryable: false, error: "Duplicate translation request" };
+  const controller = new AbortController();
+  const run = { tabId: sender.tab?.id, requestId, owner, controller,
+    kind: message.type === "babata.transcribe" ? "transcription" : "translation" };
+  translationRuns.set(key, run);
+  const abort = () => {
+    void chrome.runtime.sendMessage({ type: "babata.offscreen.translation.cancel", owner, request_id: requestId }).catch(() => {});
+  };
+  controller.signal.addEventListener("abort", abort, { once: true });
+  try {
+    await ensureOffscreen();
+    controller.signal.throwIfAborted();
+    const preferred = await getServerOrigin();
+    const origin = preferred === DEFAULT_SERVER_ORIGIN ? preferred : await resolveReachableServerOrigin(preferred, controller.signal);
+    const clientId = await getBrowserClientId();
+    controller.signal.throwIfAborted();
+    const priority = ["interactive", "subtitle", "visible", "prefetch"].includes(String(message.priority)) ? message.priority : "visible";
+    const url = sender.tab ? sender.url ?? sender.tab.url ?? "" : typeof message.url === "string" ? message.url : "";
+    const payload = message.type === "babata.transcribe" ? {
+      audio_base64: message.audio_base64,
+      mime: message.mime,
+      duration_seconds: message.duration_seconds,
+      source: message.source,
+      sequence: message.sequence,
+      request_id: requestId,
+      priority: "subtitle",
+    } : {
+      site: hostnameFromUrl(url), url,
+      target: typeof message.target === "string" ? message.target : "zh",
+      batch: Array.isArray(message.batch) ? message.batch : [],
+      priority, request_id: requestId,
+    };
+    return await chrome.runtime.sendMessage({
+      type: "babata.offscreen.translation.request",
+      request_id: requestId, owner, tab_id: sender.tab?.id,
+      origin, client_id: clientId, endpoint: message.type === "babata.transcribe" ? "/transcribe" : "/translate", payload,
+    });
+  } catch (error) {
+    // A broken message port does not prove the offscreen HTTP request stopped.
+    // Release this subscription before the page retries through a new worker.
+    abort();
+    return { ok: false, results: [], text: "", aborted: controller.signal.aborted,
+      retryable: !controller.signal.aborted, error: (error as Error).message || "Translation connection failed" };
+  } finally {
+    controller.signal.removeEventListener("abort", abort);
+    if (translationRuns.get(key) === run) translationRuns.delete(key);
+  }
+}
 
 function serializeStorage<T>(key: string, operation: () => Promise<T>): Promise<T> {
   const pending = (storageWrites.get(key) ?? Promise.resolve()).catch(() => {}).then(operation);
@@ -331,6 +409,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const contentMessages = new Set([
     "babata.current_tab_context", "babata.attention", "babata.translate_trace",
     "babata.translate", "babata.toggle_sidebar", "babata.prepare_sidebar",
+    "babata.translate.cancel", "babata.transcribe", "babata.transcribe.capabilities",
     "babata.suggest_prompts", "babata.agent_view", "babata.clean_read",
     "babata.set_host_translation",
   ]);
@@ -551,31 +630,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // page-side 翻译模块的 batch 翻译请求 → forward 到 server /translate.
-  if (m.type === "babata.translate") {
+  if (m.type === "babata.translate.cancel") {
+    const requestId = (msg as Record<string, unknown>).request_id;
+    if (typeof requestId !== "string" || !/^[\w-]{1,100}$/.test(requestId)) return false;
+    const owner = translationOwner(sender);
+    translationRuns.get(`${owner}:${requestId}`)?.controller.abort();
+    void chrome.runtime.sendMessage({ type: "babata.offscreen.translation.cancel", owner, request_id: requestId }).catch(() => {});
+    sendResponse?.({ ok: true });
+    return false;
+  }
+
+  // Long provider requests live in the offscreen document. The worker only
+  // routes them and binds cancellation to the sending document.
+  if (m.type === "babata.translate" || m.type === "babata.transcribe") {
+    void relayTranslation(msg as Record<string, unknown>, sender).then(sendResponse);
+    return true;
+  }
+
+  if (m.type === "babata.transcribe.capabilities") {
     void (async () => {
       try {
-        const resp = await serverFetch("/translate", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            site: (m as { site?: string }).site ?? "",
-            url: (m as { url?: string }).url ?? "",
-            target: (m as { target?: string }).target ?? "zh",
-            batch: (m as { batch?: unknown }).batch ?? [],
-          }),
-        });
-        if (!resp.ok) {
-          sendResponse?.({ ok: false, error: `HTTP ${resp.status}` });
-          return;
-        }
-        const json = (await resp.json()) as { ok?: boolean; results?: unknown };
-        sendResponse?.({
-          ok: !!json.ok,
-          results: Array.isArray(json.results) ? json.results : [],
-        });
+        const response = await serverFetch("/transcribe/capabilities", { signal: AbortSignal.timeout(5000) });
+        sendResponse?.(await response.json());
       } catch (e) {
-        sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
+        sendResponse?.({ ok: false, available: false, error: (e as Error).message ?? String(e) });
       }
     })();
     return true;
@@ -655,6 +733,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   chrome.runtime
     .sendMessage({ type: "babata.server_origin.changed", origin })
     .catch(() => {});
+  void broadcastTranslationConfig("all").catch(() => {});
 });
 
 async function handleWsInbound(raw: string, connectionId?: string) {
@@ -685,6 +764,10 @@ async function handleWsInbound(raw: string, connectionId?: string) {
 }
 
 async function dispatchNotification(action: string, args: Record<string, unknown>) {
+  if (action === "translation_config_changed") {
+    await broadcastTranslationConfig(String(args.scope ?? "all"));
+    return;
+  }
   const message = {
     type: "babata.notification",
     action,
@@ -1556,6 +1639,9 @@ chrome.tabs.onActivated.addListener((info) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  // URL-only changes include hash navigation and history.pushState in the same
+  // document. Its translation subscribers still own their pending work.
+  if (changeInfo.status === "loading") cancelTabTranslations(tabId);
   if (changeInfo.url || changeInfo.status === "loading") {
     cleanReadRuns.get(tabId)?.controller.abort();
     cleanReadRuns.delete(tabId);
@@ -1684,6 +1770,7 @@ async function requestCleanRead(tabId: number): Promise<boolean> {
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  cancelTabTranslations(tabId);
   cleanReadRuns.get(tabId)?.controller.abort();
   cleanReadRuns.delete(tabId);
   lastSnapshotKeysByTab.delete(tabId);

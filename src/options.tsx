@@ -31,11 +31,11 @@ function textField(obj: unknown, key: string): string {
   return typeof value === "string" ? value : "";
 }
 
-function normalizeProvider(value: unknown): TranslationProviderSettings {
-  if (!value || typeof value !== "object") return DEFAULT_PROVIDER;
+function normalizeProvider(value: unknown, fallback = DEFAULT_PROVIDER): TranslationProviderSettings {
+  if (!value || typeof value !== "object") return fallback;
   const apiKey = textField(value, "api_key");
   return {
-    base_url: textField(value, "base_url") || DEFAULT_PROVIDER.base_url,
+    base_url: textField(value, "base_url") || fallback.base_url,
     model: textField(value, "model"),
     ...(apiKey ? { api_key: apiKey } : {}),
     api_key_set: (value as Record<string, unknown>).api_key_set === true,
@@ -63,6 +63,10 @@ function App() {
   const [models, setModels] = useState<TranslationModelOption[]>([]);
   const [modelInput, setModelInput] = useState("");
   const [providerStatus, setProviderStatus] = useState("未检测");
+  const [audioProvider, setAudioProvider] = useState<TranslationProviderSettings>({ base_url: "", model: "" });
+  const [audioKey, setAudioKey] = useState("");
+  const [showAudioKey, setShowAudioKey] = useState(false);
+  const [audioStatus, setAudioStatus] = useState("可选：用于没有字幕的视频");
   const [busy, setBusy] = useState<string | null>("server");
   const [providerOrigin, setProviderOrigin] = useState<string | null>(null);
   const checkServerSeq = useRef(0);
@@ -86,6 +90,10 @@ function App() {
     setApiKey(nextProvider.api_key || "");
     setModelInput(nextProvider.model);
     setProviderStatus(nextProvider.api_key_set ? "已保存 API key" : "未配置 API key");
+    const nextAudio = normalizeProvider(data.transcription_provider, { base_url: "", model: "" });
+    setAudioProvider(nextAudio);
+    setAudioKey(nextAudio.api_key || "");
+    setAudioStatus(nextAudio.base_url && nextAudio.model ? "已配置；点击播放器中的转写按钮后才会发送音频" : "可选：用于没有字幕的视频");
   }
 
   async function checkServer(origin = serverInput) {
@@ -204,7 +212,11 @@ function App() {
     });
     const data = await readJson(resp);
     if (!resp.ok || data.ok !== true) throw new Error(textField(data, "error") || `HTTP ${resp.status}`);
-    return textField(data, "translated");
+    const translated = textField(data, "translated").trim();
+    if (!translated || data.checked_items !== 3 || data.marker_protocol !== "LINK/FMT/KEEP") {
+      throw new Error("翻译测试未验证完整批量与保护标记协议，请更新 Companion 后重试");
+    }
+    return translated;
   }
 
   async function saveProvider() {
@@ -232,6 +244,28 @@ function App() {
     }
   }
 
+  async function saveAudioProvider(clear = false) {
+    setBusy("audio");
+    setAudioStatus("保存中...");
+    try {
+      const settings = clear ? { base_url: "", model: "", api_key: "" } : {
+        base_url: audioProvider.base_url.trim(), model: audioProvider.model.trim(), api_key: audioKey.trim(),
+      };
+      if (!clear && (!settings.base_url || !settings.model)) throw new Error("请填写音频服务地址和转写模型");
+      const response = await serverRequest("/settings", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ transcription_provider: settings }),
+      });
+      const data = await readJson(response);
+      if (!response.ok || data.ok !== true) throw new Error(textField(data, "error") || `HTTP ${response.status}`);
+      const next = normalizeProvider(data.transcription_provider, { base_url: "", model: "" });
+      setAudioProvider(next);
+      setAudioKey(next.api_key || "");
+      setAudioStatus(clear ? "已停用音频转写" : "配置已保存；实际转写会在播放器中验证");
+    } catch (error) { setAudioStatus((error as Error).message || String(error)); }
+    finally { setBusy(null); }
+  }
+
   return (
     <main>
       <header>
@@ -256,6 +290,8 @@ function App() {
               setServerInput((e.currentTarget as HTMLInputElement).value);
               setProviderOrigin(null);
               setApiKey("");
+              setAudioKey("");
+              setAudioStatus("请先检测新的 Companion 地址");
               setModels([]);
               setProviderStatus("请先检测新的 Companion 地址");
             }}
@@ -338,6 +374,44 @@ function App() {
             Save Provider
           </button>
         </div>
+      </section>
+
+      <section aria-labelledby="audio-provider-title">
+        <div class="section-head">
+          <h2 id="audio-provider-title">无字幕视频 · 音频转写</h2>
+        </div>
+        <p class="meta">有字幕的视频会直接翻译，无需配置这里。无字幕时，可在播放器中主动开启转写；只发送正在播放的音频片段，不会自动录音。</p>
+        <label>
+          <span>Audio Base URL</span>
+          <input aria-label="Audio Base URL" disabled={busy !== null} value={audioProvider.base_url}
+            onInput={(event) => {
+              setAudioProvider({ ...audioProvider, base_url: event.currentTarget.value, api_key: undefined, api_key_set: false });
+              setAudioKey(""); setAudioStatus("地址已更改，请填写对应音频服务的 API key");
+            }} placeholder="https://your-audio-provider.example/v1" />
+        </label>
+        <label>
+          <span>Audio API key</span>
+          <div class="secret-row">
+            <input aria-label="Audio API key" disabled={busy !== null} type={showAudioKey ? "text" : "password"}
+              value={audioKey} onInput={(event) => setAudioKey(event.currentTarget.value)} placeholder="本地无密钥服务可留空" />
+            <button aria-label={showAudioKey ? "Hide audio API key" : "Show audio API key"}
+              disabled={!audioKey} onClick={() => setShowAudioKey(!showAudioKey)}>{showAudioKey ? "Hide" : "Show"}</button>
+          </div>
+        </label>
+        <label>
+          <span>Audio Model</span>
+          <input aria-label="Audio Model" disabled={busy !== null} value={audioProvider.model}
+            onInput={(event) => setAudioProvider({ ...audioProvider, model: event.currentTarget.value })}
+            placeholder="服务提供的转写模型 ID" />
+        </label>
+        <div class="row">
+          <button class="primary" disabled={busy !== null || providerOrigin !== currentServerUrl}
+            onClick={() => saveAudioProvider()}>Save Audio Provider</button>
+          <button disabled={busy !== null || providerOrigin !== currentServerUrl || !audioProvider.base_url}
+            onClick={() => saveAudioProvider(true)}>Disable Audio Transcription</button>
+        </div>
+        <p class="meta" role="status">{audioStatus}</p>
+        <p class="meta">音频服务需支持 audio/transcriptions。浏览器无法读取受保护或部分跨域视频的音轨时，播放器会说明原因。</p>
       </section>
     </main>
   );

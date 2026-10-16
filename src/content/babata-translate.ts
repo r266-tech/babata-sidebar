@@ -1,6 +1,8 @@
 /// <reference types="chrome" />
 
-import DOMPurify from "dompurify";
+import { requestTranslation } from "./translation-client";
+import { shouldTranslateText } from "../translation-language";
+import { encodeTranslationSource, renderTranslationMarkup, splitTranslationText } from "./translation-markup";
 import {
   STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
   STORAGE_ALWAYS_TRANSLATE_HOSTS,
@@ -20,8 +22,8 @@ import {
 // 核心 design:
 //   IntersectionObserver — viewport 内段落入境触发翻译
 //   MutationObserver — SPA (推特/Notion 等) 重 mount 时, 已 hash 段重 inject 不调 LLM
-//   L1 cache (page-side Map<hash,html>) — 同 page 内重 mount 命中
-//   Cache lifetime is limited to this document; the companion does not cache.
+//   L1 cache — a byte-bounded document LRU; remounts restore before paint.
+//   The shared transport owns provider-level deduplication and cancellation.
 //
 // Fixes the common SPA timeline failure mode: scroll down misses text, scroll
 // back up loses previously injected translations.
@@ -43,21 +45,6 @@ const TR_INPLACE_CLASS = "bbt-tr-inplace";
 const SRC_CLASS = "bbt-src";
 const INPLACE_ATTR = "data-bbt-inplace";
 const SELECTION_SETTING_EVENT = "babata:selection-translation-setting";
-const LINK_MARKER_START = "[[BBT_LINK_";
-const LINK_MARKER_END_PREFIX = "[[/BBT_LINK_";
-const LINK_MARKER_SUFFIX = "]]";
-const LINK_MARKER_PAIR_RE = /\[\[BBT_LINK_(\d+)\]\]([\s\S]*?)\[\[\/BBT_LINK_\1\]\]/g;
-const LINK_MARKER_TOKEN_RE = /\[\[\/?BBT_LINK_\d+\]\]/g;
-
-const SAFE_HTML_OPTS = {
-  ALLOWED_TAGS: ["b", "i", "em", "strong", "a", "code", "br", "span", "mark"],
-  ALLOWED_ATTR: ["href", "title", "class", "target", "rel", "referrerpolicy"],
-};
-const LINKIFIED_HTML_OPTS = {
-  ...SAFE_HTML_OPTS,
-  ALLOWED_ATTR: [...SAFE_HTML_OPTS.ALLOWED_ATTR, "style"],
-};
-
 // Translate once, inject sibling .bbt-tr forever. Replace/bilingual/off modes
 // are CSS-only after the first model call. Direct innerHTML replacement fights
 // React-style reconciliation, so the original DOM is left intact.
@@ -72,36 +59,68 @@ let selectionTranslationEnabled = false;
 let alwaysTranslateHosts: string[] = [];
 let alwaysTranslateDisabledHosts: string[] = [];
 const cache = new Map<string, string>();
+interface TranslationPart {
+  hash: string;
+  text: string;
+  translated?: string;
+  attempts: number;
+  inFlight: boolean;
+  retryAt: number;
+}
 interface QueueItem {
   el: HTMLElement;
   elements: Set<HTMLElement>;
   text: string;
   requestText: string;
   visible: boolean;
-  attempts: number;
+  parts: TranslationPart[];
 }
 const queue = new Map<string, QueueItem>();
 let flushTimer: number | null = null;
-let flushingLifecycle: number | null = null;
+const activeRequests = new Set<AbortController>();
+const rejectedHashes = new Set<string>();
+const MAX_PARALLEL_BATCHES = 2;
 let active = false;
 let lifecycle = 0;
 const CACHE_MAX = 5000;
+const CACHE_MAX_BYTES = 8 * 1024 * 1024;
+let cacheBytes = 0;
 let injectedTranslations = new WeakMap<HTMLElement, HTMLElement>();
+let translationOwners = new WeakMap<HTMLElement, HTMLElement>();
+let sourceSnapshots = new WeakMap<HTMLElement, string>();
+let repairWindows = new WeakMap<HTMLElement, { at: number; count: number; hash: string }>();
+let refreshingElements = new WeakSet<HTMLElement>();
 
+function cachedTranslation(hash: string): string | undefined {
+  const value = cache.get(hash);
+  if (value !== undefined) { cache.delete(hash); cache.set(hash, value); }
+  return value;
+}
 function cacheTranslation(hash: string, translated: string) {
+  cacheBytes -= (cache.get(hash)?.length || 0) * 2;
+  cache.delete(hash);
+  if (translated.length * 2 > CACHE_MAX_BYTES) return;
   cache.set(hash, translated);
-  while (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value!);
+  cacheBytes += translated.length * 2;
+  while (cache.size > CACHE_MAX || cacheBytes > CACHE_MAX_BYTES) {
+    const oldest = cache.keys().next().value!;
+    cacheBytes -= (cache.get(oldest)?.length || 0) * 2;
+    cache.delete(oldest);
+  }
 }
 
 const TARGET_LANG = "zh";
 // Batch enough visible text together so nearby page content translates in a
 // coherent order instead of one small leaf at a time.
-const BATCH_SIZE = 24;
-const TRANSLATION_BATCH_CHAR_BUDGET = 12_000;
-const FLUSH_DEBOUNCE_MS = 300;
-// Queue cap prevents runaway memory use on long timelines. Do not drop items
-// only because they scrolled out; if the DOM exposes readable text, translate it.
+const BATCH_SIZE = 12;
+const FIRST_BATCH_SIZE = 4;
+let completedBatches = 0;
+const TRANSLATION_BATCH_CHAR_BUDGET = 6000;
+const FLUSH_DEBOUNCE_MS = 24;
+// Keep provider work bounded. Farther paragraphs stay observed, and queue
+// saturation triggers an incremental refill instead of evicting visible text.
 const QUEUE_MAX = 5000;
+let needsQueueRefill = false;
 const MISSING_RESULT_MAX_RETRIES = 2;
 const TRANSPORT_MAX_RETRIES = 5;
 const TRANSPORT_RETRY_BASE_MS = 1500;
@@ -127,8 +146,6 @@ const VIEWPORT_PUSH_DEBOUNCE_MS = 1000;
 // chrome.runtime APIs can throw synchronously. `.catch()` cannot catch that, so
 // one invalidation flips a local guard until the page reloads.
 let extInvalidated = false;
-let transportFailures = 0;
-let nextFlushNotBefore = 0;
 function isInvalidatedError(e: unknown): boolean {
   return /Extension context invalidated/.test((e as Error)?.message ?? String(e));
 }
@@ -172,6 +189,8 @@ function scheduleViewportPush() {
 function setupAttentionWatchers() {
   const onVisibilityChange = () => {
     pushAttention({ kind: "attention", visibility: document.visibilityState });
+    if (document.visibilityState === "hidden") { cancelPageRequests(); cancelScanTasks(); }
+    else { observeNew(document.body, "rerun"); scheduleFlush(0); }
   };
   const onFocus = () => pushAttention({ kind: "attention", focus: "yes" });
   const onBlur = () => pushAttention({ kind: "attention", focus: "no" });
@@ -230,11 +249,8 @@ const FORCE_BLOCK_TAGS = new Set([
 const PARAGRAPH_MIN_TEXT_COUNT = 4;
 const BLOCK_MIN_TEXT_COUNT = 24;
 const MAIN_FRAME_MIN_TEXT_COUNT = 50;
-const LONG_BUILD_DOM_LENGTH = 3000;
-// X long-form Articles / DraftJS can pack the whole body into one inline span.
-// Keep the per-leaf cap high enough for those natural-language documents, and
-// control transport size separately with TRANSLATION_BATCH_CHAR_BUDGET.
-const LONGFORM_MAX_TEXT_COUNT = 12_000;
+// Long-form leaves are split into balanced marker chunks at the transport
+// boundary, so document length never becomes a language/coverage filter.
 const STAY_ORIGINAL_TAGS = new Set([
   "CODE", "TT", "IMG", "SUP", "SUB", "SAMP", "MATH", "SEMANTICS", "MROW",
   "MO", "MFRAC", "MSUP", "MI", "MN", "MSQRT", "D-MATH", "KBD",
@@ -266,7 +282,6 @@ const RICH_MEDIA_MIN_EDGE_PX = 32;
 const RICH_MEDIA_MIN_AREA_PX = 2048;
 const RICH_MEDIA_SCAN_LIMIT = 160;
 const DEFAULT_MIN_TEXT_COUNT = Math.min(PARAGRAPH_MIN_TEXT_COUNT, MAIN_FRAME_MIN_TEXT_COUNT);
-const MAX_TRANSLATABLE_TEXT_COUNT = Math.max(LONGFORM_MAX_TEXT_COUNT, LONG_BUILD_DOM_LENGTH);
 const LINE_BREAK_ABBREVIATION_RE = /(?:etc\.|Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.|Sr\.|Jr\.|U\.S\.|U\.K\.|Co\.|Inc\.|Ltd\.|St\.)$/i;
 
 // 子树根本不该进 (REJECT — TreeWalker 不再深入). 含已注入译文.
@@ -309,8 +324,9 @@ const skipMoNodes = new WeakSet<Node>();
 // from the first mutation and then suppress the later settled content. Here
 // every mutation refreshes the timestamp, and processing only happens after a
 // quiet window.
-const STABLE_WINDOW_MS = 1100;
-const stableWindowMap = new Map<HTMLElement, { ts: number; src: TraceSource }>();
+const STABLE_WINDOW_MS = 120;
+const STABLE_MAX_WAIT_MS = 500;
+const stableWindowMap = new Map<HTMLElement, { ts: number; firstAt: number; src: TraceSource }>();
 let stableWindowTimer: number | null = null;
 // element in-flight 锁 — 同 element 已 enqueue 在 LLM 中, 新 mutation 不重 enqueue.
 let inFlightElements = new WeakSet<HTMLElement>();
@@ -408,6 +424,7 @@ function applyShadowRootModeAttr(root: ShadowRoot) {
 }
 
 function registerShadowRoot(root: ShadowRoot) {
+  if (observedShadowRoots.has(root)) return;
   observedShadowRoots.add(root);
   applyShadowRootModeAttr(root);
   injectModeStyle(root);
@@ -423,7 +440,7 @@ function registerCleanup(fn: () => void) {
   cleanupFns.push(fn);
 }
 
-// 每 200ms 扫 stableWindowMap, 静默 1100ms+ 的 element 提升到 doProcessCandidate.
+// A short content-only debounce has a maximum wait; CSS churn cannot starve it.
 function startStableWindowTimer() {
   if (stableWindowTimer !== null) return;
   stableWindowTimer = window.setInterval(() => {
@@ -431,7 +448,7 @@ function startStableWindowTimer() {
     const now = Date.now();
     const ready: { el: HTMLElement; src: TraceSource }[] = [];
     for (const [el, info] of stableWindowMap) {
-      if (now - info.ts > STABLE_WINDOW_MS) {
+      if (now - info.ts >= STABLE_WINDOW_MS || now - info.firstAt >= STABLE_MAX_WAIT_MS) {
         ready.push({ el, src: info.src });
         stableWindowMap.delete(el);
       }
@@ -439,7 +456,7 @@ function startStableWindowTimer() {
     for (const { el, src } of ready) {
       if (el.isConnected) doProcessCandidate(el, src);
     }
-  }, 200);
+  }, 50);
 }
 function teardownAll() {
   active = false;
@@ -475,11 +492,16 @@ function teardownAll() {
     flushTimer = null;
   }
   queue.clear();
-  flushingLifecycle = null;
+  cancelPageRequests();
+  cancelScanTasks();
   inFlightElements = new WeakSet<HTMLElement>();
   stableWindowMap.clear();
   inFlightHashes.clear();
   visibleHashes.clear();
+  rejectedHashes.clear();
+  sourceSnapshots = new WeakMap();
+  repairWindows = new WeakMap();
+  refreshingElements = new WeakSet();
   for (const fn of cleanupFns.splice(0)) {
     try {
       fn();
@@ -610,7 +632,8 @@ function isTranslationElement(el: HTMLElement): boolean {
 
 function isStayOriginalElement(el: HTMLElement): boolean {
   return STAY_ORIGINAL_TAGS.has(el.tagName)
-    || el.matches(STAY_ORIGINAL_SELECTOR);
+    || el.matches(STAY_ORIGINAL_SELECTOR)
+    || el.matches('[translate="no"], .notranslate');
 }
 
 function isAtomicBlockElement(el: HTMLElement): boolean {
@@ -687,24 +710,34 @@ function hasCssBackgroundImage(el: HTMLElement): boolean {
 }
 
 function hasRichMediaSurface(el: HTMLElement): boolean {
-  const mediaNodes = [el, ...Array.from(el.querySelectorAll(RICH_MEDIA_SELECTOR))];
-  for (const node of mediaNodes) {
-    if (!(node instanceof HTMLElement)) continue;
-    if (isTranslationElement(node) || isHidden(node)) continue;
-    const isRenderedMedia = node.matches(RICH_MEDIA_SELECTOR) && isBlockRenderedMedia(node);
-    if (node !== el && isRenderedMedia && (hasLargeVisualBox(el) || hasMediaSource(node))) {
-      return true;
-    }
-    if (isRenderedMedia && hasNaturalMediaBox(node)) return true;
-    if (node.matches(RICH_MEDIA_SELECTOR) && hasLargeVisualBox(node)) return true;
+  // A targeted native query finds media beyond the bounded CSS inspection.
+  // Structural ancestors are rejected before reaching this leaf-only check.
+  let mediaCount = 0;
+  for (const media of el.querySelectorAll<HTMLElement>(RICH_MEDIA_SELECTOR)) {
+    if (++mediaCount > RICH_MEDIA_SCAN_LIMIT) return true;
+    if (isTranslationElement(media) || isHidden(media)) continue;
+    if (hasNaturalMediaBox(media) || hasLargeVisualBox(media)
+      || (isBlockRenderedMedia(media) && hasMediaSource(media))) return true;
   }
-
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT, {
+    acceptNode(node) {
+      return node instanceof HTMLElement && !isTranslationElement(node)
+        ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    },
+  });
+  let node: Node | null = el;
   let scanned = 0;
-  for (const node of [el, ...Array.from(el.querySelectorAll<HTMLElement>("*"))]) {
-    if (scanned++ >= RICH_MEDIA_SCAN_LIMIT) break;
-    if (isTranslationElement(node) || isHidden(node)) continue;
-    if (hasLargeVisualBox(node) && hasCssBackgroundImage(node)) return true;
+  while (node && scanned++ < RICH_MEDIA_SCAN_LIMIT) {
+    if (node instanceof HTMLElement && !isHidden(node)) {
+      const media = node.matches(RICH_MEDIA_SELECTOR);
+      if (media && (hasNaturalMediaBox(node) || hasLargeVisualBox(node)
+        || (node !== el && isBlockRenderedMedia(node) && hasMediaSource(node)))) return true;
+      if (hasLargeVisualBox(node) && hasCssBackgroundImage(node)) return true;
+    }
+    node = walker.nextNode();
   }
+  // TreeWalker bounds allocation and CSS background inspection; plain text
+  // paragraphs may contain any number of inline formatting nodes.
   return false;
 }
 
@@ -743,7 +776,7 @@ function normalizeSourceText(text: string): string {
 
 // Read only the page's source text, never our injected sibling/wrapper text.
 // This is the idempotency boundary for language detection and trace text.
-function buildSourceText(el: HTMLElement, linkIds?: Map<HTMLAnchorElement, number>): string {
+function buildSourceText(el: HTMLElement): string {
   const parts: string[] = [];
 
   function pushBlockBreak() {
@@ -752,7 +785,7 @@ function buildSourceText(el: HTMLElement, linkIds?: Map<HTMLAnchorElement, numbe
     if (!last.endsWith("\n")) parts.push("\n");
   }
 
-  function walk(node: Node, linkIds?: Map<HTMLAnchorElement, number>) {
+  function walk(node: Node) {
     if (node.nodeType === Node.TEXT_NODE) {
       parts.push(node.textContent || "");
       return;
@@ -773,19 +806,16 @@ function buildSourceText(el: HTMLElement, linkIds?: Map<HTMLAnchorElement, numbe
       return;
     }
 
-    const linkId = node instanceof HTMLAnchorElement ? linkIds?.get(node) : undefined;
-    if (linkId !== undefined) parts.push(`${LINK_MARKER_START}${linkId}${LINK_MARKER_SUFFIX}`);
     const block = node !== el && FORCE_BLOCK_TAGS.has(node.tagName);
     if (block) pushBlockBreak();
     for (const child of Array.from(node.childNodes)) {
-      walk(child, linkIds);
+      walk(child);
     }
     if (block) pushBlockBreak();
-    if (linkId !== undefined) parts.push(`${LINK_MARKER_END_PREFIX}${linkId}${LINK_MARKER_SUFFIX}`);
   }
 
   for (const child of Array.from(el.childNodes)) {
-    walk(child, linkIds);
+    walk(child);
   }
   return normalizeSourceText(parts.join(""));
 }
@@ -794,20 +824,20 @@ function sourceText(el: HTMLElement): string {
   return buildSourceText(el);
 }
 
-function sourceLinkElements(el: HTMLElement): HTMLAnchorElement[] {
-  return Array.from(el.querySelectorAll<HTMLAnchorElement>("a[href]"))
-    .filter((source) => !isIgnoredElement(source) && !isTranslationElement(source));
+function sourcePlan(el: HTMLElement) {
+  return encodeTranslationSource(el, {
+    skip: (node) => isTranslationElement(node) || isIgnoredElement(node)
+      || (!node.classList.contains(SRC_CLASS) && isHidden(node)),
+    preserve: (node) => isStayOriginalElement(node) && !isTranslationElement(node),
+    block: (node) => FORCE_BLOCK_TAGS.has(node.tagName),
+  });
 }
 
 function sourceTextForTranslation(el: HTMLElement): string {
-  const anchors = sourceLinkElements(el);
-  if (anchors.length === 0) return sourceText(el);
-  const linkIds = new Map<HTMLAnchorElement, number>();
-  anchors.forEach((anchor, index) => linkIds.set(anchor, index + 1));
-  return buildSourceText(el, linkIds);
+  return sourcePlan(el).text;
 }
 
-function isLeafTextElement(el: HTMLElement, knownHasRichMedia = hasRichMediaSurface(el)): boolean {
+function isLeafTextElement(el: HTMLElement, knownHasRichMedia?: boolean): boolean {
   if (knownHasRichMedia) return false;
   // 直接子节点必须全是 text 或 inline 元素 + 含可视 text.
   let hasMeaningfulText = false;
@@ -836,8 +866,9 @@ function isLeafTextElement(el: HTMLElement, knownHasRichMedia = hasRichMediaSurf
     if (!scan(child)) return false;
   }
   if (!hasMeaningfulText) return false;
+  if (knownHasRichMedia === undefined && hasRichMediaSurface(el)) return false;
   const text = sourceText(el);
-  return shouldTranslate(text);
+  return shouldTranslate(text, DEFAULT_MIN_TEXT_COUNT, el);
 }
 
 // "outer 含多个独立 inline 段 (子全 inline, inline 间无 text 桥接)"
@@ -873,132 +904,46 @@ function isMultiSegmentInline(el: HTMLElement): boolean {
   return r;
 }
 
-function collectTranslatable(root: ParentNode): HTMLElement[] {
-  const result: HTMLElement[] = [];
-
-  function visit(el: HTMLElement) {
-    if (isIgnoredElement(el)) return;
-    // 祖先已 leaf (整段已包翻) → 子树不切. 物理 closest 遍历, 不依赖内存 lock.
-    if (hasLeafAncestor(el)) return;
-    if (isHidden(el)) return;
-
-    const isInline = isInlineElement(el);
+function* walkTranslatable(root: ParentNode): Generator<HTMLElement | null> {
+  const stack: Element[] = root instanceof HTMLElement ? [root]
+    : root instanceof Document ? [document.body] : Array.from(root.children).reverse();
+  while (stack.length) {
+    const el = stack.pop();
+    // Yield even when a node is rejected, so a huge excluded/structural tree
+    // cannot monopolize a frame between two accepted leaves.
+    yield null;
+    if (!(el instanceof HTMLElement) || isIgnoredElement(el) || hasLeafAncestor(el) || isHidden(el)) continue;
+    if (el.shadowRoot) registerShadowRoot(el.shadowRoot);
+    const inline = isInlineElement(el);
+    const atomic = isAtomicBlockElement(el);
+    const descend = () => {
+      if (el.shadowRoot) stack.push(...Array.from(el.shadowRoot.children).reverse());
+      stack.push(...Array.from(el.children).reverse());
+    };
+    // Reject structural containers before any descendant scan or layout read.
+    if (!inline && !atomic && hasNonInlineElementChild(el)) { descend(); continue; }
     const containsTranslation = hasTranslationChild(el);
-
-    if (el.shadowRoot) {
-      registerShadowRoot(el.shadowRoot);
+    const rich = hasRichMediaSurface(el);
+    if (!containsTranslation && !rich && atomic && shouldTranslate(sourceText(el), BLOCK_MIN_TEXT_COUNT, el)) {
+      el.setAttribute(LEAF_ATTR, "1"); yield el; continue;
     }
-
-    if (isInline) {
-      // INLINE 标签自身仅在 leaf 时 ACCEPT (X 推 span / X article sibling 内容).
-      // rich card / nested block 链接继续下钻, 避免 replace 模式隐藏媒体预览.
-      const hasRichMedia = hasRichMediaSurface(el);
-      if (!containsTranslation && isLeafTextElement(el, hasRichMedia)) {
-        el.setAttribute(LEAF_ATTR, "1");
-        result.push(el);
-      }
-      // 如果 inline parent 已含 babata 译文，不能把 parent 的原文+译文当
-      // 一个新 leaf；下钻回原 source child，避免 X 上译文污染 hash。
-      if (containsTranslation || hasRichMedia || hasNonInlineElementChild(el)) {
-        for (const child of Array.from(el.children)) {
-          if (child instanceof HTMLElement) visit(child);
-        }
-      }
-      return;
+    if (!containsTranslation && !rich && !inline && !hasTextBlockSemantics(el) && isMultiSegmentInline(el)) {
+      descend(); continue;
     }
-
-    if (!containsTranslation && isAtomicBlockElement(el)) {
-      const text = sourceText(el);
-      if (shouldTranslate(text, BLOCK_MIN_TEXT_COUNT)) {
-        el.setAttribute(LEAF_ATTR, "1");
-        result.push(el);
-        return;
-      }
+    if (!containsTranslation && isLeafTextElement(el, rich)) {
+      el.setAttribute(LEAF_ATTR, "1"); yield el; continue;
     }
-
-    // Natural-language containers with lang/dir=auto should stay one leaf even
-    // when a site splits the sentence into many inline spans/mentions.
-    if (!containsTranslation && hasTextBlockSemantics(el) && isLeafTextElement(el)) {
-      el.setAttribute(LEAF_ATTR, "1");
-      result.push(el);
-      return;
-    }
-
-    // block 候选: 多 inline 子且无 text 桥接 → 拆开各翻.
-    if (isMultiSegmentInline(el)) {
-      // outer SKIP, walker 进子让 inline 各 ACCEPT.
-      for (const child of Array.from(el.children)) {
-        if (child instanceof HTMLElement) visit(child);
-      }
-      if (el.shadowRoot) {
-        for (const child of Array.from(el.shadowRoot.children)) {
-          if (child instanceof HTMLElement) visit(child);
-        }
-      }
-      return;
-    }
-
-    // block 是单段 leaf → 整段一坨翻.
-    if (isLeafTextElement(el)) {
-      el.setAttribute(LEAF_ATTR, "1");
-      result.push(el);
-      return;
-    }
-
-    // block 但非 leaf (含 block 子) — 继续深入.
-    for (const child of Array.from(el.children)) {
-      if (child instanceof HTMLElement) visit(child);
-    }
-    if (el.shadowRoot) {
-      for (const child of Array.from(el.shadowRoot.children)) {
-        if (child instanceof HTMLElement) visit(child);
-      }
-    }
+    descend();
   }
-
-  if (root instanceof HTMLElement) {
-    visit(root);
-  } else {
-    const children = root instanceof Document ? [document.body] : Array.from(root.children);
-    for (const child of children) {
-      if (child instanceof HTMLElement) visit(child);
-    }
-  }
-  return result;
 }
 
-// ── language detection ────────────────────────────────────────────────
-
-function detectLang(text: string): "zh" | "other" {
-  let cn = 0;
-  let total = 0;
-  for (const c of text) {
-    const code = c.charCodeAt(0);
-    if (code < 0x20) continue;
-    total++;
-    if (code >= 0x4e00 && code <= 0x9fff) cn++;
-  }
-  if (total === 0) return "other";
-  return cn / total > 0.3 ? "zh" : "other";
-}
-
-function shouldTranslate(text: string, minTextCount = DEFAULT_MIN_TEXT_COUNT): boolean {
+function shouldTranslate(text: string, minTextCount = DEFAULT_MIN_TEXT_COUNT, el?: HTMLElement): boolean {
   if (!text || text.length < minTextCount) return false;
-  if (text.length > MAX_TRANSLATABLE_TEXT_COUNT) return false;
-  // 输入框 placeholder / 示例文案常以 e.g. 开头。它们通常不是 DOM 正文文本,
-  // 被页面用 overlay 渲染时强行注入会和原 placeholder 叠字；后续应走 attr 专用链.
   if (/^e\.g[.,]?\s+/i.test(text.trim())) return false;
-  // X 上计数/倒计时会秒级 mutation；这些不是自然语言，翻译只会制造 stale_result
-  // 和重复网络请求。保留含字母的混合文案，跳纯数字/时间/单位/handle/tag。
-  const trimmed = text.trim();
-  if (/^[@#][\p{L}\p{N}_-]+$/u.test(trimmed)) return false;
-  // File trees and topic chips often expose lowercase identifiers as plain text
-  // nodes. Translating "images", "docs", or "scrapling" damages the UI more
-  // than it helps; sentence-like headings still pass this gate.
-  if (/^[a-z0-9][a-z0-9._/-]{1,39}$/u.test(trimmed)) return false;
-  if (!/[\p{L}]/u.test(text)) return false;
-  if (/^[\d\s:.,，.%％+\-–—/()（）[\]万亿千百十kKmMbB]+$/u.test(text)) return false;
-  return detectLang(text) !== "zh";
+  if (/^[@#][\p{L}\p{N}_-]+$/u.test(text.trim())) return false;
+  if (/^[a-z0-9][a-z0-9._/-]{1,39}$/u.test(text.trim())) return false;
+  const hint = el?.closest("[lang]")?.getAttribute("lang") || document.documentElement.lang;
+  return shouldTranslateText(text, TARGET_LANG, hint);
 }
 
 // ── hash (FNV-1a-ish 64bit, 16 hex chars) ─────────────────────────────
@@ -1183,35 +1128,28 @@ function hideSelectionPopup(popup: SelectionPopup) {
   popup.body.textContent = "";
 }
 
-async function translateSelectionText(text: string): Promise<string | null> {
+async function translateSelectionText(text: string, signal: AbortSignal): Promise<string | null> {
   if (!selectionTranslationEnabled) return null;
   const generation = lifecycle;
   const hash = hashText(normalizeForHash(text), TARGET_LANG);
-  const cached = cache.get(hash);
+  const cached = cachedTranslation(hash);
   if (cached) return cached;
-  const resp = (await safeChromeSend(() =>
-    chrome.runtime.sendMessage({
-      type: "babata.translate",
-      site: location.hostname,
-      url: location.href,
-      target: TARGET_LANG,
-      batch: [{ hash, text }],
-    }),
-  )) as { ok: boolean; results?: { hash: string; translated: string }[] } | undefined;
-  if (!active || generation !== lifecycle) return null;
-  const result = resp?.ok && Array.isArray(resp.results)
-    ? resp.results.find((item) => item?.hash === hash)
-    : undefined;
-  const translated = typeof result?.translated === "string" ? result.translated.trim() : "";
-  if (!translated) return null;
-  cacheTranslation(hash, translated);
-  return translated;
+  try {
+    const response = await requestTranslation({ site: location.hostname, url: location.href, target: TARGET_LANG,
+      priority: "interactive", batch: [{ hash, text }] }, { signal });
+    if (!active || generation !== lifecycle || signal.aborted) return null;
+    const translated = response.results?.find((item) => item.hash === hash)?.translated?.trim();
+    if (!translated) return null;
+    cacheTranslation(hash, translated);
+    return translated;
+  } catch { return null; }
 }
 
 function setupSelectionTranslator() {
   const popup = createSelectionPopup();
   let timer: number | null = null;
   let requestSeq = 0;
+  let selectionRequest: AbortController | null = null;
 
   function clearTimer() {
     if (timer !== null) {
@@ -1238,7 +1176,9 @@ function setupSelectionTranslator() {
     const seq = ++requestSeq;
     positionSelectionPopup(popup.host, snapshot.rect);
     renderSelectionPopup(popup, "loading", "…");
-    const translated = await translateSelectionText(snapshot.text);
+    selectionRequest?.abort();
+    selectionRequest = new AbortController();
+    const translated = await translateSelectionText(snapshot.text, selectionRequest.signal);
     if (seq !== requestSeq) return;
     if (!translated) {
       renderSelectionPopup(popup, "error", "没有拿到译文，稍后再试。");
@@ -1248,6 +1188,8 @@ function setupSelectionTranslator() {
   }
 
   function hideAndInvalidate() {
+    selectionRequest?.abort();
+    selectionRequest = null;
     requestSeq++;
     clearTimer();
     hideSelectionPopup(popup);
@@ -1279,6 +1221,9 @@ function setupSelectionTranslator() {
     }
   };
 
+  const onSelectionVisibility = () => { if (document.visibilityState === "hidden") hideAndInvalidate(); };
+  document.addEventListener("babata:translation-config-changed", hideAndInvalidate);
+  document.addEventListener("visibilitychange", onSelectionVisibility);
   document.addEventListener("selectionchange", onSelectionChange);
   window.addEventListener("mouseup", onPointerUp);
   window.addEventListener("touchend", onPointerUp);
@@ -1291,6 +1236,8 @@ function setupSelectionTranslator() {
 
   registerCleanup(() => {
     hideAndInvalidate();
+    document.removeEventListener("babata:translation-config-changed", hideAndInvalidate);
+    document.removeEventListener("visibilitychange", onSelectionVisibility);
     document.removeEventListener("selectionchange", onSelectionChange);
     window.removeEventListener("mouseup", onPointerUp);
     window.removeEventListener("touchend", onPointerUp);
@@ -1307,7 +1254,9 @@ function setupSelectionTranslator() {
 // ── inject ────────────────────────────────────────────────────────────
 
 function clearTranslation(el: HTMLElement) {
-  injectedTranslations.get(el)?.remove();
+  const owned = injectedTranslations.get(el);
+  if (owned) { translationOwners.delete(owned); io?.unobserve(owned); }
+  owned?.remove();
   injectedTranslations.delete(el);
   el.querySelectorAll(`:scope .${TR_INPLACE_CLASS}`).forEach((node) => node.remove());
   const next = el.nextElementSibling;
@@ -1327,6 +1276,7 @@ function clearCandidateState(el: HTMLElement) {
 }
 
 function clearAllTranslations() {
+  translationOwners = new WeakMap();
   for (const root of translationRoots()) {
     root.querySelectorAll(`.${TR_CLASS}`).forEach((node) => node.remove());
   }
@@ -1334,7 +1284,8 @@ function clearAllTranslations() {
 }
 
 function isElementNearViewport(el: HTMLElement): boolean {
-  const rect = el.getBoundingClientRect();
+  const translated = injectedTranslations.get(el);
+  const rect = translated?.isConnected ? translated.getBoundingClientRect() : el.getBoundingClientRect();
   return rect.bottom >= -VISIBLE_PRIORITY_MARGIN_PX
     && rect.top <= window.innerHeight + VISIBLE_PRIORITY_MARGIN_PX
     && rect.right >= -VISIBLE_PRIORITY_MARGIN_PX
@@ -1551,70 +1502,6 @@ function createTranslationElement(el: HTMLElement, safe: string, inlineLeaf: boo
   return font;
 }
 
-interface SourceLink {
-  source: HTMLAnchorElement;
-  tokens: string[];
-  used: boolean;
-}
-
-function collapsedText(value: string): string {
-  return value.replace(/\s+/g, " ").trim();
-}
-
-function addLinkToken(tokens: string[], value: string | null | undefined) {
-  const text = collapsedText(value ?? "");
-  if (text.length < 2 || tokens.includes(text)) return;
-  tokens.push(text);
-}
-
-function addUrlLikeTokens(tokens: string[], value: string | null | undefined) {
-  const text = collapsedText(value ?? "");
-  if (!text) return;
-  addLinkToken(tokens, text);
-  const withoutProtocol = text.replace(/^https?:\/\//i, "");
-  addLinkToken(tokens, withoutProtocol);
-  addLinkToken(tokens, withoutProtocol.replace(/^www\./i, ""));
-  if (withoutProtocol.endsWith("/")) {
-    addLinkToken(tokens, withoutProtocol.slice(0, -1));
-  } else if (/\.[a-z]{2,}(?:[/:?#]|$)/i.test(withoutProtocol)) {
-    addLinkToken(tokens, `${withoutProtocol}/`);
-  }
-}
-
-function collectSourceLinks(el: HTMLElement): SourceLink[] {
-  const links: SourceLink[] = [];
-  for (const source of sourceLinkElements(el)) {
-    const href = source.getAttribute("href") || "";
-    const tokens: string[] = [];
-    const visibleTexts = [sourceText(source), source.innerText, source.textContent ?? ""];
-    for (const visibleText of visibleTexts) {
-      addLinkToken(tokens, visibleText);
-      addUrlLikeTokens(tokens, visibleText);
-    }
-    addUrlLikeTokens(tokens, href);
-    addUrlLikeTokens(tokens, source.href);
-    if (tokens.length === 0) continue;
-    tokens.sort((a, b) => b.length - a.length);
-    links.push({ source, tokens, used: false });
-  }
-  return links;
-}
-
-function markerIdToIndex(markerId: string, links: SourceLink[]): number | null {
-  const index = Number(markerId) - 1;
-  return Number.isInteger(index) && index >= 0 && index < links.length ? index : null;
-}
-
-function copyAnchorAttrs(src: HTMLAnchorElement, dst: HTMLAnchorElement) {
-  for (const attr of Array.from(src.attributes)) {
-    if (["href", "title", "class", "target", "rel", "referrerpolicy"].includes(attr.name.toLowerCase())) {
-      dst.setAttribute(attr.name, attr.value);
-    }
-  }
-  if (dst.target === "_blank" && !dst.rel) dst.rel = "noopener noreferrer";
-  copyAnchorPresentation(src, dst);
-}
-
 function copyAnchorPresentation(src: HTMLAnchorElement, dst: HTMLAnchorElement) {
   try {
     const cs = window.getComputedStyle(src);
@@ -1636,149 +1523,22 @@ function copyAnchorPresentation(src: HTMLAnchorElement, dst: HTMLAnchorElement) 
   }
 }
 
-function tokenIndexOf(text: string, token: string, start: number): number {
-  if (/\.[a-z]{2,}(?:[/:?#]|$)|^https?:\/\//i.test(token)) {
-    return text.toLowerCase().indexOf(token.toLowerCase(), start);
-  }
-  return text.indexOf(token, start);
-}
-
-function nextSourceLinkMatch(
-  text: string,
-  links: SourceLink[],
-  start: number,
-): { index: number; token: string; link: SourceLink } | null {
-  let best: { index: number; token: string; link: SourceLink } | null = null;
-  for (const link of links) {
-    if (link.used) continue;
-    for (const token of link.tokens) {
-      const index = tokenIndexOf(text, token, start);
-      if (index === -1) continue;
-      if (
-        !best
-        || index < best.index
-        || (index === best.index && token.length > best.token.length)
-      ) {
-        best = { index, token, link };
-      }
-    }
-  }
-  return best;
-}
-
-function linkifyPreservedSourceLinks(el: HTMLElement, safe: string): string {
-  const links = collectSourceLinks(el);
-  if (links.length === 0) return safe;
-
-  const template = document.createElement("template");
-  Reflect.set(template, "innerHTML", safe);
-  restoreMarkedSourceLinks(template, links);
-  const walker = document.createTreeWalker(
-    template.content,
-    NodeFilter.SHOW_TEXT,
-    {
-      acceptNode(node) {
-        const parent = node.parentElement;
-        return parent && parent.closest("a")
-          ? NodeFilter.FILTER_REJECT
-          : NodeFilter.FILTER_ACCEPT;
-      },
-    },
-  );
-  const textNodes: Text[] = [];
-  while (walker.nextNode()) {
-    if (walker.currentNode instanceof Text) textNodes.push(walker.currentNode);
-  }
-
-  for (const textNode of textNodes) {
-    const text = textNode.nodeValue ?? "";
-    if (!text) continue;
-    let offset = 0;
-    let match = nextSourceLinkMatch(text, links, offset);
-    if (!match) continue;
-
-    const frag = document.createDocumentFragment();
-    while (match) {
-      if (match.index > offset) {
-        frag.append(document.createTextNode(text.slice(offset, match.index)));
-      }
-      const matchedText = text.slice(match.index, match.index + match.token.length);
-      const a = document.createElement("a");
-      copyAnchorAttrs(match.link.source, a);
-      a.textContent = matchedText;
-      frag.append(a);
-      match.link.used = true;
-      offset = match.index + match.token.length;
-      match = nextSourceLinkMatch(text, links, offset);
-    }
-    if (offset < text.length) {
-      frag.append(document.createTextNode(text.slice(offset)));
-    }
-    textNode.parentNode?.replaceChild(frag, textNode);
-  }
-
-  return DOMPurify.sanitize(template.innerHTML.replace(LINK_MARKER_TOKEN_RE, ""), LINKIFIED_HTML_OPTS);
-}
-
-function restoreMarkedSourceLinks(template: HTMLTemplateElement, links: SourceLink[]) {
-  const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
-  const textNodes: Text[] = [];
-  while (walker.nextNode()) {
-    if (walker.currentNode instanceof Text) textNodes.push(walker.currentNode);
-  }
-
-  for (const textNode of textNodes) {
-    const text = textNode.nodeValue ?? "";
-    if (!text || !LINK_MARKER_PAIR_RE.test(text)) {
-      LINK_MARKER_PAIR_RE.lastIndex = 0;
-      continue;
-    }
-    LINK_MARKER_PAIR_RE.lastIndex = 0;
-    const frag = document.createDocumentFragment();
-    let offset = 0;
-    let match: RegExpExecArray | null;
-    while ((match = LINK_MARKER_PAIR_RE.exec(text)) !== null) {
-      const markerIndex = markerIdToIndex(match[1], links);
-      if (markerIndex === null) continue;
-      if (match.index > offset) {
-        frag.append(document.createTextNode(text.slice(offset, match.index)));
-      }
-      const link = links[markerIndex];
-      const a = document.createElement("a");
-      copyAnchorAttrs(link.source, a);
-      a.textContent = match[2].replace(LINK_MARKER_TOKEN_RE, "") || collapsedText(link.source.textContent ?? "");
-      frag.append(a);
-      link.used = true;
-      offset = match.index + match[0].length;
-    }
-    if (offset === 0) continue;
-    if (offset < text.length) {
-      frag.append(document.createTextNode(text.slice(offset)));
-    }
-    textNode.parentNode?.replaceChild(frag, textNode);
-  }
-}
 
 function injectTranslation(el: HTMLElement, raw: string) {
   if (!active || !el.isConnected) return;
+  refreshingElements.delete(el);
   clearTranslation(el);
   if (mode === "off" || !raw || isIgnoredElement(el)) return;
-  // 译文等于原文 (模型决定不翻 — 专有名词 / handle / 版本号等) → 不 inject sibling,
-  // Otherwise the original appears twice for names, handles, and version text.
   const original = sourceText(el);
-  if (raw.trim().replace(LINK_MARKER_TOKEN_RE, "") === original) return;
-  // server 返 plain text with \n\n 段分隔. 浏览器把 \n 当 whitespace 渲染,
-  // 段间会粘连, 转 <br><br> 才有视觉换行 (DOMPurify allowlist 含 br).
-  const withBreaks = raw
-    .replace(/\r\n/g, "\n")
-    .replace(/\n{2,}/g, "<br><br>")
-    .replace(/\n/g, "<br>");
-  const safe = linkifyPreservedSourceLinks(el, DOMPurify.sanitize(withBreaks, SAFE_HTML_OPTS));
+  if (raw.trim() === original) return;
+  const safe = renderTranslationMarkup(raw, sourcePlan(el));
   const inlineLeaf = isInlineElement(el);
   if (shouldRenderInPlace(el, original)) {
     const template = markInPlaceSource(el);
     const tr = createInPlaceTranslationElement(template, safe);
     injectedTranslations.set(el, tr);
+    translationOwners.set(tr, el);
+    io?.observe(tr);
     skipMoNodes.add(tr);
     el.setAttribute(INPLACE_ATTR, "1");
     if (template) {
@@ -1790,6 +1550,8 @@ function injectTranslation(el: HTMLElement, raw: string) {
   }
   const tr = createTranslationElement(el, safe, inlineLeaf);
   injectedTranslations.set(el, tr);
+  translationOwners.set(tr, el);
+  io?.observe(tr);
   // MO sentinel: 自己 inject 的 node 加进 skipMoNodes, MO addedNodes 看到跳 (防自触发).
   skipMoNodes.add(tr);
   // Sibling injection avoids mutating the source leaf. Infinite-loop prevention
@@ -1807,7 +1569,7 @@ function rerenderCachedTranslations() {
       if (!shouldTranslate(text)) return;
       const requestText = sourceTextForTranslation(node);
       const fresh = hashText(normalizeForHash(requestText), TARGET_LANG);
-      const translated = cache.get(fresh);
+      const translated = cachedTranslation(fresh);
       if (translated !== undefined) {
         node.setAttribute(HASH_ATTR, fresh);
         injectTranslation(node, translated);
@@ -1821,277 +1583,229 @@ function rerenderCachedTranslations() {
 // ── candidate processing ──────────────────────────────────────────────
 
 function processCandidate(el: HTMLElement, src: TraceSource = "init") {
-  if (!active || mode === "off") return;
+  if (!active || mode === "off" || document.visibilityState === "hidden" || !el.isConnected) return;
   el = candidateRoot(el);
+  const text = sourceTextForTranslation(el);
+  const previous = sourceSnapshots.get(el);
+  sourceSnapshots.set(el, text);
+  const hash = hashText(normalizeForHash(text), TARGET_LANG);
+  const repair = repairWindows.get(el);
+  if (repair && repair.count > 3 && repair.hash === hash) return;
+  if (repair && repair.hash !== hash) repairWindows.delete(el);
+  // Cached virtual-list mounts and removed generated siblings recover in the
+  // current mutation microtask, before the browser paints the source again.
+  if (cache.has(hash)) {
+    stableWindowMap.delete(el);
+    if (!hasInjectedTranslation(el) || el.getAttribute(HASH_ATTR) !== hash) doProcessCandidate(el, src);
+    return;
+  }
+  if (previous === text) {
+    if (!stableWindowMap.has(el) && !inFlightElements.has(el) && isElementNearViewport(el)) doProcessCandidate(el, src);
+    return;
+  }
+  if (src === "rerun" || src === "init") { doProcessCandidate(el, src); return; }
+  const previousWindow = stableWindowMap.get(el);
+  stableWindowMap.set(el, { ts: Date.now(), firstAt: previousWindow?.firstAt ?? Date.now(), src });
+}
 
-  // user-initiated (rerun = mode toggle / init = boot) 立即处理, 不等 stable window.
-  // mutation-triggered (io / mo_add / mo_char) 走 trailing stable-window: 每次 mutation
-  // 更新 ts, 1100ms 静默后才真 process — 拿到 X reconcile 稳态 text 1 次翻不闪.
-  if (src === "rerun" || src === "init") {
-    doProcessCandidate(el, src);
-    return;
-  }
-  // 已在 in-flight 翻译中: 不重 enqueue, flush 完成后下次 mutation 再触发.
-  if (inFlightElements.has(el)) {
-    trace(src, el, "", "in_flight_defer");
-    return;
-  }
-  // 入 trailing stable-window — 每次 mutation 更新 ts. last-wins.
-  stableWindowMap.set(el, { ts: Date.now(), src });
-  trace(src, el, "", "stable_pending");
+function releaseQueueItem(hash: string, item: QueueItem) {
+  if (queue.get(hash) === item) queue.delete(hash);
+  inFlightHashes.delete(hash);
+  item.elements.forEach((element) => inFlightElements.delete(element));
 }
 
 function doProcessCandidate(el: HTMLElement, src: TraceSource) {
-  if (!active || mode === "off" || !el.isConnected) return;
+  if (!active || mode === "off" || document.visibilityState === "hidden" || !el.isConnected) return;
+  if (isIgnoredElement(el)) { clearCandidateState(el); return; }
   const hasInjected = hasInjectedTranslation(el);
-  if (isIgnoredElement(el)) {
-    clearCandidateState(el);
-    trace(src, el, "", "not_translatable", "");
-    return;
-  }
-  if (hasRichMediaSurface(el)) {
-    clearCandidateState(el);
-    trace(src, el, "", "not_translatable", sourceText(el));
-    observeNew(el, src);
-    return;
-  }
-  if (!hasInjected && isHidden(el)) {
-    clearCandidateState(el);
-    trace(src, el, "", "not_translatable", "");
-    return;
-  }
-
+  if (!hasInjected && isHidden(el)) return;
   const text = sourceText(el);
-  if (!text) {
-    clearCandidateState(el);
-    trace(src, el, "", "skip_no_text");
-    return;
-  }
-  if (!shouldTranslate(text)) {
-    clearCandidateState(el);
-    trace(src, el, "", "not_translatable", text);
-    return;
-  }
-
+  if (!shouldTranslate(text, DEFAULT_MIN_TEXT_COUNT, el)) { clearCandidateState(el); return; }
+  if (hasRichMediaSurface(el)) { clearCandidateState(el); observeNew(el, src); return; }
   const requestText = sourceTextForTranslation(el);
   const fresh = hashText(normalizeForHash(requestText), TARGET_LANG);
+  sourceSnapshots.set(el, requestText);
   const existing = el.getAttribute(HASH_ATTR);
-
-  // SPA 重 mount 时, 旧 .bbt-tr sibling 可能跟随 hash 节点带过来; 但 text 已变 →
-  // hash 不一致 → 旧译文跟新内容不对应, 必须清掉重翻.
-  if (hasInjected && existing === fresh) {
-    trace(src, el, fresh, "already", text);
-    return;
-  }
-  if (hasInjected && existing !== fresh) {
+  if (hasInjected && existing === fresh && !refreshingElements.has(el)) return;
+  if (existing && existing !== fresh) {
+    const old = queue.get(existing);
+    old?.elements.delete(el);
+    if (old && old.elements.size === 0) releaseQueueItem(existing, old);
     clearTranslation(el);
   }
-
-  if (existing !== fresh) {
-    el.setAttribute(HASH_ATTR, fresh);
+  el.setAttribute(HASH_ATTR, fresh);
+  el.setAttribute(LEAF_ATTR, "1");
+  const cached = cachedTranslation(fresh);
+  if (cached !== undefined) { injectTranslation(el, cached); return; }
+  if (rejectedHashes.has(fresh)) return;
+  // Only the current viewport and a bounded 800px look-ahead can consume
+  // provider work. IntersectionObserver retains every farther candidate.
+  if (!isElementNearViewport(el)) return;
+  const queued = queue.get(fresh);
+  if (queued) { queued.elements.add(el); inFlightElements.add(el); return; }
+  if (queue.size >= QUEUE_MAX) {
+    for (const [hash, item] of queue) {
+      if (!item.parts.some((part) => part.inFlight) && !isElementNearViewport(item.el)) releaseQueueItem(hash, item);
+    }
+    // Keep the oldest visible paragraph and refill after capacity is released.
+    if (queue.size >= QUEUE_MAX) { needsQueueRefill = true; return; }
   }
-
-  const cached = cache.get(fresh);
-  if (cached !== undefined) {
-    trace(src, el, fresh, "cache_inject", text);
-    injectTranslation(el, cached);
-    return;
-  }
-
-  // hash in-flight: 同 text 跨 element instance 已 enqueue 在 server roundtrip 中,
-  // 不重 enqueue 触发并发 flush. 等 flush 完 cache.set 后, 同 hash 走 cache hit.
-  if (inFlightHashes.has(fresh)) {
-    queue.get(fresh)?.elements.add(el);
-    inFlightElements.add(el);
-    trace(src, el, fresh, "in_flight_defer", text);
-    return;
-  }
-
-  trace(src, el, fresh, "enqueue", text);
   inFlightElements.add(el);
   inFlightHashes.add(fresh);
-  queue.set(fresh, {
-    el,
-    elements: new Set([el]),
-    text,
-    requestText,
-    visible: isElementNearViewport(el),
-    attempts: 0,
+  const parts = splitTranslationText(requestText).map((part) => {
+    const hash = hashText(normalizeForHash(part), TARGET_LANG);
+    return { hash, text: part, translated: cachedTranslation(hash), attempts: 0, inFlight: false, retryAt: 0 };
   });
-  // Queue cap: evict the oldest item by FIFO insertion order.
-  if (queue.size > QUEUE_MAX) {
-    const oldest = queue.keys().next().value as string | undefined;
-    if (oldest && oldest !== fresh) {
-      const evicted = queue.get(oldest);
-      queue.delete(oldest);
-      inFlightHashes.delete(oldest);
-      evicted?.elements.forEach((element) => inFlightElements.delete(element));
-    }
+  if (parts.length && parts.every((part) => part.translated !== undefined)) {
+    const translated = parts.map((part) => part.translated).join("");
+    cacheTranslation(fresh, translated);
+    inFlightElements.delete(el);
+    inFlightHashes.delete(fresh);
+    injectTranslation(el, translated);
+    return;
   }
+  queue.set(fresh, { el, elements: new Set([el]), text, requestText, visible: isActuallyVisible(el), parts });
+  trace(src, el, fresh, "enqueue", text);
   scheduleFlush();
 }
 
-function scheduleFlush(delayMs = FLUSH_DEBOUNCE_MS) {
-  if (!active || mode === "off") return;
-  if (flushingLifecycle === lifecycle) return;
-  if (flushTimer !== null) return;
-  const backoffMs = Math.max(0, nextFlushNotBefore - Date.now());
-  flushTimer = window.setTimeout(flush, Math.max(delayMs, backoffMs));
+function isActuallyVisible(el: HTMLElement): boolean {
+  const translated = injectedTranslations.get(el);
+  const rect = translated?.isConnected ? translated.getBoundingClientRect() : el.getBoundingClientRect();
+  return rect.bottom >= 0 && rect.top <= innerHeight && rect.right >= 0 && rect.left <= innerWidth;
 }
 
-async function flush() {
+const batchOwners = new Map<AbortController, QueueItem[]>();
+function cancelPageRequests() {
+  for (const controller of activeRequests) controller.abort();
+  activeRequests.clear();
+  batchOwners.clear();
+  queue.clear();
+  inFlightHashes.clear();
+  inFlightElements = new WeakSet();
+  stableWindowMap.clear();
+  completedBatches = 0;
+  needsQueueRefill = false;
+}
+
+function scheduleFlush(delayMs = FLUSH_DEBOUNCE_MS) {
+  if (!active || mode === "off" || document.visibilityState === "hidden" || activeRequests.size >= MAX_PARALLEL_BATCHES || flushTimer !== null) return;
+  flushTimer = window.setTimeout(flush, delayMs);
+}
+
+interface SelectedPart { ownerHash: string; item: QueueItem; part: TranslationPart }
+function flush() {
   flushTimer = null;
   if (!active || mode === "off") return;
-  if (flushingLifecycle === lifecycle) {
-    scheduleFlush();
-    return;
-  }
-  if (queue.size === 0) return;
-  const generation = lifecycle;
-  flushingLifecycle = generation;
-  try {
-    await flushOnce();
-  } finally {
-    if (flushingLifecycle === generation) {
-      flushingLifecycle = null;
-      if (queue.size > 0) scheduleFlush();
+  while (activeRequests.size < MAX_PARALLEL_BATCHES) {
+    const candidates: Array<[string, QueueItem]> = [];
+    for (const [hash, item] of queue) {
+      for (const element of item.elements) {
+        if (!element.isConnected || isIgnoredElement(element)) { item.elements.delete(element); inFlightElements.delete(element); }
+      }
+      const live = [...item.elements].find((element) => isElementNearViewport(element));
+      if (live) { item.el = live; item.visible = isActuallyVisible(live); candidates.push([hash, item]); }
+      else if (!item.parts.some((part) => part.inFlight)) releaseQueueItem(hash, item);
     }
+    candidates.sort((a, b) => Number(b[1].visible) - Number(a[1].visible));
+    const selected: SelectedPart[] = [];
+    const size = completedBatches === 0 ? FIRST_BATCH_SIZE : BATCH_SIZE;
+    let chars = 0;
+    let retryAt = Infinity;
+    const now = Date.now();
+    for (const [ownerHash, item] of candidates) {
+      for (const part of item.parts) {
+        if (part.translated !== undefined || part.inFlight) continue;
+        if (part.retryAt > now) { retryAt = Math.min(retryAt, part.retryAt); continue; }
+        if (selected.length >= size || (selected.length && chars + part.text.length > TRANSLATION_BATCH_CHAR_BUDGET)) break;
+        part.inFlight = true;
+        selected.push({ ownerHash, item, part });
+        chars += part.text.length;
+      }
+      if (selected.length >= size) break;
+    }
+    if (!selected.length) {
+      if (Number.isFinite(retryAt)) scheduleFlush(Math.max(1, retryAt - now));
+      break;
+    }
+    const controller = new AbortController();
+    activeRequests.add(controller);
+    batchOwners.set(controller, selected.map(({ item }) => item));
+    void runBatch(selected, controller, lifecycle);
   }
 }
 
-async function flushOnce() {
-  const generation = lifecycle;
-  // Removed timeline entries cannot consume a model call or retain every old
-  // DOM copy of the same paragraph while a retry is pending.
-  for (const [hash, item] of queue) {
-    for (const element of item.elements) {
-      if (!element.isConnected || isIgnoredElement(element)) {
-        item.elements.delete(element);
-        inFlightElements.delete(element);
-      }
-    }
-    const liveElement = item.elements.values().next().value as HTMLElement | undefined;
-    if (liveElement) item.el = liveElement;
-    else { queue.delete(hash); inFlightHashes.delete(hash); }
-  }
-  // 可见优先取 BATCH_SIZE, 但不丢 scroll-out: 队列里的后台段落继续补翻.
-  // slice 暂不删, 等 round-trip 完按 result 状态决定.
-  const slice: { hash: string; el: HTMLElement; elements: Set<HTMLElement>; text: string; requestText: string }[] = [];
-  let sliceChars = 0;
-  const candidates = Array.from(queue.entries()).sort((a, b) => {
-    const av = a[1].visible || isElementNearViewport(a[1].el);
-    const bv = b[1].visible || isElementNearViewport(b[1].el);
-    if (av !== bv) return bv ? 1 : -1;
-    return a[1].attempts - b[1].attempts;
-  });
-  for (const [h, item] of candidates) {
-    if (slice.length >= BATCH_SIZE) break;
-    item.visible = item.visible || isElementNearViewport(item.el);
-    if (slice.length > 0 && sliceChars + item.requestText.length > TRANSLATION_BATCH_CHAR_BUDGET) {
-      continue;
-    }
-    slice.push({ hash: h, el: item.el, elements: item.elements, text: item.text, requestText: item.requestText });
-    sliceChars += item.requestText.length;
-  }
-  if (slice.length === 0) return;
-
-  const batch = slice.map(({ hash, requestText }) => ({
-    hash,
-    text: requestText,
-  }));
-
-  let results: { hash: string; translated: string }[] = [];
-  let networkOk = false;
-  const resp = (await safeChromeSend(() =>
-    chrome.runtime.sendMessage({
-      type: "babata.translate",
-      site: location.hostname,
-      url: location.href,
-      target: TARGET_LANG,
-      batch,
-    }),
-  )) as { ok: boolean; results?: typeof results } | undefined;
-  if (!active || generation !== lifecycle) return;
-  if (resp?.ok && Array.isArray(resp.results)) {
-    results = resp.results.filter((item) => item && typeof item.hash === "string" && typeof item.translated === "string");
-    networkOk = true;
-    transportFailures = 0;
-    nextFlushNotBefore = 0;
-  }
-  // SW / server 没 ready 或 extension reload → bounded retry with backoff. The old
-  // 300ms loop hammered localhost indefinitely when the server was down.
-  if (!networkOk) {
-    transportFailures += 1;
-    const retryDelay = Math.min(
-      TRANSPORT_RETRY_BASE_MS * Math.pow(2, Math.max(0, transportFailures - 1)),
-      TRANSPORT_RETRY_MAX_MS,
-    );
-    nextFlushNotBefore = Date.now() + retryDelay;
-    for (const { hash, el, text } of slice) {
-      const queued = queue.get(hash);
-      if (!queued) continue;
-      queued.attempts += 1;
-      if (queued.attempts > TRANSPORT_MAX_RETRIES) {
-        trace("mo_add", el, hash, "transport_drop", text);
-        queue.delete(hash);
-      } else {
-        queued.visible = queued.visible || isElementNearViewport(el);
-        trace("mo_add", el, hash, "transport_retry", text);
-      }
-    }
-  }
-
-  const byHash = new Map(slice.map((item) => [item.hash, item]));
-  const staleRechecks: HTMLElement[] = [];
-  const completedHashes = new Set<string>();
-  for (const r of results) {
-    const item = byHash.get(r.hash);
-    if (!item || !r.translated) continue;
-    completedHashes.add(r.hash);
-    cacheTranslation(r.hash, r.translated);
-    for (const element of queue.get(r.hash)?.elements ?? [item.el]) {
-      if (!element.isConnected) continue;
-      const currentText = sourceText(element);
-      const currentRequestText = currentText ? sourceTextForTranslation(element) : "";
-      const currentHash = currentRequestText ? hashText(normalizeForHash(currentRequestText), TARGET_LANG) : "";
-      if (currentHash !== r.hash) {
-        trace("mo_add", element, r.hash, "stale_result", currentText);
-        staleRechecks.push(element);
+async function runBatch(selected: SelectedPart[], controller: AbortController, generation: number) {
+  try {
+    const response = await requestTranslation({
+      site: location.hostname, url: location.href, target: TARGET_LANG,
+      priority: selected.some(({ item }) => item.visible) ? "visible" : "prefetch",
+      // Repeated chunks are separate positions in the paragraph but one wire
+      // item. Keep selected intact so every position receives the shared result.
+      batch: Array.from(new Map(selected.map(({ part }) => [part.hash, { hash: part.hash, text: part.text }])).values()),
+    }, { signal: controller.signal });
+    if (!active || generation !== lifecycle || controller.signal.aborted) return;
+    completedBatches++;
+    const results = new Map((response.results || []).filter((item) => typeof item?.translated === "string" && item.translated.trim()).map((item) => [item.hash, item.translated]));
+    const errors = new Map((response.errors || []).map((error) => [error.hash, error]));
+    for (const { ownerHash, item, part } of selected) {
+      if (queue.get(ownerHash) !== item || part.translated !== undefined) continue;
+      const translated = results.get(part.hash);
+      if (translated !== undefined) {
+        // Fan out to every equal chunk in this paragraph, including chunks not
+        // selected yet. Array order remains the source order when reassembled.
+        for (const sibling of item.parts) {
+          if (sibling.hash === part.hash && sibling.text === part.text) sibling.translated = translated;
+        }
+        cacheTranslation(part.hash, translated);
         continue;
       }
-      injectTranslation(element, r.translated);
-    }
-  }
-
-  if (networkOk) {
-    for (const { hash, el, text } of slice) {
-      if (completedHashes.has(hash)) {
-        queue.delete(hash);
-        continue;
-      }
-      const queued = queue.get(hash);
-      if (!queued) continue;
-      queued.attempts += 1;
-      if (queued.attempts > MISSING_RESULT_MAX_RETRIES) {
-        trace("mo_add", el, hash, "missing_result_drop", text);
-        queue.delete(hash);
+      const error = errors.get(part.hash);
+      part.attempts++;
+      const retryable = error?.retryable ?? response.retryable ?? true;
+      const limit = response.ok ? MISSING_RESULT_MAX_RETRIES : TRANSPORT_MAX_RETRIES;
+      if (!retryable || part.attempts > limit) {
+        rejectedHashes.add(ownerHash);
+        while (rejectedHashes.size > CACHE_MAX) rejectedHashes.delete(rejectedHashes.values().next().value!);
+        releaseQueueItem(ownerHash, item);
+        trace("mo_add", item.el, ownerHash, "transport_drop", item.text);
       } else {
-        queued.visible = queued.visible || isElementNearViewport(el);
-        trace("mo_add", el, hash, "missing_result_retry", text);
+        part.retryAt = Date.now() + (error?.retry_after_ms ?? response.retry_after_ms
+          ?? Math.min(TRANSPORT_RETRY_BASE_MS * 2 ** (part.attempts - 1), TRANSPORT_RETRY_MAX_MS));
       }
     }
-  }
-  // Retain hash ownership across retries so duplicate DOM mutations cannot
-  // overwrite the queue entry and reset its retry count.
-  for (const { hash, elements } of slice) {
-    if (!queue.has(hash)) {
-      inFlightHashes.delete(hash);
-      elements.forEach((el) => inFlightElements.delete(el));
+    for (const [hash, item] of new Map(selected.map(({ ownerHash, item }) => [ownerHash, item]))) {
+      if (queue.get(hash) !== item || !item.parts.every((part) => part.translated !== undefined)) continue;
+      const translated = item.parts.map((part) => part.translated).join("");
+      cacheTranslation(hash, translated);
+      releaseQueueItem(hash, item);
+      for (const element of item.elements) {
+        if (!element.isConnected) continue;
+        const current = sourceTextForTranslation(element);
+        if (hashText(normalizeForHash(current), TARGET_LANG) === hash) injectTranslation(element, translated);
+        else processCandidate(element, "mo_char");
+      }
     }
-  }
-  for (const element of staleRechecks) inFlightElements.delete(element);
-  for (const el of staleRechecks) {
-    if (el.isConnected) processCandidate(el, "mo_add");
+  } catch {
+    if (!controller.signal.aborted && generation === lifecycle) {
+      for (const { ownerHash, item, part } of selected) {
+        if (queue.get(ownerHash) !== item) continue;
+        part.attempts++;
+        if (part.attempts > TRANSPORT_MAX_RETRIES) { rejectedHashes.add(ownerHash); releaseQueueItem(ownerHash, item); }
+        else part.retryAt = Date.now() + Math.min(TRANSPORT_RETRY_BASE_MS * 2 ** (part.attempts - 1), TRANSPORT_RETRY_MAX_MS);
+      }
+    }
+  } finally {
+    selected.forEach(({ part }) => { part.inFlight = false; });
+    activeRequests.delete(controller);
+    batchOwners.delete(controller);
+    if (active && generation === lifecycle && mode !== "off") {
+      if (needsQueueRefill && queue.size < QUEUE_MAX - BATCH_SIZE * MAX_PARALLEL_BATCHES) {
+        needsQueueRefill = false;
+        observeNew(document.body, "rerun");
+      }
+      scheduleFlush(0);
+    }
   }
 }
 
@@ -2100,42 +1814,79 @@ async function flushOnce() {
 let io: IntersectionObserver | null = null;
 
 function makeIO() {
-  // IO 追踪 visibleHashes + 提升队列优先级. 翻译不 gate 在 viewport:
-  // 可见段先翻, scroll-out 段后台补完.
-  io = new IntersectionObserver(
-    (entries) => {
-      let viewportChanged = false;
-      for (const e of entries) {
-        const el = e.target as HTMLElement;
-        const h = el.getAttribute(HASH_ATTR);
-        if (!h) continue;
-        if (e.isIntersecting) {
-          const queued = queue.get(h);
-          if (queued) queued.visible = true;
-          if (!visibleHashes.has(h)) {
-            visibleHashes.add(h);
-            viewportChanged = true;
-          }
-        } else {
-          if (visibleHashes.delete(h)) {
-            viewportChanged = true;
-          }
-        }
+  io = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const el = translationOwners.get(entry.target as HTMLElement) ?? entry.target as HTMLElement;
+      const hash = el.getAttribute(HASH_ATTR);
+      if (hash) {
+        if (entry.isIntersecting) visibleHashes.add(hash); else visibleHashes.delete(hash);
+        const item = queue.get(hash);
+        if (item) item.visible = entry.isIntersecting && isActuallyVisible(el);
       }
-      if (viewportChanged) scheduleViewportPush();
-    },
-    { rootMargin: `${VISIBLE_PRIORITY_MARGIN_PX}px`, threshold: 0.01 },
-  );
+      if (entry.isIntersecting) processCandidate(el, "io");
+    }
+    for (const [controller, owners] of batchOwners) {
+      if (owners.every((item) => ![...item.elements].some((element) => element.isConnected && isElementNearViewport(element)))) controller.abort();
+    }
+    scheduleFlush(0);
+    scheduleViewportPush();
+  }, { rootMargin: `${VISIBLE_PRIORITY_MARGIN_PX}px`, threshold: 0 });
 }
 
-function observeNew(root: ParentNode, src: TraceSource = "init") {
-  if (!io) return;
-  // 通用 leaf-text 收集 (不再走 site-specific selectors).
-  const elements = collectTranslatable(root);
-  for (const el of elements) {
-    io.observe(el);
-    processCandidate(el, src);
+interface ScanTask { iterator: Generator<HTMLElement | null>; src: TraceSource }
+const scanTasks = new Map<ParentNode, ScanTask>();
+let scanTimer: number | null = null;
+function cancelScanTasks() {
+  if (scanTimer !== null) clearTimeout(scanTimer);
+  scanTimer = null;
+  scanTasks.clear();
+}
+function runScanTasks() {
+  scanTimer = null;
+  if (!active || mode === "off" || document.visibilityState === "hidden") { scanTasks.clear(); return; }
+  const deadline = performance.now() + 4;
+  let visited = 0;
+  while (scanTasks.size && visited++ < 80 && performance.now() < deadline) {
+    const [root, task] = scanTasks.entries().next().value!;
+    if (root instanceof Node && !root.isConnected) { scanTasks.delete(root); continue; }
+    const next = task.iterator.next();
+    if (next.done) { scanTasks.delete(root); continue; }
+    if (next.value) {
+      io?.observe(next.value);
+      if (isElementNearViewport(next.value)) processCandidate(next.value, task.src);
+    }
   }
+  if (scanTasks.size) scanTimer = window.setTimeout(runScanTasks, 16);
+}
+function observeNew(root: ParentNode, src: TraceSource = "init") {
+  if (!io || !active || mode === "off" || document.visibilityState === "hidden") return;
+  if (root instanceof HTMLElement && isLeafTextElement(root)) {
+    const hash = hashText(normalizeForHash(sourceTextForTranslation(root)), TARGET_LANG);
+    if (cache.has(hash)) { root.setAttribute(LEAF_ATTR, "1"); io.observe(root); processCandidate(root, "rerun"); return; }
+  }
+  // Coalesce overlapping mutation roots before walking. Ancestor class changes
+  // may produce hundreds of records but still require one bounded scan.
+  for (const existing of scanTasks.keys()) {
+    if (existing === root || existing instanceof Node && root instanceof Node && existing.contains(root)) return;
+    if (root instanceof Node && existing instanceof Node && root.contains(existing)) scanTasks.delete(existing);
+  }
+  scanTasks.set(root, { iterator: walkTranslatable(root), src });
+  if (scanTimer === null) scanTimer = window.setTimeout(runScanTasks, 0);
+}
+
+function restoreRemovedTranslation(node: HTMLElement) {
+  const owner = translationOwners.get(node);
+  if (!owner?.isConnected || !active || mode === "off" || hasInjectedTranslation(owner)) return;
+  const now = Date.now();
+  const previous = repairWindows.get(owner);
+  const hash = hashText(normalizeForHash(sourceTextForTranslation(owner)), TARGET_LANG);
+  const state = previous && previous.hash === hash && now - previous.at < 2000 ? previous : { at: now, count: 0, hash };
+  state.count++;
+  repairWindows.set(owner, state);
+  // Do not fight a framework that intentionally deletes the same generated
+  // node every frame. It falls back once to stable source text instead.
+  if (state.count > 3) return;
+  processCandidate(owner, "rerun");
 }
 
 function observeMutations(root: ParentNode = document.body) {
@@ -2195,6 +1946,7 @@ function observeMutations(root: ParentNode = document.body) {
         if (target instanceof HTMLElement) {
           const leaf = closestLeafElement(target);
           if (leaf) processCandidate(leaf, "mo_add");
+          else if (Array.from(r.addedNodes).some((node) => node.nodeType === Node.TEXT_NODE)) observeNew(target, "mo_add");
         }
 
         for (const node of r.addedNodes) {
@@ -2223,6 +1975,7 @@ function observeMutations(root: ParentNode = document.body) {
         // source was removed, its generated sibling must disappear with it.
         for (const node of r.removedNodes) {
           if (!(node instanceof HTMLElement) || node.isConnected) continue;
+          if (isTranslationElement(node)) { restoreRemovedTranslation(node); continue; }
           for (const element of [node, ...node.querySelectorAll<HTMLElement>(`[${HASH_ATTR}], [${LEAF_ATTR}]`)]) {
             io?.unobserve(element);
             stableWindowMap.delete(element);
@@ -2387,6 +2140,7 @@ function boot() {
         const prev = mode;
         mode = resolveMode();
         applyModeAttr();
+        if (mode === "off") { cancelPageRequests(); cancelScanTasks(); }
         // bilingual ↔ replace 需要重绘 wrapper 形态: replace 用 native clone,
         // bilingual 用中性 font sibling; 译文本身仍走 L1 cache, 不重调 LLM.
         if (prev !== mode && mode !== "off") {
@@ -2406,6 +2160,28 @@ function boot() {
   } catch {
     /* extension context invalidated: wait for the next page load */
   }
+
+  try {
+    const onConfigurationChanged = (message: { type?: string; scope?: string }) => {
+      if (message.type !== "babata.translation_config_changed" || message.scope === "transcription") return;
+      cancelPageRequests();
+      cache.clear();
+      cacheBytes = 0;
+      rejectedHashes.clear();
+      sourceSnapshots = new WeakMap();
+      repairWindows = new WeakMap();
+      for (const root of translationRoots()) {
+        for (const element of root.querySelectorAll<HTMLElement>(`[${HASH_ATTR}]`)) {
+          if (hasInjectedTranslation(element)) refreshingElements.add(element);
+          if (isElementNearViewport(element)) processCandidate(element, "rerun");
+        }
+      }
+      document.dispatchEvent(new Event("babata:translation-config-changed"));
+      observeNew(document.body, "rerun");
+    };
+    chrome.runtime.onMessage.addListener(onConfigurationChanged);
+    registerCleanup(() => chrome.runtime.onMessage.removeListener(onConfigurationChanged));
+  } catch { /* Extension reload can invalidate runtime listeners. */ }
 
   // F8: page unload / extension reload 时清 timer + MO, 防老 content script leak.
   window.addEventListener("pagehide", teardownAll, { once: true });

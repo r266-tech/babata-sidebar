@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 import http from "node:http";
 import spawn from "cross-spawn";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import { promises as fs, constants as fsConstants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { createProviderScheduler, translationError } from "./translation-scheduler.mjs";
+import { createTranslationEngine, publicTranslationError, TRANSLATION_SYSTEM_PROMPT } from "./translation-engine.mjs";
+import { transcribeAudio, transcriptionCapabilities } from "./transcription.mjs";
+import { BUILD_INFO } from "./build-info.mjs";
 
 const HOST = process.env.BABATA_SIDEBAR_HOST || "127.0.0.1";
 const PORT = Number(process.env.BABATA_SIDEBAR_PORT || process.env.PORT || "18791");
@@ -87,7 +92,30 @@ const activeChats = new Set();
 const activeRequests = new Set();
 const MAX_ACTIVE_CHATS = envInt("BABATA_CHAT_MAX_CONCURRENT", 4, 1, 32);
 const MAX_ACTIVE_PROVIDER_CALLS = envInt("BABATA_PROVIDER_MAX_CONCURRENT", 8, 1, 64);
-let activeProviderCalls = 0;
+const PROVIDER_MAX_RETRIES = envInt("BABATA_PROVIDER_MAX_RETRIES", 1, 0, 5);
+const PROVIDER_RETRY_BASE_MS = envInt("BABATA_PROVIDER_RETRY_BASE_MS", 400, 1, 60000);
+const PROVIDER_RETRY_MAX_WAIT_MS = envInt("BABATA_PROVIDER_RETRY_MAX_WAIT_MS", 10000, 1, 300000);
+const providerScheduler = createProviderScheduler({
+  concurrency: MAX_ACTIVE_PROVIDER_CALLS,
+  maxQueued: envInt("BABATA_PROVIDER_QUEUE_MAX", 128, 0, 4096),
+  queueTimeoutMs: envInt("BABATA_PROVIDER_QUEUE_TIMEOUT_MS", 30000, 1, 300000),
+  requestsPerSecond: envNumber("BABATA_PROVIDER_REQUESTS_PER_SECOND", 4, 0.01, 1000),
+  burst: envInt("BABATA_PROVIDER_BURST", 8, 1, 1000),
+});
+const providerMetrics = { attempts: 0, retries: 0, rate_limits: 0, prompt_tokens: 0, completion_tokens: 0 };
+const translationEngine = createTranslationEngine({
+  complete: async ({ provider, target, batch, signal, priority }) => completionData(provider, [
+    { role: "system", content: TRANSLATION_SYSTEM_PROMPT },
+    { role: "user", content: JSON.stringify({ target, batch }) },
+  ], {}, signal, priority),
+  maxBatchItems: TRANSLATE_BATCH_MAX,
+  maxItemChars: envInt("BABATA_TRANSLATE_ITEM_MAX_CHARS", 16000, 1, 1000000),
+  maxBatchChars: envInt("BABATA_TRANSLATE_BATCH_MAX_CHARS", 24000, 1, 1000000),
+  cacheMaxEntries: envInt("BABATA_TRANSLATE_CACHE_MAX_ENTRIES", 5000, 0, 100000),
+  cacheMaxBytes: envInt("BABATA_TRANSLATE_CACHE_MAX_BYTES", 16 * 1024 * 1024, 0, 512 * 1024 * 1024),
+  cacheTtlMs: envInt("BABATA_TRANSLATE_CACHE_TTL_MS", 1800000, 0, 86400000),
+  maxPendingItems: envInt("BABATA_TRANSLATE_PENDING_MAX_ITEMS", 4096, 1, 100000),
+});
 let configWriteChain = Promise.resolve();
 
 function envInt(name, fallback, min, max) {
@@ -95,6 +123,12 @@ function envInt(name, fallback, min, max) {
   if (!Number.isInteger(value) || value < min || value > max) {
     throw new Error(`${name} must be an integer between ${min} and ${max}`);
   }
+  return value;
+}
+
+function envNumber(name, fallback, min, max) {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isFinite(value) || value < min || value > max) throw new Error(`${name} must be a number between ${min} and ${max}`);
   return value;
 }
 
@@ -106,6 +140,7 @@ function emptyConfig() {
       api_key: "",
       model: "",
     },
+    transcription_provider: { base_url: "", api_key: "", model: "" },
   };
 }
 
@@ -116,6 +151,7 @@ async function readConfig() {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("config object required");
     if (parsed.cpu !== undefined && !isCpu(parsed.cpu)) throw new Error("invalid configured cpu");
     if (parsed.translation_provider !== undefined) validateProviderSettings(parsed.translation_provider);
+    if (parsed.transcription_provider !== undefined) validateProviderSettings(parsed.transcription_provider, "transcription_provider");
     return normalizeConfig(parsed);
   } catch (err) {
     if (err.code === "ENOENT") return normalizeConfig({});
@@ -151,6 +187,7 @@ function normalizeConfig(raw) {
   const provider = item.translation_provider && typeof item.translation_provider === "object"
     ? item.translation_provider
     : {};
+  const transcription = item.transcription_provider && typeof item.transcription_provider === "object" ? item.transcription_provider : {};
   const cpu = isCpu(item.cpu) ? item.cpu : DEFAULT_CPU;
   return {
     cpu,
@@ -158,6 +195,11 @@ function normalizeConfig(raw) {
       base_url: text(provider.base_url) || process.env.OPENAI_BASE_URL || process.env.OPENROUTER_BASE_URL || base.translation_provider.base_url,
       api_key: typeof provider.api_key === "string" ? text(provider.api_key) : process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || "",
       model: typeof provider.model === "string" ? text(provider.model) : process.env.BABATA_TRANSLATION_MODEL || process.env.OPENAI_MODEL || process.env.OPENROUTER_MODEL || "",
+    },
+    transcription_provider: {
+      base_url: typeof transcription.base_url === "string" ? text(transcription.base_url) : process.env.BABATA_TRANSCRIPTION_BASE_URL || "",
+      api_key: typeof transcription.api_key === "string" ? text(transcription.api_key) : process.env.BABATA_TRANSCRIPTION_API_KEY || "",
+      model: typeof transcription.model === "string" ? text(transcription.model) : process.env.BABATA_TRANSCRIPTION_MODEL || "",
     },
   };
 }
@@ -171,6 +213,7 @@ function publicConfig(config) {
       model: normalized.translation_provider.model,
       api_key_set: Boolean(normalized.translation_provider.api_key),
     },
+    transcription_provider: providerPublic(normalized.transcription_provider),
   };
 }
 
@@ -183,6 +226,7 @@ function settingsConfig(config) {
       ...visible.translation_provider,
       api_key: normalized.translation_provider.api_key,
     },
+    transcription_provider: { ...visible.transcription_provider, api_key: normalized.transcription_provider.api_key },
   };
 }
 
@@ -357,6 +401,7 @@ async function healthPayload(config) {
   return {
     ok: true,
     companion: "node",
+    build: BUILD_INFO,
     sw_attached: wsClients.size > 0,
     ws_clients: wsClients.size,
     config_path: CONFIG_PATH,
@@ -364,6 +409,7 @@ async function healthPayload(config) {
     label: CPU_SPECS[normalized.cpu].label,
     choices: await cpuChoices(normalized.cpu),
     translation_provider: publicConfig(normalized).translation_provider,
+    transcription_provider: publicConfig(normalized).transcription_provider,
   };
 }
 
@@ -381,13 +427,13 @@ function providerFrom(config, override = {}) {
   };
 }
 
-function validateProviderSettings(provider) {
+function validateProviderSettings(provider, label = "translation_provider") {
   if (!provider || typeof provider !== "object" || Array.isArray(provider)) {
-    throw httpError(400, "translation_provider must be an object");
+    throw httpError(400, `${label} must be an object`);
   }
   for (const field of ["base_url", "api_key", "model"]) {
     if (provider[field] !== undefined && typeof provider[field] !== "string") {
-      throw httpError(400, `translation_provider.${field} must be a string`);
+      throw httpError(400, `${label}.${field} must be a string`);
     }
   }
 }
@@ -408,7 +454,7 @@ function providerUrl(baseUrl, endpoint) {
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
     throw httpError(400, "provider base_url must be an HTTP(S) URL without credentials");
   }
-  url.pathname = `${url.pathname.replace(/\/(?:chat\/completions|models)\/?$/i, "").replace(/\/+$/, "")}/${endpoint}`;
+  url.pathname = `${url.pathname.replace(/\/(?:chat\/completions|audio\/transcriptions|models)\/?$/i, "").replace(/\/+$/, "")}/${endpoint}`;
   url.hash = "";
   return url.toString();
 }
@@ -420,11 +466,50 @@ function sameProviderDestination(next, current) {
 }
 
 async function providerFetch(provider, endpoint, init = {}) {
+  const { priority = "visible", ...request } = init;
+  const bucket = createHash("sha256").update(JSON.stringify([providerUrl(provider.base_url, "chat/completions"), provider.model, provider.api_key || ""])).digest("hex");
+  for (let attempt = 0; ; attempt += 1) {
+    request.signal?.throwIfAborted();
+    try {
+      return await providerScheduler.run(() => providerFetchAttempt(provider, endpoint, request), { signal: request.signal, priority, bucket });
+    } catch (error) {
+      request.signal?.throwIfAborted();
+      if (error.code === "provider_rate_limited" || (error.code === "provider_http_error" && error.retry_after_ms)) {
+        providerScheduler.cooldown(bucket, Math.max(error.retry_after_ms || 0, PROVIDER_RETRY_BASE_MS * 2 ** attempt));
+      }
+      if (!error.retryable || attempt >= PROVIDER_MAX_RETRIES) throw error;
+      const retryAfter = error.retry_after_ms ?? 0;
+      // A long provider cooldown belongs to the caller; never occupy a worker
+      // or hide a multi-minute wait inside a page request.
+      if (retryAfter > PROVIDER_RETRY_MAX_WAIT_MS) throw error;
+      const backoff = Math.min(PROVIDER_RETRY_MAX_WAIT_MS, PROVIDER_RETRY_BASE_MS * 2 ** attempt);
+      const wait = Math.max(retryAfter, backoff * (0.5 + Math.random() * 0.5));
+      providerMetrics.retries += 1;
+      await delay(wait, undefined, { signal: request.signal });
+    }
+  }
+}
+
+function retryAfterMs(value) {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  const ms = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - Date.now();
+  return Number.isFinite(ms) ? Math.max(0, Math.min(ms, 86400000)) : undefined;
+}
+
+function sanitizeProviderErrorMessage(message, apiKey) {
+  // Providers sometimes echo request credentials in authentication errors.
+  // Redact before creating an Error so its message and stack are both safe.
+  const withoutKey = apiKey ? String(message).replaceAll(apiKey, "[redacted]") : String(message);
+  return withoutKey.replace(/\bBearer\s+[^\s"'<>]+/gi, "Bearer [redacted]");
+}
+
+async function providerFetchAttempt(provider, endpoint, init) {
   init.signal?.throwIfAborted();
-  if (activeProviderCalls >= MAX_ACTIVE_PROVIDER_CALLS) throw httpError(429, "too many active provider requests");
-  activeProviderCalls += 1;
+  providerMetrics.attempts += 1;
   const headers = {
-    "content-type": "application/json",
+    // FormData must supply its own multipart boundary (audio transcription).
+    ...(typeof init.body === "string" ? { "content-type": "application/json" } : {}),
     ...(provider.api_key ? { authorization: `Bearer ${provider.api_key}` } : {}),
     "http-referer": "https://github.com/r266-tech/babata-sidebar",
     "x-title": "babata-sidebar",
@@ -444,34 +529,48 @@ async function providerFetch(provider, endpoint, init = {}) {
     // Keep the timeout alive until the body has arrived, not just the headers.
     if (Number(resp.headers.get("content-length")) > MAX_BODY_BYTES) {
       await resp.body?.cancel();
-      throw httpError(502, "provider response exceeded limit");
+      throw translationError("provider response exceeded limit", 502, "response_too_large");
     }
     const chunks = [];
     let bytes = 0;
     for await (const chunk of resp.body || []) {
       bytes += chunk.byteLength;
-      if (bytes > MAX_BODY_BYTES) throw httpError(502, "provider response exceeded limit");
+      if (bytes > MAX_BODY_BYTES) throw translationError("provider response exceeded limit", 502, "response_too_large");
       chunks.push(chunk);
     }
     let data;
     try { data = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
-    catch { throw httpError(resp.ok ? 502 : resp.status, `provider returned non-JSON data (HTTP ${resp.status})`); }
-    if (!resp.ok) throw httpError(resp.status, providerError(data) || `provider HTTP ${resp.status}`);
+    catch { data = null; }
+    if (!resp.ok) {
+      if (resp.status === 429) providerMetrics.rate_limits += 1;
+      throw translationError(
+        sanitizeProviderErrorMessage(providerError(data), provider.api_key) || `provider HTTP ${resp.status}${data === null ? " returned non-JSON data" : ""}`,
+        resp.status,
+        resp.status === 429 ? "provider_rate_limited" : "provider_http_error",
+        [408, 429, 500, 502, 503, 504].includes(resp.status),
+        retryAfterMs(resp.headers.get("retry-after")),
+      );
+    }
+    if (data === null) throw translationError("provider returned non-JSON data (HTTP 200)", 502, "invalid_provider_json");
+    for (const [metric, field] of [["prompt_tokens", "prompt_tokens"], ["completion_tokens", "completion_tokens"]]) {
+      const value = data?.usage?.[field];
+      if (Number.isSafeInteger(value) && value >= 0) providerMetrics[metric] += value;
+    }
     return data;
   } catch (err) {
     init.signal?.throwIfAborted();
-    if (controller.signal.aborted) throw httpError(504, "translation provider timed out");
+    if (controller.signal.aborted) throw translationError("translation provider timed out", 504, "provider_timeout", true);
+    if (err instanceof TypeError) throw translationError("provider network request failed", 503, "provider_network_error", true);
     throw err;
   } finally {
     init.signal?.removeEventListener("abort", abort);
     clearTimeout(timer);
-    activeProviderCalls -= 1;
   }
 }
 
 async function listProviderModels(config, payload, signal) {
   const provider = providerFrom(config, payload);
-  const data = await providerFetch(provider, "models", { method: "GET", headers: {}, signal });
+  const data = await providerFetch(provider, "models", { method: "GET", headers: {}, signal, priority: "interactive" });
   const raw = Array.isArray(data?.data) ? data.data : Array.isArray(data?.models) ? data.models : [];
   const models = raw
     .map((item) => {
@@ -496,11 +595,12 @@ function providerError(data) {
   return text(data.message);
 }
 
-async function chatCompletion(provider, messages, extra = {}, signal) {
+async function completionData(provider, messages, extra = {}, signal, priority = "visible") {
   if (!provider.model) throw httpError(400, "model is required");
   const data = await providerFetch(provider, "chat/completions", {
     method: "POST",
     signal,
+    priority,
     body: JSON.stringify({
       model: provider.model,
       messages,
@@ -509,92 +609,47 @@ async function chatCompletion(provider, messages, extra = {}, signal) {
     }),
   });
   const content = data?.choices?.[0]?.message?.content;
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content.map((part) => typeof part?.text === "string" ? part.text : "").join("");
-  }
-  throw httpError(502, "provider returned no text");
+  return {
+    content: typeof content === "string" ? content : Array.isArray(content) ? content.map((part) => typeof part?.text === "string" ? part.text : "").join("") : "",
+    finishReason: data?.choices?.[0]?.finish_reason,
+  };
+}
+
+async function chatCompletion(provider, messages, extra = {}, signal) {
+  const { content } = await completionData(provider, messages, extra, signal);
+  if (!content.trim()) throw translationError("provider returned no text", 502, "empty_output");
+  return content;
 }
 
 async function testProvider(config, payload, signal) {
   const provider = providerFrom(config, payload);
-  const translated = await chatCompletion(provider, [
-    { role: "system", content: "Translate the user's text to Simplified Chinese. Return only the translation." },
-    { role: "user", content: "Hello, world." },
-  ], {}, signal);
+  const result = await translationEngine.translate(provider, {
+    target: "zh", priority: "interactive",
+    batch: [
+      { hash: "test-plain", text: "Hello, world." },
+      { hash: "test-link", text: "Read [[BBT_LINK_1]]the introduction[[/BBT_LINK_1]] and [[BBT_FMT_1]]keep learning[[/BBT_FMT_1]]." },
+      { hash: "test-keep", text: "Keep this code unchanged: [[BBT_KEEP_1]] and the number 42." },
+    ],
+  }, signal, { force: true });
+  if (!result.complete) {
+    const first = result.errors[0];
+    throw translationError(`Translation capability test failed: ${first.message}`, first.status || 502, first.code, first.retryable, first.retry_after_ms);
+  }
+  const translated = result.results[0].translated;
+  if (!/\p{Script=Han}/u.test(translated)) throw translationError("Translation capability test returned no Chinese translation", 502, "test_not_translated");
+  if (!result.results[2].translated.includes("42")) throw translationError("Translation capability test changed a protected number", 502, "test_value_changed");
   return {
     ok: true,
-    translated: translated.trim(),
+    translated,
+    checked_items: result.results.length,
+    marker_protocol: "LINK/FMT/KEEP",
     translation_provider: providerPublic(provider),
   };
 }
 
 async function translateBatch(config, payload, signal) {
   const provider = providerFrom(config, payload.translation_provider || payload);
-  const target = text(payload.target) || "zh";
-  const batch = Array.isArray(payload.batch) ? payload.batch : [];
-  const normalized = batch
-    .map((item) => ({
-      hash: text(item?.hash),
-      text: typeof item?.text === "string" ? item.text : "",
-    }))
-    .filter((item) => item.hash && item.text.trim())
-    .slice(0, TRANSLATE_BATCH_MAX);
-  if (normalized.length === 0) return { ok: true, results: [] };
-  const content = await chatCompletion(provider, [
-    {
-      role: "system",
-      content:
-        "You translate visible web page text. Preserve URLs, code, numbers, emoji, product names, line breaks, and link markers like [[BBT_LINK_1]]...[[/BBT_LINK_1]] exactly around the translated text for that link. Return only JSON with shape {\"results\":[{\"hash\":\"...\",\"translated\":\"...\"}]}.",
-    },
-    {
-      role: "user",
-      content: JSON.stringify({
-        target,
-        site: text(payload.site),
-        url: text(payload.url),
-        batch: normalized,
-      }),
-    },
-  ], {}, signal);
-  const parsed = extractJson(content);
-  const rawResults = Array.isArray(parsed?.results) ? parsed.results : Array.isArray(parsed) ? parsed : [];
-  const wanted = new Set(normalized.map((item) => item.hash));
-  const results = rawResults
-    .map((item) => ({
-      hash: text(item?.hash),
-      translated: typeof item?.translated === "string" ? item.translated.trim() : "",
-    }))
-    .filter((item) => wanted.has(item.hash) && item.translated);
-  return { ok: true, results };
-}
-
-function extractJson(content) {
-  const raw = text(content);
-  if (!raw) throw httpError(502, "empty provider response");
-  try {
-    return JSON.parse(raw);
-  } catch {
-    const objectStart = raw.indexOf("{");
-    const objectEnd = raw.lastIndexOf("}");
-    if (objectStart !== -1 && objectEnd > objectStart) {
-      try {
-        return JSON.parse(raw.slice(objectStart, objectEnd + 1));
-      } catch {
-        /* fall through */
-      }
-    }
-    const arrayStart = raw.indexOf("[");
-    const arrayEnd = raw.lastIndexOf("]");
-    if (arrayStart !== -1 && arrayEnd > arrayStart) {
-      try {
-        return JSON.parse(raw.slice(arrayStart, arrayEnd + 1));
-      } catch {
-        /* fall through */
-      }
-    }
-  }
-  throw httpError(502, "provider did not return JSON");
+  return translationEngine.translate(provider, payload, signal);
 }
 
 function normalizeChatMessages(raw, fallbackMessage) {
@@ -1171,7 +1226,11 @@ async function route(req, res, signal) {
   if (req.method === "POST" && url.pathname === "/settings") {
     const body = await readJson(req);
     if (body.translation_provider !== undefined) validateProviderSettings(body.translation_provider);
+    if (body.transcription_provider !== undefined) validateProviderSettings(body.transcription_provider, "transcription_provider");
+    const changedScopes = [];
     const next = await updateConfig((current) => {
+      const previousTranslation = JSON.stringify(current.translation_provider);
+      const previousTranscription = JSON.stringify(current.transcription_provider);
       if (body.cpu !== undefined) {
         if (!isCpu(body.cpu)) throw httpError(400, "invalid cpu");
         current.cpu = body.cpu;
@@ -1187,7 +1246,25 @@ async function route(req, res, signal) {
           if (Object.prototype.hasOwnProperty.call(incoming, field)) current.translation_provider[field] = text(incoming[field]);
         }
       }
+      if (body.transcription_provider) {
+        const incoming = body.transcription_provider;
+        if (Object.prototype.hasOwnProperty.call(incoming, "base_url")) {
+          const nextBase = text(incoming.base_url);
+          const changed = nextBase ? !sameProviderDestination(nextBase, current.transcription_provider.base_url) : Boolean(current.transcription_provider.base_url);
+          if (changed) current.transcription_provider.api_key = "";
+          current.transcription_provider.base_url = nextBase;
+        }
+        for (const field of ["api_key", "model"]) {
+          if (Object.prototype.hasOwnProperty.call(incoming, field)) current.transcription_provider[field] = text(incoming[field]);
+        }
+      }
+      if (JSON.stringify(current.translation_provider) !== previousTranslation) changedScopes.push("translation");
+      if (JSON.stringify(current.transcription_provider) !== previousTranscription) changedScopes.push("transcription");
     });
+    if (changedScopes.length) {
+      const scope = changedScopes.length === 2 ? "all" : changedScopes[0];
+      for (const socket of wsClients) sendWsToSocket(socket, { kind: "notification", action: "translation_config_changed", args: { scope } });
+    }
     json(res, 200, { ok: true, ...settingsConfig(next) });
     return;
   }
@@ -1200,6 +1277,18 @@ async function route(req, res, signal) {
   }
   if (req.method === "POST" && url.pathname === "/translate/models") {
     json(res, 200, await listProviderModels(config, await readJson(req), signal));
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/translate/stats") {
+    json(res, 200, { ok: true, translation: translationEngine.stats(), provider: { ...providerMetrics, ...providerScheduler.stats() } });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/transcribe/capabilities") {
+    json(res, 200, transcriptionCapabilities(config.transcription_provider));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/transcribe") {
+    json(res, 200, await transcribeAudio(config.transcription_provider, await readJson(req), providerFetch, signal));
     return;
   }
   if (req.method === "POST" && url.pathname === "/translate/test") {
@@ -1244,7 +1333,9 @@ const server = http.createServer((req, res) => {
     if (res.headersSent) { res.end(); return; }
     const status = Number(err.status) || 500;
     if (status === 413) res.setHeader("connection", "close");
-    json(res, status, { ok: false, error: err.message || String(err) });
+    const detail = publicTranslationError(err);
+    if (detail.retry_after_ms) res.setHeader("retry-after", String(Math.ceil(detail.retry_after_ms / 1000)));
+    json(res, status, { ok: false, error: err.message || String(err), ...detail });
   }).finally(() => { res.off("close", abort); activeRequests.delete(controller); });
 });
 

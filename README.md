@@ -20,7 +20,14 @@ extension with a loopback companion server so users can bring their own:
   use them.
 - Optional prompt debug mode that shows the exact assembled chat prompt before
   each local model invocation.
-- Inline page translation and selection translation.
+- Inline page and selection translation, with near-viewport scheduling, shared
+  request deduplication, and bounded translation caches.
+- Paragraph formatting, links, and protected inline code stay attached to the
+  original page structure. Dynamic and virtualized pages reuse completed work.
+- Video subtitles from HTML5 text tracks, WebVTT/SRT files, and YouTube caption
+  responses, with original, bilingual, and translation-only display modes.
+- Optional, explicitly started audio transcription for uncaptioned videos whose
+  audio the browser can capture.
 - Dynamic local companion URL in the extension options page.
 - Dynamic translation provider settings: fetch model list, select a model, type
   a custom model, test, and save.
@@ -106,7 +113,7 @@ Useful environment variables:
 | `BABATA_CHAT_MAX_CONCURRENT` | `4` | Maximum simultaneous model turns. Additional requests receive HTTP 429. |
 | `BABATA_CHAT_TIMEOUT_MS` | `600000` | Per-model-invocation deadline; cancellation also terminates descendant processes. |
 | `BABATA_PROVIDER_TIMEOUT_MS` | `60000` | Translation-provider deadline, including response-body download. |
-| `BABATA_PROVIDER_MAX_CONCURRENT` | `8` | Concurrent provider operations (1–64); excess requests receive HTTP 429. |
+| `BABATA_PROVIDER_MAX_CONCURRENT` | `8` | Concurrent provider operations (1–64); excess work enters a bounded priority queue. |
 | `BABATA_SIDEBAR_ALLOWED_ORIGINS` | extension origins | Comma-separated extension origins trusted by the companion. Pin your extension ID to narrow access. |
 
 The extension options page can change the companion URL and translation
@@ -153,6 +160,74 @@ also derives the matching `/models` URL. Keyless local providers are supported.
 Provider redirects are rejected; configure the final API URL directly. A saved
 key is not reused for a different provider URL unless explicitly supplied.
 
+### Reading and video translation
+
+Translation starts with the visible content and a small area ahead of the
+viewport. Scrolling away does not discard successful translations. A page-local
+cache restores remounted content immediately; the companion reuses matching
+translations across pages and merges concurrent requests for the same text.
+Cache identity includes the provider, model, credential identity, target, source
+text, and prompt version. Changing a provider in settings invalidates page
+caches. Cached translations live in memory, not in a permanent browsing log.
+
+Source paragraphs stay readable while a translation is pending. Completed
+paragraphs replace their previous rendering together; intermediate model tokens
+are not inserted into the page. Links and emphasis use validated structural
+markers, and protected inline code is restored from the source DOM.
+
+Video controls appear over supported HTML5 players. Choose a caption track, use
+the display-mode control, or import a local `.vtt`/`.srt` subtitle file. Current
+captions have priority over prefetch; seeking cancels work for the old playback
+window. Display mode can be changed per player; font size is saved as a shared
+subtitle preference. Captions already
+in the target language do not make translation requests.
+
+Caption coverage depends on the player exposing a text track or an accessible
+subtitle response. Generic support is not a claim that every site's proprietary
+player is supported. Encrypted subtitles, closed player internals, and browser
+restrictions can require a site adapter or an imported subtitle file.
+
+For a video without captions, configure **Audio Base URL**, **Audio API key**,
+and **Audio Model** in extension settings. This service must accept an
+OpenAI-compatible `POST /audio/transcriptions` multipart request; it can be
+different from the text translation provider. Configuration can also use
+`BABATA_TRANSCRIPTION_BASE_URL`, `BABATA_TRANSCRIPTION_API_KEY`, and
+`BABATA_TRANSCRIPTION_MODEL`. It is disabled when no audio provider is configured.
+
+Click the player's transcription control to start recording accessible audio
+from that video. Audio is sent in short independent chunks; silence is skipped,
+and capture stops when disabled or the video is removed. Transcription has
+inherent recognition and translation latency, which the player indicates. The
+feature does not record the microphone or desktop audio. Protected media and
+some cross-origin streams cannot be captured; the player reports this instead
+of claiming to have generated subtitles.
+
+### Translation resource controls
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BABATA_TRANSLATE_BATCH_MAX` | `48` | Maximum items accepted in one batch; oversized batches fail explicitly. |
+| `BABATA_TRANSLATE_ITEM_MAX_CHARS` | `16000` | Maximum source characters in one submitted item. |
+| `BABATA_TRANSLATE_BATCH_MAX_CHARS` | `24000` | Total source character budget per request. |
+| `BABATA_TRANSLATE_CACHE_MAX_ENTRIES` | `5000` | Companion cache entry limit; `0` disables caching. |
+| `BABATA_TRANSLATE_CACHE_MAX_BYTES` | `16777216` | Companion cache memory budget. |
+| `BABATA_TRANSLATE_CACHE_TTL_MS` | `1800000` | Translation lifetime in the companion cache. |
+| `BABATA_TRANSLATE_PENDING_MAX_ITEMS` | `4096` | Bound on unfinished shared translation items. |
+| `BABATA_PROVIDER_QUEUE_MAX` | `128` | Maximum provider operations waiting for a worker or rate budget. |
+| `BABATA_PROVIDER_QUEUE_TIMEOUT_MS` | `30000` | Maximum time an operation may wait in the queue. |
+| `BABATA_PROVIDER_REQUESTS_PER_SECOND` | `4` | Sustained request budget per provider identity; fractional values are supported. |
+| `BABATA_PROVIDER_BURST` | `8` | Short burst allowance per provider identity. |
+| `BABATA_PROVIDER_MAX_RETRIES` | `1` | Additional attempts for transient provider failures. |
+| `BABATA_PROVIDER_RETRY_BASE_MS` | `400` | Base delay for bounded jittered retries. |
+| `BABATA_PROVIDER_RETRY_MAX_WAIT_MS` | `10000` | Maximum delay retried inside one request; longer cooldowns are returned to the caller. |
+| `BABATA_TRANSCRIPTION_RESPONSE_FORMAT` | `json` | Use `verbose_json` only when the audio provider supports timed segments. |
+
+The extension-origin-restricted loopback endpoint `GET /translate/stats` reports counts,
+cache hits, coalesced requests, queue waits, and bounded latency samples. It
+contains no source text, URLs, provider credentials, or translated text.
+`GET /health` includes the version and a startup source digest so a running
+companion can be distinguished from a newer checkout.
+
 ## Development
 
 ```bash
@@ -170,6 +245,8 @@ extension in a temporary browser profile, without using your everyday browser
 profile or paid model calls. Set `BABATA_TEST_BROWSER_PATH` to use another
 Chromium executable, and optionally `BABATA_TEST_SCREENSHOTS` to save UI captures.
 `npm run check` runs typechecking, unit/integration tests, and the build.
+`npm run check:all` also runs browser acceptance, including dynamic-page,
+format-preservation, cancellation, caption-timing, and audio-container checks.
 
 After source changes, restart the companion and reload the unpacked `dist/`
 extension to apply them to an existing installation.

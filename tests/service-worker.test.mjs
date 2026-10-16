@@ -9,7 +9,7 @@ const source = await readFile('src/service-worker.ts', 'utf8');
 const bundle = await build({ stdin: { contents: source + '\nexport { ensureOffscreen, actPageClickRef, snapshotStores, actBookmarksSearch, actBookmarksTree, actHistorySearch, requestCleanRead, sendToWs };', resolveDir: 'src', loader: 'ts' }, bundle: true, write: false, format: 'iife', globalName: 'sw' });
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-function host({ createDocument = async () => {}, fetchImpl = async () => new Response('{}'), executeScript } = {}) {
+function host({ createDocument = async () => {}, fetchImpl = async () => new Response('{}'), executeScript, runtimeSend } = {}) {
   const data = {};
   const sent = [];
   const events = {};
@@ -24,7 +24,7 @@ function host({ createDocument = async () => {}, fetchImpl = async () => new Res
   const tab = { id: 1, windowId: 10, active: true, url: 'https://article.test/one', title: 'Article' };
   let scripts = [];
   const chrome = {
-    runtime: { id, getURL: (path) => `chrome-extension://${id}/${path}`, getContexts: async () => [], onConnect: event('connect'), onMessage: event('message'), onInstalled: event('installed'), onStartup: event('startup'), sendMessage: async (message) => { sent.push(message); return {}; } },
+    runtime: { id, getURL: (path) => `chrome-extension://${id}/${path}`, getContexts: async () => [], onConnect: event('connect'), onMessage: event('message'), onInstalled: event('installed'), onStartup: event('startup'), sendMessage: async (message) => { sent.push(message); return runtimeSend ? runtimeSend(message) : {}; } },
     offscreen: { hasDocument: async () => false, Reason: { WORKERS: 'WORKERS' }, createDocument },
     storage: { local: store, session: store, onChanged: event('storage') },
     tabs: { query: async () => [tab], get: async () => ({ ...tab }), sendMessage: async (...args) => { sent.push(args); }, onActivated: event('activated'), onUpdated: event('updated'), onRemoved: event('removed') },
@@ -127,4 +127,55 @@ await test('navigation cancels clean-read and prevents the old result from reach
   assert.equal(await result, false);
   assert.equal(signal.aborted, true);
   assert.equal(h.sent.filter((message) => message?.action === 'clean_read_result' || message?.action === 'clean_read_error').length, 0);
+});
+
+await test('translation cancellation during offscreen startup prevents a late provider dispatch', async () => {
+  let release;
+  const h = host({ createDocument: () => new Promise((resolve) => { release = resolve; }) });
+  const sender = { id, url: 'https://article.test/one', tab: { id: 1 }, documentId: 'document-one' };
+  const pending = h.message({ type: 'babata.translate', request_id: 'cancelled-first', batch: [{ hash: 'a', text: 'Source' }] }, sender);
+  await tick();
+  await h.message({ type: 'babata.translate.cancel', request_id: 'cancelled-first' }, sender);
+  release();
+  assert.equal((await pending).aborted, true);
+  assert.equal(h.sent.some((message) => message.type === 'babata.offscreen.translation.request'), false);
+});
+
+await test('translation relay derives identity and source from the sender and keeps partial errors', async () => {
+  const response = { ok: false, partial: true, results: [{ hash: 'a', translated: '完成' }], errors: [{ hash: 'b', retryable: true }] };
+  const h = host({ runtimeSend: async (message) => message.type === 'babata.offscreen.translation.request' ? response : {} });
+  const sender = { id, url: 'https://article.test/one', tab: { id: 5 }, frameId: 2, documentId: 'document-two' };
+  const output = await h.message({ type: 'babata.translate', request_id: 'relay-one', url: 'https://forged.test/', priority: 'subtitle', batch: [{ hash: 'a', text: 'Source' }] }, sender);
+  assert.deepEqual(output, response);
+  const dispatched = h.sent.find((message) => message.type === 'babata.offscreen.translation.request');
+  assert.equal(dispatched.owner, 'tab:5:document-two');
+  assert.equal(dispatched.payload.url, sender.url);
+  assert.equal(dispatched.payload.priority, 'subtitle');
+  assert.equal(dispatched.payload.site, 'article.test');
+});
+
+await test('same-document URL changes preserve translations while document loads cancel them', async () => {
+  let release;
+  const h = host({ runtimeSend: async (message) => message.type === 'babata.offscreen.translation.request'
+    ? await new Promise((resolve) => { release = resolve; }) : {} });
+  const sender = { id, url: h.tab.url, tab: { id: 1 }, documentId: 'same-document' };
+  const pending = h.message({ type: 'babata.translate', request_id: 'spa-navigation', batch: [{ hash: 'a', text: 'Source' }] }, sender);
+  while (!release) await tick();
+  h.events.updated(1, { url: `${h.tab.url}#section` }, h.tab);
+  assert.equal(h.sent.some((message) => message.type === 'babata.offscreen.translation.cancel_tab'), false);
+  release({ ok: true, results: [{ hash: 'a', translated: '译文' }] });
+  assert.equal((await pending).ok, true);
+  h.events.updated(1, { status: 'loading' }, h.tab);
+  assert.equal(h.sent.some((message) => message.type === 'babata.offscreen.translation.cancel_tab'), true);
+});
+
+await test('a broken offscreen response port releases its subscription before retry', async () => {
+  const h = host({ runtimeSend: async (message) => {
+    if (message.type === 'babata.offscreen.translation.request') throw new Error('Message port closed');
+    return {};
+  } });
+  const sender = { id, url: h.tab.url, tab: { id: 1 }, documentId: 'broken-port' };
+  const result = await h.message({ type: 'babata.translate', request_id: 'port-lost', batch: [{ hash: 'a', text: 'Source' }] }, sender);
+  assert.equal(result.retryable, true);
+  assert.ok(h.sent.some((message) => message.type === 'babata.offscreen.translation.cancel' && message.request_id === 'port-lost' && message.owner === 'tab:1:broken-port'));
 });
