@@ -58,7 +58,7 @@ function installStyles(): void {
     .bbt-video-overlay [hidden] { display:none!important; }
     bbt-video-controls { position:absolute!important;right:auto!important;left:var(--bbt-controls-left,10px)!important;
       top:var(--bbt-controls-top,10px)!important;transform:translateX(-100%)!important;z-index:2147483646!important;
-      display:block!important;width:auto!important;height:auto!important;font-size:14px!important; }
+      display:block!important;width:max-content!important;height:auto!important;font-size:14px!important; }
   `;
   (document.head || document.documentElement).appendChild(style);
 }
@@ -139,7 +139,7 @@ class VideoSubtitleController {
       :host{font:13px/1.4 system-ui,sans-serif;color:#fff;color-scheme:dark;}
       *{box-sizing:border-box}button,select,input{font:inherit}button,select{color:#fff;background:#20252e;border:1px solid #ffffff38;border-radius:7px;padding:6px 9px;cursor:pointer}
       button:hover,select:hover{background:#343c49}button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid #8bc5ff;outline-offset:2px}
-      .toolbar{display:flex;gap:3px;justify-content:flex-end}.toggle{background:#18222ee6;opacity:.85}.toggle:hover{opacity:1}
+      .toolbar{display:flex;gap:3px;justify-content:flex-end;white-space:nowrap}.toggle{background:#18222ee6;opacity:.85}.toggle:hover{opacity:1}
       .panel{position:absolute;right:0;top:37px;width:248px;padding:12px;border:1px solid #ffffff24;border-radius:11px;background:#151a22f5;box-shadow:0 8px 25px #0005}
       .panel[hidden]{display:none}label{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:0 0 9px}select{max-width:155px;min-width:100px}input[type=range]{width:145px}
       .actions{display:flex;flex-wrap:wrap;gap:6px}.status{margin:10px 0 0;color:#c2ccd8;font-size:12px;line-height:1.5;overflow-wrap:anywhere}.file{display:none}

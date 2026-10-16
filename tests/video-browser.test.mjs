@@ -87,6 +87,8 @@ await test('video captions and explicit audio transcription in Chromium', { time
     assert.equal(await page.evaluate(() => requests.filter((message) => message.type === 'babata.translate').flatMap((message) => message.batch).filter((item) => item.text === 'Caption number 0.').length), 1);
     const geometry = await page.evaluate(() => ({ overlay: document.querySelector('.bbt-video-overlay').getBoundingClientRect().toJSON(), video: video.getBoundingClientRect().toJSON() }));
     assert.ok(geometry.overlay.top >= geometry.video.top && geometry.overlay.bottom <= geometry.video.bottom, 'captions must anchor inside the video, even in a tall article');
+    const toolbar = await page.locator('bbt-video-controls').evaluate((node) => node.shadowRoot.querySelector('.toolbar').getBoundingClientRect().toJSON());
+    assert.ok(toolbar.width > 100 && toolbar.height < 45, `toolbar must remain a readable horizontal row: ${JSON.stringify(toolbar)}`);
     assert.deepEqual(errors, []);
     await page.close();
   });
