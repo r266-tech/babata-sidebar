@@ -459,6 +459,10 @@ function startStableWindowTimer() {
   }, 50);
 }
 function teardownAll() {
+  // A detached extension context can reject an older message after a new
+  // engine has taken over the same document. Cleanup belongs to its first
+  // teardown only; a late rejection must not erase the replacement's DOM.
+  if (!active) return;
   active = false;
   lifecycle += 1;
   const w = window as unknown as { __babataTranslateBooted?: boolean };

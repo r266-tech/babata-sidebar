@@ -189,4 +189,30 @@ await test('page translation scheduling and source ownership in an isolated brow
     await expect(page.locator('#source')).toBeVisible();
     await page.close();
   });
+
+  await t.test('a late invalidation from a replaced engine cannot remove the current translation', async () => {
+    const { page, errors } = await fixture('<p id="source">An existing comment remains translated after an extension update.</p>');
+    await expect(page.locator('#source + .bbt-tr')).toContainText('译文');
+    await page.evaluate(() => {
+      const send = chrome.runtime.sendMessage;
+      let held = false;
+      chrome.runtime.sendMessage = (message) => {
+        if (!held && message.type === 'babata.attention') {
+          held = true;
+          return new Promise((_resolve, reject) => { window.rejectOldContext = reject; });
+        }
+        return send(message);
+      };
+      window.dispatchEvent(new Event('focus'));
+    });
+    await page.addScriptTag({ content: bundle });
+    await expect(page.locator('#source + .bbt-tr')).toContainText('译文');
+    await page.evaluate(() => rejectOldContext(new Error('Extension context invalidated.')));
+    await page.waitForTimeout(50);
+    await expect(page.locator('#bbt-mode-style')).toHaveCount(1);
+    await expect(page.locator('#source + .bbt-tr')).toContainText('译文');
+    assert.equal(await page.evaluate(() => window.__babataTranslateBooted), true);
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
 });

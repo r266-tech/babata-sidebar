@@ -18,6 +18,7 @@ import {
   resolveReachableServerOrigin,
   serverFetch,
 } from "./runtime-config";
+import { createTranslationContentRecovery } from "./content-recovery";
 
 // SW = 极薄 dispatcher.
 //
@@ -1625,17 +1626,24 @@ async function extractArticleFromTab(tabId: number): Promise<ArticleExtractResul
 
 // ── lifecycle ─────────────────────────────────────────────────────────
 
+const translationContentRecovery = createTranslationContentRecovery(chrome);
+
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel
     .setPanelBehavior({ openPanelOnActionClick: true })
     .catch(() => {});
   prepareOffscreen();
+  void translationContentRecovery.recoverExistingTabs();
 });
 
-chrome.runtime.onStartup.addListener(prepareOffscreen);
+chrome.runtime.onStartup.addListener(() => {
+  prepareOffscreen();
+  void translationContentRecovery.recoverExistingTabs();
+});
 
 chrome.tabs.onActivated.addListener((info) => {
   void chrome.tabs.get(info.tabId).then(rememberActivePage).catch(() => {});
+  void translationContentRecovery.recoverTab(info.tabId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {

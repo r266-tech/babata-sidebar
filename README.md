@@ -175,6 +175,10 @@ paragraphs replace their previous rendering together; intermediate model tokens
 are not inserted into the page. Links and emphasis use validated structural
 markers, and protected inline code is restored from the source DOM.
 
+Extension updates reconnect page translation in already-open HTTP(S) tabs.
+Recovery checks the current document before injecting missing code; it preserves
+the page, scroll position, and unsent inputs without reloading the website.
+
 Video controls appear over supported HTML5 players. Choose a caption track, use
 the display-mode control, or import a local `.vtt`/`.srt` subtitle file. Current
 captions have priority over prefetch; seeking cancels work for the old playback
