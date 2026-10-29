@@ -1,5 +1,8 @@
+import { connectCdp as connect, fetchJson as json, evaluateCdp as evalOn } from "./manual-smoke-cdp.mjs";
+import { smokeExtensionId } from "./manual-smoke-config.mjs";
+
 const CDP = process.env.BABATA_EDGE_CDP || "http://127.0.0.1:9222";
-const EXT_ID = process.env.BABATA_EXTENSION_ID || "giaglakcelnaklncmnhnpbmkfiffaflo";
+const EXT_ID = smokeExtensionId();
 const WAIT_MS = Number(process.env.BABATA_LINK_SMOKE_WAIT_MS || "2500");
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.BABATA_LINK_SMOKE_PORT || "18793");
@@ -9,60 +12,9 @@ const serverState = {
   lastTranslatePayload: null,
 };
 
-let nextId = 1;
-
-async function json(url, opts) {
-  const res = await fetch(url, opts);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${url}`);
-  return res.json();
-}
-
-function connect(wsUrl) {
-  const ws = new WebSocket(wsUrl);
-  const pending = new Map();
-  ws.addEventListener("message", (event) => {
-    const msg = JSON.parse(event.data);
-    if (!msg.id || !pending.has(msg.id)) return;
-    const { resolve, reject } = pending.get(msg.id);
-    pending.delete(msg.id);
-    if (msg.error) reject(new Error(JSON.stringify(msg.error)));
-    else resolve(msg.result);
-  });
-  return new Promise((resolve, reject) => {
-    ws.addEventListener("open", () => {
-      resolve({
-        send(method, params = {}) {
-          const id = nextId++;
-          ws.send(JSON.stringify({ id, method, params }));
-          return new Promise((res, rej) => pending.set(id, { resolve: res, reject: rej }));
-        },
-        close() {
-          ws.close();
-          ws.terminate?.();
-        },
-      });
-    }, { once: true });
-    ws.addEventListener("error", reject, { once: true });
-  });
-}
-
 async function findExtensionWorker() {
   const targets = await json(`${CDP}/json/list`);
   return targets.find((t) => t.type === "service_worker" && t.url.includes(EXT_ID));
-}
-
-async function evalOn(target, expression, awaitPromise = false) {
-  const client = await connect(target.webSocketDebuggerUrl);
-  try {
-    return await client.send("Runtime.evaluate", {
-      expression,
-      awaitPromise,
-      returnByValue: true,
-      userGesture: true,
-    });
-  } finally {
-    client.close();
-  }
 }
 
 async function reloadExtension() {
@@ -83,12 +35,12 @@ async function withStorage(worker, values, fn) {
   const keys = Object.keys(values);
   const before = await evalOn(worker, `chrome.storage.local.get(${JSON.stringify(keys)})`, true);
   const previous = before.result.value || {};
-  await evalOn(worker, `chrome.storage.local.set(${JSON.stringify(values)})`, true);
   try {
+    await evalOn(worker, `chrome.storage.local.set(${JSON.stringify(values)})`, true);
     return await fn();
   } finally {
     const current = await findExtensionWorker();
-    if (!current) return;
+    if (!current) throw new Error("extension service worker missing; smoke settings could not be restored");
     const restore = {};
     const remove = [];
     for (const key of keys) {
@@ -154,7 +106,7 @@ function corsHeaders(req) {
   return {
     "access-control-allow-origin": origin,
     "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type,authorization",
+    "access-control-allow-headers": "content-type,authorization,x-babata-client-id,x-babata-extension-origin",
     "content-type": "application/json; charset=utf-8",
   };
 }
@@ -166,10 +118,10 @@ function writeJson(req, res, body, status = 200) {
 
 async function runProbe() {
   const server = await startFakeCompanion();
-  const worker = await reloadExtension();
   let pageClient = null;
   let page = null;
   try {
+    const worker = await reloadExtension();
     await withStorage(worker, {
       "babata.server_origin": ORIGIN,
       "babata.translation_mode": "replace",

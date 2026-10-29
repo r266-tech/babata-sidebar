@@ -6,14 +6,19 @@ import {
   STORAGE_TRANSLATION_MODE,
   effectiveTranslationModeForUrl,
   normalizeTranslationRenderMode,
+  hostnameFromUrl,
+  updateAlwaysTranslateHostState,
 } from "./translation-settings";
 import {
+  DEFAULT_SERVER_ORIGIN,
   STORAGE_SERVER_ORIGIN,
   getServerOrigin,
+  getBrowserClientId,
   normalizeServerOrigin,
   resolveReachableServerOrigin,
   serverFetch,
 } from "./runtime-config";
+import { createTranslationContentRecovery } from "./content-recovery";
 
 // SW = 极薄 dispatcher.
 //
@@ -45,6 +50,7 @@ type SnapshotStore = {
   url: string;
   selectors: Record<string, string>;
   createdAt: number;
+  documentId?: string;
 };
 
 type SnapshotRawItem = SnapshotItem & { key: string };
@@ -72,6 +78,7 @@ type ArticleExtractResult = {
   paragraphs: ArticleParagraph[];
   char_count: number;
   extraction_method: string;
+  document_id?: string;
 };
 
 const lastSnapshotKeysByTab = new Map<number, { url: string; keys: Set<string> }>();
@@ -81,6 +88,98 @@ const SIDEPANEL_PORT = "babata-sidepanel";
 const CHAT_HISTORY_KEY_PREFIX = "babata.chat.history.v1";
 const CHAT_HISTORY_LATEST_KEY = `${CHAT_HISTORY_KEY_PREFIX}:latest`;
 const sidepanelPorts = new Set<chrome.runtime.Port>();
+const storageWrites = new Map<string, Promise<unknown>>();
+let offscreenCreation: Promise<void> | undefined;
+const cleanReadRuns = new Map<number, { id: string; controller: AbortController }>();
+const translationRuns = new Map<string, { tabId?: number; controller: AbortController; requestId: string; owner: string; kind: string }>();
+
+function translationOwner(sender: chrome.runtime.MessageSender): string {
+  return sender.tab?.id === undefined
+    ? `extension:${sender.url ?? "worker"}`
+    : `tab:${sender.tab.id}:${sender.documentId ?? `frame:${sender.frameId ?? 0}`}`;
+}
+
+function cancelTabTranslations(tabId: number) {
+  for (const run of translationRuns.values()) if (run.tabId === tabId) run.controller.abort();
+  // The offscreen registry also covers requests from a previous worker lifetime.
+  void chrome.runtime.sendMessage({ type: "babata.offscreen.translation.cancel_tab", tab_id: tabId }).catch(() => {});
+}
+
+async function broadcastTranslationConfig(scope: string) {
+  if (!["translation", "transcription", "all"].includes(scope)) return;
+  for (const run of translationRuns.values()) if (scope === "all" || scope === run.kind) run.controller.abort();
+  await chrome.runtime.sendMessage({ type: "babata.offscreen.translation.cancel_scope", scope }).catch(() => {});
+  const tabs = await chrome.tabs.query({});
+  await Promise.all(tabs.filter((tab) => tab.id !== undefined && isPageUrl(tab.url)).map((tab) =>
+    chrome.tabs.sendMessage(tab.id!, { type: "babata.translation_config_changed", scope }).catch(() => {}),
+  ));
+}
+
+async function relayTranslation(message: Record<string, unknown>, sender: chrome.runtime.MessageSender): Promise<unknown> {
+  const requestId = typeof message.request_id === "string" && /^[\w-]{1,100}$/.test(message.request_id)
+    ? message.request_id : crypto.randomUUID();
+  const owner = translationOwner(sender);
+  const key = `${owner}:${requestId}`;
+  if (translationRuns.has(key)) return { ok: false, results: [], retryable: false, error: "Duplicate translation request" };
+  const controller = new AbortController();
+  const run = { tabId: sender.tab?.id, requestId, owner, controller,
+    kind: message.type === "babata.transcribe" ? "transcription" : "translation" };
+  translationRuns.set(key, run);
+  const abort = () => {
+    void chrome.runtime.sendMessage({ type: "babata.offscreen.translation.cancel", owner, request_id: requestId }).catch(() => {});
+  };
+  controller.signal.addEventListener("abort", abort, { once: true });
+  try {
+    await ensureOffscreen();
+    controller.signal.throwIfAborted();
+    const preferred = await getServerOrigin();
+    const origin = preferred === DEFAULT_SERVER_ORIGIN ? preferred : await resolveReachableServerOrigin(preferred, controller.signal);
+    const clientId = await getBrowserClientId();
+    controller.signal.throwIfAborted();
+    const priority = ["interactive", "subtitle", "visible", "prefetch"].includes(String(message.priority)) ? message.priority : "visible";
+    const url = sender.tab ? sender.url ?? sender.tab.url ?? "" : typeof message.url === "string" ? message.url : "";
+    const payload = message.type === "babata.transcribe" ? {
+      audio_base64: message.audio_base64,
+      mime: message.mime,
+      duration_seconds: message.duration_seconds,
+      source: message.source,
+      sequence: message.sequence,
+      request_id: requestId,
+      priority: "subtitle",
+    } : {
+      site: hostnameFromUrl(url), url,
+      target: typeof message.target === "string" ? message.target : "zh",
+      batch: Array.isArray(message.batch) ? message.batch : [],
+      priority, request_id: requestId,
+    };
+    return await chrome.runtime.sendMessage({
+      type: "babata.offscreen.translation.request",
+      request_id: requestId, owner, tab_id: sender.tab?.id,
+      origin, client_id: clientId, endpoint: message.type === "babata.transcribe" ? "/transcribe" : "/translate", payload,
+    });
+  } catch (error) {
+    // A broken message port does not prove the offscreen HTTP request stopped.
+    // Release this subscription before the page retries through a new worker.
+    abort();
+    return { ok: false, results: [], text: "", aborted: controller.signal.aborted,
+      retryable: !controller.signal.aborted, error: (error as Error).message || "Translation connection failed" };
+  } finally {
+    controller.signal.removeEventListener("abort", abort);
+    if (translationRuns.get(key) === run) translationRuns.delete(key);
+  }
+}
+
+function serializeStorage<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const pending = (storageWrites.get(key) ?? Promise.resolve()).catch(() => {}).then(operation);
+  storageWrites.set(key, pending);
+  void pending.finally(() => { if (storageWrites.get(key) === pending) storageWrites.delete(key); }).catch(() => {});
+  return pending;
+}
+
+function snapshotMatches(record: Record<string, unknown> | null, message: Record<string, unknown>): boolean {
+  return (!Object.hasOwn(message, "expected_updated_at") || (record?.updated_at ?? null) === message.expected_updated_at)
+    && (!Object.hasOwn(message, "expected_turn_id") || (record?.active_turn_id ?? null) === message.expected_turn_id);
+}
 let lastActivePageContext: {
   tab_id: number;
   window_id: number;
@@ -137,7 +236,7 @@ async function findActivePageTab(windowId?: number): Promise<chrome.tabs.Tab | n
   if (lastActivePageContext?.tab_id) {
     try {
       const tab = await chrome.tabs.get(lastActivePageContext.tab_id);
-      if (tab?.id && isPageUrl(tab.url)) {
+      if (tab?.id && isPageUrl(tab.url) && (windowId === undefined || tab.windowId === windowId)) {
         rememberActivePage(tab);
         return tab;
       }
@@ -165,8 +264,8 @@ function sidePanelTargetFromMessage(
   let tabId = intMessageField(record, "tab_id", "tabId");
   let windowId = intMessageField(record, "window_id", "windowId");
 
-  if (sender.tab?.id !== undefined && tabId === undefined) tabId = sender.tab.id;
-  if (sender.tab?.windowId !== undefined && windowId === undefined) windowId = sender.tab.windowId;
+  if (sender.tab?.id !== undefined) tabId = sender.tab.id;
+  if (sender.tab?.windowId !== undefined) windowId = sender.tab.windowId;
   rememberActivePage(sender.tab);
 
   if (tabId !== undefined && tabId <= 0) tabId = undefined;
@@ -183,9 +282,9 @@ function rememberSidePanelOpenTarget(target: { tabId?: number; windowId?: number
   };
 }
 
-async function recentSidePanelOpenTab(): Promise<chrome.tabs.Tab | null> {
+async function recentSidePanelOpenTab(windowId?: number): Promise<chrome.tabs.Tab | null> {
   const target = lastSidePanelOpenTarget;
-  if (!target || Date.now() - target.ts > 10_000) return null;
+  if (!target || Date.now() - target.ts > 10_000 || (windowId !== undefined && target.window_id !== windowId)) return null;
   if (target.tab_id !== undefined) {
     try {
       const tab = await chrome.tabs.get(target.tab_id);
@@ -215,15 +314,11 @@ function sidePanelPathForTarget(target: { tabId?: number; windowId?: number }) {
 async function configureSidePanelForTarget(target: { tabId?: number; windowId?: number }) {
   if (target.tabId === undefined && target.windowId === undefined) return;
   const path = sidePanelPathForTarget(target);
-  try {
-    if (target.tabId !== undefined) {
-      await chrome.sidePanel.setOptions({ tabId: target.tabId, path, enabled: true });
-      return;
-    }
-    await chrome.sidePanel.setOptions({ path, enabled: true });
-  } catch (e) {
-    console.debug("[babata-sw] sidePanel.setOptions failed:", (e as Error)?.message ?? e);
+  if (target.tabId !== undefined) {
+    await chrome.sidePanel.setOptions({ tabId: target.tabId, path, enabled: true });
+    return;
   }
+  await chrome.sidePanel.setOptions({ path, enabled: true });
 }
 
 function notifySidePanelTarget(target: { tabId?: number; windowId?: number }) {
@@ -245,38 +340,33 @@ async function openSidePanelForTarget(target: { tabId?: number; windowId?: numbe
     await chrome.sidePanel.open(
       windowId !== undefined ? { tabId, windowId } : { tabId },
     );
-    void configureSidePanelForTarget(target);
+    void configureSidePanelForTarget(target).catch((error) => console.debug("[babata-sw] panel target unavailable", error));
     return;
   }
   if (windowId !== undefined) {
     await chrome.sidePanel.open({ windowId });
-    void configureSidePanelForTarget(target);
+    void configureSidePanelForTarget(target).catch((error) => console.debug("[babata-sw] panel target unavailable", error));
   }
 }
 
 async function ensureOffscreen() {
-  // chrome.offscreen.hasDocument 在某些版本不存在, 用 getContexts fallback.
-  try {
-    const has = await (chrome.offscreen as { hasDocument?: () => Promise<boolean> })
-      .hasDocument?.();
-    if (has) return;
-  } catch {
-    /* fall through */
-  }
-  try {
+  return offscreenCreation ??= (async () => {
+    const hasDocument = (chrome.offscreen as { hasDocument?: () => Promise<boolean> }).hasDocument;
+    if (hasDocument ? await hasDocument.call(chrome.offscreen) : (await chrome.runtime.getContexts({
+      contextTypes: ["OFFSCREEN_DOCUMENT" as chrome.runtime.ContextType],
+      documentUrls: [chrome.runtime.getURL("src/offscreen.html")],
+    })).length > 0) return;
     await chrome.offscreen.createDocument({
       url: "src/offscreen.html",
       reasons: [chrome.offscreen.Reason.WORKERS],
       justification:
         "Persistent WebSocket to babata server (MV3 SW idle bypass).",
     });
-  } catch (e) {
-    // 已存在的 document 会抛, 忽略.
-    const m = (e as Error).message ?? "";
-    if (!m.includes("Only a single offscreen document")) {
-      console.warn("[babata-sw] createOffscreenDocument failed", e);
-    }
-  }
+  })().finally(() => { offscreenCreation = undefined; });
+}
+
+function prepareOffscreen() {
+  void ensureOffscreen().catch((error) => console.warn("[babata-sw] offscreen unavailable", error));
 }
 
 function chatStorageKeyFromMessage(msg: unknown): string | null {
@@ -295,9 +385,9 @@ function normalizeChatSnapshot(raw: unknown): Record<string, unknown> | null {
 // ── messages from offscreen / sidepanel ──────────────────────────────
 
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== SIDEPANEL_PORT) return;
+  if (port.name !== SIDEPANEL_PORT || port.sender?.id !== chrome.runtime.id || !port.sender.url?.startsWith(chrome.runtime.getURL(""))) return;
   sidepanelPorts.add(port);
-  void ensureOffscreen();
+  prepareOffscreen();
   port.onMessage.addListener((msg) => {
     const m = msg as { type?: string; ts?: number } | undefined;
     if (m?.type === "babata.sidepanel_ping") {
@@ -315,7 +405,19 @@ chrome.runtime.onConnect.addListener((port) => {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== "object") return;
-  const m = msg as { type?: string; payload?: string };
+  const m = msg as { type?: string; payload?: string; connection_id?: string };
+  if (sender.id !== chrome.runtime.id) return;
+  const contentMessages = new Set([
+    "babata.current_tab_context", "babata.attention", "babata.translate_trace",
+    "babata.translate", "babata.toggle_sidebar", "babata.prepare_sidebar",
+    "babata.translate.cancel", "babata.transcribe", "babata.transcribe.capabilities",
+    "babata.suggest_prompts", "babata.agent_view", "babata.clean_read",
+    "babata.set_host_translation",
+  ]);
+  if (!sender.url?.startsWith(chrome.runtime.getURL("")) && !contentMessages.has(m.type ?? "")) {
+    sendResponse?.({ ok: false, error: "extension page required" });
+    return false;
+  }
 
   if (m.type === "babata.keepalive") {
     sendResponse?.({ ok: true });
@@ -325,7 +427,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (m.type === "babata.server_origin.get") {
     void (async () => {
       try {
-        sendResponse?.({ ok: true, origin: await resolveReachableServerOrigin(await getServerOrigin()) });
+        sendResponse?.({ ok: true, origin: await resolveReachableServerOrigin(await getServerOrigin()), client_id: await getBrowserClientId() });
       } catch (e) {
         sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
       }
@@ -334,7 +436,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (m.type === "babata.ws.inbound" && typeof m.payload === "string") {
-    handleWsInbound(m.payload).then(() => sendResponse?.({ ok: true }));
+    handleWsInbound(m.payload, m.connection_id).then(
+      () => sendResponse?.({ ok: true }),
+      (error) => sendResponse?.({ ok: false, error: (error as Error).message }),
+    );
+    return true;
+  }
+
+  if (m.type === "babata.set_host_translation") {
+    const enabled = (msg as Record<string, unknown>).enabled;
+    const host = sender.tab?.id !== undefined ? hostnameFromUrl(sender.url ?? sender.tab.url ?? "") : "";
+    if (!host || typeof enabled !== "boolean") {
+      sendResponse?.({ ok: false, error: "valid sender host and enabled flag required" });
+      return false;
+    }
+    void serializeStorage("translation-host-settings", async () => {
+      const current = await chrome.storage.local.get([STORAGE_ALWAYS_TRANSLATE_HOSTS, STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS]);
+      const next = updateAlwaysTranslateHostState(current[STORAGE_ALWAYS_TRANSLATE_HOSTS], current[STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS], host, enabled);
+      await chrome.storage.local.set({ [STORAGE_ALWAYS_TRANSLATE_HOSTS]: next.hosts, [STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS]: next.disabledHosts });
+      return { ok: true, ...next };
+    }).then(sendResponse, (error) => sendResponse?.({ ok: false, error: (error as Error).message }));
     return true;
   }
 
@@ -353,7 +474,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (m.type === "babata.active_page_context") {
     void (async () => {
       try {
-        const tab = await recentSidePanelOpenTab() ?? await findActivePageTab();
+        const windowId = intMessageField(msg as Record<string, unknown>, "window_id");
+        const tab = await recentSidePanelOpenTab(windowId) ?? await findActivePageTab(windowId);
         sendResponse?.({
           ok: !!tab?.id,
           tab_id: tab?.id,
@@ -377,11 +499,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse?.({ ok: false, error: "invalid chat snapshot" });
           return;
         }
-        await chrome.storage.local.set({
-          [key]: record,
-          [CHAT_HISTORY_LATEST_KEY]: record,
+        const result = await serializeStorage(key, async () => {
+          const current = normalizeChatSnapshot((await chrome.storage.local.get(key))[key]);
+          if (!snapshotMatches(current, msg as Record<string, unknown>)) return { ok: true, changed: false, record: current };
+          const next = { ...record, updated_at: Math.max(Date.now(), Number(current?.updated_at || 0) + 1) };
+          await chrome.storage.local.set({ [key]: next, [CHAT_HISTORY_LATEST_KEY]: next });
+          return { ok: true, changed: true, record: next };
         });
-        sendResponse?.({ ok: true });
+        sendResponse?.(result);
       } catch (e) {
         sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
       }
@@ -397,7 +522,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse?.({ ok: false, error: "invalid storage key" });
           return;
         }
-        await chrome.storage.local.remove([key, CHAT_HISTORY_LATEST_KEY]);
+        // Keep an empty snapshot so reopening a cleared chat cannot restore old
+        // server history. Other open surfaces receive the clear as a change.
+        await serializeStorage(key, async () => {
+          const current = normalizeChatSnapshot((await chrome.storage.local.get(key))[key]);
+          const empty = { version: 1, messages: [], streaming: false, updated_at: Math.max(Date.now(), Number(current?.updated_at || 0) + 1) };
+          await chrome.storage.local.set({ [key]: empty, [CHAT_HISTORY_LATEST_KEY]: empty });
+        });
         sendResponse?.({ ok: true });
       } catch (e) {
         sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
@@ -414,16 +545,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse?.({ ok: false, error: "invalid storage key" });
           return;
         }
-        const got = await chrome.storage.local.get([key]);
-        const record = normalizeChatSnapshot(got[key]);
-        if (record) {
-          const stopped = { ...record, streaming: false, updated_at: Date.now() };
-          await chrome.storage.local.set({
-            [key]: stopped,
-            [CHAT_HISTORY_LATEST_KEY]: stopped,
-          });
-        }
-        sendResponse?.({ ok: true });
+        const result = await serializeStorage(key, async () => {
+          const record = normalizeChatSnapshot((await chrome.storage.local.get(key))[key]);
+          if (!record || !snapshotMatches(record, msg as Record<string, unknown>)) return { ok: true, changed: false, record };
+          const stopped = { ...record, streaming: false, updated_at: Math.max(Date.now(), Number(record.updated_at || 0) + 1) };
+          await chrome.storage.local.set({ [key]: stopped, [CHAT_HISTORY_LATEST_KEY]: stopped });
+          return { ok: true, changed: true, record: stopped };
+        });
+        sendResponse?.(result);
       } catch (e) {
         sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
       }
@@ -434,7 +563,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (
     m.type === "babata.chat.start" ||
     m.type === "babata.chat.abort" ||
-    m.type === "babata.chat.clear"
+    m.type === "babata.chat.clear" ||
+    m.type === "babata.chat.status"
   ) {
     void (async () => {
       try {
@@ -442,6 +572,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const targetType =
           m.type === "babata.chat.start"
             ? "babata.offscreen.chat.start"
+            : m.type === "babata.chat.status"
+              ? "babata.offscreen.chat.status"
             : m.type === "babata.chat.abort"
               ? "babata.offscreen.chat.abort"
               : "babata.offscreen.chat.clear";
@@ -461,11 +593,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (m.type === "babata.attention") {
     void (async () => {
       try {
-        await serverFetch("/attention", {
+        const response = await serverFetch("/attention", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(m),
         });
+        await response.body?.cancel();
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         sendResponse?.({ ok: true });
       } catch (e) {
         sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
@@ -479,7 +613,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (m.type === "babata.translate_trace") {
     void (async () => {
       try {
-        await serverFetch("/translate_trace", {
+        const response = await serverFetch("/translate_trace", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
@@ -487,6 +621,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             traces: (m as { traces?: unknown }).traces ?? [],
           }),
         });
+        await response.body?.cancel();
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         sendResponse?.({ ok: true });
       } catch (e) {
         sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
@@ -495,31 +631,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // page-side 翻译模块的 batch 翻译请求 → forward 到 server /translate.
-  if (m.type === "babata.translate") {
+  if (m.type === "babata.translate.cancel") {
+    const requestId = (msg as Record<string, unknown>).request_id;
+    if (typeof requestId !== "string" || !/^[\w-]{1,100}$/.test(requestId)) return false;
+    const owner = translationOwner(sender);
+    translationRuns.get(`${owner}:${requestId}`)?.controller.abort();
+    void chrome.runtime.sendMessage({ type: "babata.offscreen.translation.cancel", owner, request_id: requestId }).catch(() => {});
+    sendResponse?.({ ok: true });
+    return false;
+  }
+
+  // Long provider requests live in the offscreen document. The worker only
+  // routes them and binds cancellation to the sending document.
+  if (m.type === "babata.translate" || m.type === "babata.transcribe") {
+    void relayTranslation(msg as Record<string, unknown>, sender).then(sendResponse);
+    return true;
+  }
+
+  if (m.type === "babata.transcribe.capabilities") {
     void (async () => {
       try {
-        const resp = await serverFetch("/translate", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            site: (m as { site?: string }).site ?? "",
-            url: (m as { url?: string }).url ?? "",
-            target: (m as { target?: string }).target ?? "zh",
-            batch: (m as { batch?: unknown }).batch ?? [],
-          }),
-        });
-        if (!resp.ok) {
-          sendResponse?.({ ok: false, error: `HTTP ${resp.status}` });
-          return;
-        }
-        const json = (await resp.json()) as { ok?: boolean; results?: unknown };
-        sendResponse?.({
-          ok: !!json.ok,
-          results: Array.isArray(json.results) ? json.results : [],
-        });
+        const response = await serverFetch("/transcribe/capabilities", { signal: AbortSignal.timeout(5000) });
+        sendResponse?.(await response.json());
       } catch (e) {
-        sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
+        sendResponse?.({ ok: false, available: false, error: (e as Error).message ?? String(e) });
       }
     })();
     return true;
@@ -530,10 +665,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     void (async () => {
       try {
         await openSidePanelForTarget(sidePanelTargetFromMessage(msg, sender));
-      } catch {
-        /* 静默 */
+        sendResponse?.({ ok: true });
+      } catch (e) {
+        sendResponse?.({ ok: false, error: (e as Error).message ?? String(e) });
       }
-      sendResponse?.({ ok: true });
     })();
     return true;
   }
@@ -599,9 +734,10 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   chrome.runtime
     .sendMessage({ type: "babata.server_origin.changed", origin })
     .catch(() => {});
+  void broadcastTranslationConfig("all").catch(() => {});
 });
 
-async function handleWsInbound(raw: string) {
+async function handleWsInbound(raw: string, connectionId?: string) {
   let inbound: { kind?: string; id?: string; action?: string; args?: Record<string, unknown> };
   try {
     inbound = JSON.parse(raw);
@@ -609,20 +745,30 @@ async function handleWsInbound(raw: string) {
     return;
   }
 
+  if (!inbound || typeof inbound !== "object" || Array.isArray(inbound)) return;
+  if (inbound.args !== undefined && (!inbound.args || typeof inbound.args !== "object" || Array.isArray(inbound.args))) {
+    if (typeof inbound.id === "string") sendToWs({ kind: "response", id: inbound.id, ok: false, error: "args must be an object" }, connectionId);
+    return;
+  }
+
   if (inbound.kind === "request" && typeof inbound.id === "string" && typeof inbound.action === "string") {
     try {
       const result = await dispatchAction(inbound.action, inbound.args ?? {});
-      sendToWs({ kind: "response", id: inbound.id, ok: true, result });
+      sendToWs({ kind: "response", id: inbound.id, ok: true, result }, connectionId);
     } catch (e) {
       const err = (e as Error).message ?? String(e);
-      sendToWs({ kind: "response", id: inbound.id, ok: false, error: err });
+      sendToWs({ kind: "response", id: inbound.id, ok: false, error: err }, connectionId);
     }
   } else if (inbound.kind === "notification") {
-    void dispatchNotification(inbound.action ?? "", inbound.args ?? {});
+    await dispatchNotification(typeof inbound.action === "string" ? inbound.action : "", inbound.args ?? {});
   }
 }
 
 async function dispatchNotification(action: string, args: Record<string, unknown>) {
+  if (action === "translation_config_changed") {
+    await broadcastTranslationConfig(String(args.scope ?? "all"));
+    return;
+  }
   const message = {
     type: "babata.notification",
     action,
@@ -632,6 +778,7 @@ async function dispatchNotification(action: string, args: Record<string, unknown
   if (action === "mascot_speak") {
     try {
       const tab = await targetTab(args);
+      if (typeof args.url === "string" && tab.url !== args.url) return;
       await chrome.tabs.sendMessage(tab.id!, message);
       return;
     } catch (e) {
@@ -646,13 +793,20 @@ async function dispatchNotification(action: string, args: Record<string, unknown
   if (action.startsWith("clean_read_")) {
     try {
       const tab = await targetTab(args);
-      await chrome.tabs.sendMessage(tab.id!, message);
+      if (typeof args.url === "string" && tab.url !== args.url) return;
+      const documentId = typeof args.document_id === "string" ? args.document_id : undefined;
+      if (documentId) {
+        const [current] = await chrome.scripting.executeScript({ target: { tabId: tab.id! }, func: () => location.href });
+        if (current?.documentId !== documentId || current.result !== args.url) return;
+      }
+      await chrome.tabs.sendMessage(tab.id!, message, documentId ? { documentId } : {});
     } catch (e) {
       console.debug(
         "[babata-sw] clean_read page notification dropped:",
         action,
         (e as Error)?.message ?? e,
       );
+      if (args.document_id) return;
     }
   }
 
@@ -668,11 +822,18 @@ async function dispatchNotification(action: string, args: Record<string, unknown
     });
 }
 
-function sendToWs(payload: object) {
+function sendToWs(payload: object, connectionId?: string) {
+  let encoded = JSON.stringify(payload);
+  // Bound the complete response as well as individual read operations. Return a
+  // useful tool error instead of closing the socket on an oversized result.
+  if (new TextEncoder().encode(encoded).byteLength > 4 * 1024 * 1024) {
+    encoded = JSON.stringify({ kind: "response", id: (payload as { id?: string }).id, ok: false, error: "Browser result exceeds 4 MiB; narrow the query or request fewer results." });
+  }
   chrome.runtime
     .sendMessage({
       type: "babata.ws.outbound",
-      payload: JSON.stringify(payload),
+      payload: encoded,
+      connection_id: connectionId,
     })
     .catch(() => {});
 }
@@ -763,7 +924,7 @@ async function actTabMetadata(args: Record<string, unknown>) {
     func: () => ({
       url: location.href,
       title: document.title,
-      selection: window.getSelection()?.toString() ?? "",
+      selection: (window.getSelection()?.toString() ?? "").slice(0, 20_000),
       scroll_y: window.scrollY,
       doc_height: document.documentElement.scrollHeight,
       lang: document.documentElement.lang || "",
@@ -773,12 +934,16 @@ async function actTabMetadata(args: Record<string, unknown>) {
   return result ? { ...result, tab_id: tab.id, window_id: tab.windowId } : null;
 }
 
+function boundedCount(value: unknown, fallback: number, max: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.min(Math.trunc(value), max)) : fallback;
+}
+
 async function actDomQuery(args: Record<string, unknown>) {
   const selector = typeof args.selector === "string" ? args.selector : "body";
   const root = typeof args.root === "string" ? args.root : null;
-  const limit = typeof args.limit === "number" ? args.limit : 50;
+  const limit = boundedCount(args.limit, 50, 250);
   const props = Array.isArray(args.props)
-    ? (args.props as string[])
+    ? [...new Set(args.props.filter((prop): prop is string => typeof prop === "string"))].slice(0, 16)
     : ["tag", "text"];
 
   const tab = await targetTab(args);
@@ -786,11 +951,37 @@ async function actDomQuery(args: Record<string, unknown>) {
     target: { tabId: tab.id! },
     args: [{ selector, root, limit, props }],
     func: (a: { selector: string; root: string | null; limit: number; props: string[] }) => {
-      const scope: Document | Element =
-        a.root && document.querySelector(a.root)
-          ? (document.querySelector(a.root) as Element)
-          : document;
-      const all = Array.from(scope.querySelectorAll(a.selector)).slice(0, a.limit);
+      const scope = a.root ? document.querySelector(a.root) : document;
+      if (!scope) return [];
+      const sensitive = (el: Element) => (
+        el instanceof HTMLInputElement && ["password", "hidden"].includes(el.type)
+      ) || (
+        (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)
+        && /(?:^|\s)(?:current-password|new-password|one-time-code)(?:$|\s)/i.test(el.autocomplete)
+      );
+      const safeHtml = (el: HTMLElement) => {
+        if (sensitive(el)) return "[redacted]";
+        const copy = el.cloneNode(true) as HTMLElement;
+        // Template contents are separate document fragments, not descendants of
+        // querySelectorAll, but are serialized as part of innerHTML.
+        const pending: ParentNode[] = [copy];
+        if (copy instanceof HTMLTemplateElement) pending.push(copy.content);
+        while (pending.length) {
+          const root = pending.pop()!;
+          for (const input of root.querySelectorAll("input,textarea")) {
+            if (!sensitive(input)) continue;
+            input.setAttribute("value", "[redacted]");
+            if (input instanceof HTMLTextAreaElement) input.textContent = "[redacted]";
+          }
+          for (const template of root.querySelectorAll("template")) pending.push(template.content);
+        }
+        return copy.innerHTML.slice(0, 2000);
+      };
+      const all: Element[] = [];
+      for (const node of scope.querySelectorAll(a.selector)) {
+        all.push(node);
+        if (all.length >= a.limit) break;
+      }
       return all.map((node) => {
         const el = node as HTMLElement;
         const out: Record<string, unknown> = {};
@@ -799,12 +990,15 @@ async function actDomQuery(args: Record<string, unknown>) {
           else if (p === "id" && el.id) out.id = el.id;
           else if (p === "class" && el.className) out.class = el.className;
           else if (p === "text") {
-            const t = (el.innerText ?? el.textContent ?? "").trim();
+            let t = sensitive(el) ? "[redacted]" : (el.innerText ?? el.textContent ?? "").trim();
+            for (const field of el.querySelectorAll("textarea")) {
+              if (sensitive(field) && field.textContent) t = t.replaceAll(field.textContent, "[redacted]");
+            }
             out.text = t.length > 1500 ? t.slice(0, 1500) + "…" : t;
           }
-          else if (p === "html") out.html = el.innerHTML?.slice(0, 2000) ?? "";
+          else if (p === "html") out.html = safeHtml(el);
           else if (p === "href") out.href = (el as HTMLAnchorElement).href ?? "";
-          else if (p === "value") out.value = (el as HTMLInputElement).value ?? "";
+          else if (p === "value") out.value = sensitive(el) ? "[redacted]" : ((el as HTMLInputElement).value ?? "").slice(0, 2000);
           else if (p === "name") out.name = (el as HTMLInputElement).name ?? "";
           else if (p === "type") out.type = (el as HTMLInputElement).type ?? "";
           else if (p === "placeholder") out.placeholder = (el as HTMLInputElement).placeholder ?? "";
@@ -818,7 +1012,7 @@ async function actDomQuery(args: Record<string, unknown>) {
             };
           } else if (p === "attrs") {
             const a2: Record<string, string> = {};
-            for (const at of Array.from(el.attributes)) a2[at.name] = at.value;
+            for (const at of Array.from(el.attributes).slice(0, 64)) a2[at.name] = at.name === "value" && sensitive(el) ? "[redacted]" : at.value.slice(0, 2000);
             out.attrs = a2;
           }
         }
@@ -976,8 +1170,9 @@ async function actPageSnapshot(args: Record<string, unknown>) {
         const aria = el.getAttribute("aria-label") || el.getAttribute("title") || "";
         if (aria.trim()) return oneLine(aria);
         if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+          const privateInput = (el instanceof HTMLInputElement && ["password", "hidden"].includes(el.type)) || /(?:^|\s)(?:current-password|new-password|one-time-code)(?:$|\s)/i.test(el.autocomplete);
           const inputText =
-            el.value ||
+            (privateInput ? "[redacted]" : el.value) ||
             el.placeholder ||
             el.getAttribute("name") ||
             el.getAttribute("type") ||
@@ -1124,6 +1319,7 @@ async function actPageSnapshot(args: Record<string, unknown>) {
     url: page.url,
     selectors,
     createdAt: Date.now(),
+    documentId: exec?.documentId,
   });
   pruneSnapshotStores();
 
@@ -1149,6 +1345,7 @@ async function actPageClickRef(args: Record<string, unknown>) {
   const snapshotId = typeof args.snapshot_id === "string" ? args.snapshot_id : "";
   const ref = typeof args.ref === "string" ? args.ref : "";
   if (!snapshotId || !ref) throw new Error("page_click_ref: snapshot_id and ref required");
+  pruneSnapshotStores();
   const store = snapshotStores.get(snapshotId);
   if (!store) throw new Error(`page_click_ref: snapshot not found or expired: ${snapshotId}`);
   const explicitTabId = intArg(args, "tab_id", "tabId");
@@ -1164,9 +1361,10 @@ async function actPageClickRef(args: Record<string, unknown>) {
     throw new Error("page_click_ref: snapshot is stale because the tab URL changed");
   }
   const [exec] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    args: [{ selector }],
-    func: (a: { selector: string }) => {
+    target: { tabId: tab.id, ...(store.documentId ? { documentIds: [store.documentId] } : {}) },
+    args: [{ selector, url: store.url }],
+    func: (a: { selector: string; url: string }) => {
+      if (location.href !== a.url) return { ok: false, reason: "document URL changed" };
       const el = document.querySelector(a.selector) as HTMLElement | null;
       if (!el) return { ok: false, reason: "selector no longer found", selector: a.selector };
       el.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
@@ -1210,7 +1408,7 @@ async function actArticleExtract(args: Record<string, unknown>) {
 
 async function actBookmarksSearch(args: Record<string, unknown>) {
   const query = typeof args.query === "string" ? args.query : "";
-  const max = typeof args.max_results === "number" ? args.max_results : 50;
+  const max = boundedCount(args.max_results, 50, 500);
   const results = await chrome.bookmarks.search(query);
   return results.slice(0, max).map((b) => ({
     id: b.id,
@@ -1223,10 +1421,16 @@ async function actBookmarksSearch(args: Record<string, unknown>) {
 
 type BmNode = chrome.bookmarks.BookmarkTreeNode;
 
-function stripFolders(node: BmNode): Record<string, unknown> {
+function stripFolders(node: BmNode, budget: { remaining: number }, depth = 0): Record<string, unknown> {
+  budget.remaining -= 1;
   const out: Record<string, unknown> = { id: node.id, title: node.title };
   if (node.children) {
-    const childFolders = node.children.filter((c) => !c.url).map(stripFolders);
+    const childFolders: Record<string, unknown>[] = [];
+    for (const child of node.children) {
+      if (child.url) continue;
+      if (budget.remaining <= 0 || depth >= 32) { out.truncated = true; break; }
+      childFolders.push(stripFolders(child, budget, depth + 1));
+    }
     if (childFolders.length > 0) out.children = childFolders;
   }
   return out;
@@ -1234,7 +1438,8 @@ function stripFolders(node: BmNode): Record<string, unknown> {
 
 async function actBookmarksTree() {
   const tree = await chrome.bookmarks.getTree();
-  return tree.map(stripFolders);
+  const budget = { remaining: 2000 };
+  return tree.slice(0, budget.remaining).map((node) => stripFolders(node, budget));
 }
 
 async function actBookmarksCreate(args: Record<string, unknown>) {
@@ -1297,7 +1502,8 @@ async function actHistorySearch(args: Record<string, unknown>) {
   const text = typeof args.text === "string" ? args.text : "";
   const startTime = typeof args.start_ms === "number" ? args.start_ms : 0;
   const endTime = typeof args.end_ms === "number" ? args.end_ms : Date.now();
-  const max = typeof args.max_results === "number" ? args.max_results : 100;
+  const max = boundedCount(args.max_results, 100, 500);
+  if (!Number.isFinite(startTime) || !Number.isFinite(endTime) || startTime < 0 || endTime < startTime) throw new Error("history_search: invalid time range");
   const items = await chrome.history.search({
     text,
     startTime,
@@ -1415,25 +1621,39 @@ async function extractArticleFromTab(tabId: number): Promise<ArticleExtractResul
   });
   const result = exec?.result as ArticleExtractResult | undefined;
   if (!result) throw new Error("article_extract: no result");
-  return result;
+  return { ...result, document_id: exec?.documentId };
 }
 
 // ── lifecycle ─────────────────────────────────────────────────────────
+
+const translationContentRecovery = createTranslationContentRecovery(chrome);
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel
     .setPanelBehavior({ openPanelOnActionClick: true })
     .catch(() => {});
-  ensureOffscreen();
+  prepareOffscreen();
+  void translationContentRecovery.recoverExistingTabs();
 });
 
-chrome.runtime.onStartup.addListener(() => ensureOffscreen());
+chrome.runtime.onStartup.addListener(() => {
+  prepareOffscreen();
+  void translationContentRecovery.recoverExistingTabs();
+});
 
 chrome.tabs.onActivated.addListener((info) => {
   void chrome.tabs.get(info.tabId).then(rememberActivePage).catch(() => {});
+  void translationContentRecovery.recoverTab(info.tabId);
 });
 
-chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  // URL-only changes include hash navigation and history.pushState in the same
+  // document. Its translation subscribers still own their pending work.
+  if (changeInfo.status === "loading") cancelTabTranslations(tabId);
+  if (changeInfo.url || changeInfo.status === "loading") {
+    cleanReadRuns.get(tabId)?.controller.abort();
+    cleanReadRuns.delete(tabId);
+  }
   if (tab.active && (changeInfo.url || changeInfo.title || changeInfo.status === "complete")) {
     rememberActivePage(tab);
   }
@@ -1485,7 +1705,7 @@ async function requestProactive(tabId: number, intent: ProactiveIntent): Promise
   }
 
   try {
-    await serverFetch("/proactive", {
+    const response = await serverFetch("/proactive", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -1497,7 +1717,8 @@ async function requestProactive(tabId: number, intent: ProactiveIntent): Promise
         intent,
       }),
     });
-    return true;
+    await response.body?.cancel();
+    return response.ok;
   } catch {
     /* server 没起 — 静默 (feedback_self_heal_no_escalate). */
     return false;
@@ -1524,50 +1745,42 @@ async function requestCleanRead(tabId: number): Promise<boolean> {
     return false;
   }
 
-  const runId = `${tabId}-${Date.now().toString(36)}-${Math.random()
-    .toString(36)
-    .slice(2, 7)}`;
-  void dispatchNotification("clean_read_started", {
-    run_id: runId,
-    url,
-    title: tab.title ?? "",
-    tab_id: tabId,
-    window_id: tab.windowId,
-  });
-
+  cleanReadRuns.get(tabId)?.controller.abort();
+  const run = { id: crypto.randomUUID(), controller: new AbortController() };
+  cleanReadRuns.set(tabId, run);
+  let documentId: string | undefined;
+  const current = () => cleanReadRuns.get(tabId) === run && !run.controller.signal.aborted;
+  const metadata = () => ({ run_id: run.id, url, title: tab.title ?? "", tab_id: tabId, window_id: tab.windowId, document_id: documentId });
   try {
     const article = await extractArticleFromTab(tabId);
-    if (!article.text.trim() || article.char_count < 200) {
-      throw new Error("没抽到足够正文");
-    }
+    documentId = article.document_id;
+    if (!current() || article.url !== url) return false;
+    await dispatchNotification("clean_read_started", metadata());
+    if (!article.text.trim() || article.char_count < 200) throw new Error("没抽到足够正文");
     const resp = await serverFetch("/clean_read", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        run_id: runId,
-        url,
-        title: tab.title ?? article.title ?? "",
-        tab_id: tabId,
-        window_id: tab.windowId,
-        article,
-      }),
+      signal: AbortSignal.any([run.controller.signal, AbortSignal.timeout(120_000)]),
+      body: JSON.stringify({ ...metadata(), article }),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json() as { ok?: boolean; result?: Record<string, unknown> };
+    if (!data?.ok || !data.result || typeof data.result.markdown !== "string") throw new Error("净化阅读返回了无效结果");
+    if (!current()) return false;
+    await dispatchNotification("clean_read_result", { ...data.result, ...metadata() });
     return true;
   } catch (e) {
-    void dispatchNotification("clean_read_error", {
-      run_id: runId,
-      url,
-      title: tab.title ?? "",
-      error: (e as Error).message ?? String(e),
-      tab_id: tabId,
-      window_id: tab.windowId,
-    });
+    if (current()) await dispatchNotification("clean_read_error", { ...metadata(), error: (e as Error).message ?? String(e) });
     return false;
+  } finally {
+    if (cleanReadRuns.get(tabId) === run) cleanReadRuns.delete(tabId);
   }
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  cancelTabTranslations(tabId);
+  cleanReadRuns.get(tabId)?.controller.abort();
+  cleanReadRuns.delete(tabId);
   lastSnapshotKeysByTab.delete(tabId);
   for (const [snapshotId, store] of snapshotStores) {
     if (store.tabId === tabId) snapshotStores.delete(snapshotId);
@@ -1584,6 +1797,6 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
   }
 });
 
-ensureOffscreen();
+prepareOffscreen();
 
 export {};

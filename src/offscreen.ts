@@ -1,4 +1,6 @@
 /// <reference types="chrome" />
+import { boundDebugPromptHistory } from "./chat-debug-history";
+import { abortTranslationRequests, handleOffscreenTranslation } from "./offscreen-translation";
 
 import {
   DEFAULT_SERVER_ORIGIN,
@@ -142,6 +144,7 @@ type ChatStartMessage = {
   page_context?: LightContext;
   attachments?: WireAttachment[];
   debug_prompt?: boolean;
+  cpu?: string;
 };
 
 type ActiveChatRun = {
@@ -150,12 +153,17 @@ type ActiveChatRun = {
   controller: AbortController;
   messages: Msg[];
   discard: boolean;
+  finished: Promise<void>;
 };
 
 let ws: WebSocket | null = null;
 let reconnectAttempt = 0;
 let reconnectTimer: number | null = null;
 let activeServerOrigin = DEFAULT_SERVER_ORIGIN;
+let browserClientId = "";
+let connecting = false;
+let connectionGeneration = 0;
+let bridgeConnectionId = "";
 const activeChatRuns = new Map<string, ActiveChatRun>();
 
 const PAGE_READ_TOOLS = new Set(["tab_metadata", "page_snapshot", "dom_query", "article_extract"]);
@@ -331,7 +339,7 @@ function sanitizeDebugPromptsForStorage(raw: unknown): DebugPromptTrace[] {
 }
 
 function sanitizeMsgsForStorage(messages: Msg[]): Msg[] {
-  return messages.slice(-CHAT_HISTORY_MAX_MESSAGES).map((msg) => {
+  return boundDebugPromptHistory(messages.slice(-CHAT_HISTORY_MAX_MESSAGES).map((msg) => {
     const out: Msg = {
       role: msg.role,
       text: truncateText(msg.text, CHAT_TEXT_MAX_CHARS),
@@ -349,7 +357,7 @@ function sanitizeMsgsForStorage(messages: Msg[]): Msg[] {
     if (typeof msg.clean_read_id === "string") out.clean_read_id = msg.clean_read_id;
     if (msg.pending) out.pending = true;
     return out;
-  });
+  }));
 }
 
 function msgsForModelWire(messages: Msg[]): Array<{ role: Msg["role"]; text: string }> {
@@ -364,7 +372,8 @@ function msgsForModelWire(messages: Msg[]): Array<{ role: Msg["role"]; text: str
 
 function normalizeStoredMsgs(raw: unknown): Msg[] {
   if (!Array.isArray(raw)) return [];
-  return raw
+  return boundDebugPromptHistory(raw
+    .slice(-CHAT_HISTORY_MAX_MESSAGES)
     .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
     .filter((item) => item.role === "user" || item.role === "assistant")
     .map((item) => {
@@ -404,7 +413,7 @@ function normalizeStoredMsgs(raw: unknown): Msg[] {
       if (typeof item.clean_read_id === "string") msg.clean_read_id = item.clean_read_id;
       if (item.pending === true) msg.pending = true;
       return msg;
-    });
+    }));
 }
 
 async function writeSavedChatHistory(
@@ -590,7 +599,7 @@ function normalizeChatStartMessage(msg: unknown): ChatStartMessage | null {
   const item = msg as Record<string, unknown>;
   if (
     item.type !== "babata.offscreen.chat.start" ||
-    typeof item.storage_key !== "string" ||
+    !storageKeyFromMessage(msg) ||
     typeof item.message !== "string"
   ) {
     return null;
@@ -608,18 +617,19 @@ function normalizeChatStartMessage(msg: unknown): ChatStartMessage | null {
         name: typeof a.name === "string" ? a.name : "attachment",
         mime: typeof a.mime === "string" ? a.mime : "application/octet-stream",
         size: typeof a.size === "number" ? a.size : 0,
-        data_base64: typeof a.data_base64 === "string" ? a.data_base64 : "",
+        data_base64: "",
       }))
     : undefined;
   return {
     type: "babata.offscreen.chat.start",
-    storage_key: item.storage_key,
+    storage_key: item.storage_key as string,
     turn_id: typeof item.turn_id === "string" ? item.turn_id : undefined,
     message: item.message,
     messages: item.messages,
     page_context: pageContext,
     attachments,
     debug_prompt: item.debug_prompt === true,
+    cpu: typeof item.cpu === "string" ? item.cpu : undefined,
   };
 }
 
@@ -633,7 +643,7 @@ async function abortChat(key: string): Promise<void> {
   const run = activeChatRuns.get(key);
   if (run) {
     run.controller.abort();
-    await writeSavedChatHistory(key, run.messages, false, run.turnId);
+    await run.finished;
     return;
   }
   const resp = await chrome.runtime.sendMessage({
@@ -650,11 +660,12 @@ async function clearChat(key: string): Promise<void> {
     run.discard = true;
     activeChatRuns.delete(key);
     run.controller.abort();
+    await run.finished;
   }
-  await clearSavedChatHistory(key);
+  if (!activeChatRuns.has(key)) await clearSavedChatHistory(key);
 }
 
-async function startChat(req: ChatStartMessage): Promise<void> {
+async function startChat(req: ChatStartMessage, acknowledge: (result: { ok: boolean; error?: string }) => void): Promise<void> {
   const key = req.storage_key;
   const previous = activeChatRuns.get(key);
   if (previous) {
@@ -669,16 +680,19 @@ async function startChat(req: ChatStartMessage): Promise<void> {
     messages.push({ role: "assistant", text: "" });
   }
 
+  let finishRun!: () => void;
   const run: ActiveChatRun = {
     key,
     turnId,
     controller: new AbortController(),
     messages,
     discard: false,
+    finished: new Promise<void>((resolve) => { finishRun = resolve; }),
   };
   activeChatRuns.set(key, run);
 
   let streaming = true;
+  let acknowledged = false;
   let flushTimer: number | null = null;
   let writeChain: Promise<void> = Promise.resolve();
 
@@ -688,9 +702,22 @@ async function startChat(req: ChatStartMessage): Promise<void> {
     const streamingSnapshot = streaming;
     writeChain = writeChain
       .catch(() => {})
-      .then(() => writeSavedChatHistory(key, messages, streamingSnapshot, turnId))
+      .then(() => isCurrentRun() ? writeSavedChatHistory(key, messages, streamingSnapshot, turnId) : undefined)
       .catch((e) => {
         console.warn("[babata-offscreen] chat snapshot write failed", e);
+        if (isCurrentRun()) {
+          // A failed disk write must not leave an open panel stuck on Stop or
+          // silently hide its final answer. Keep the live copy visible, with a
+          // clear warning that reload recovery is not guaranteed.
+          void chrome.runtime.sendMessage({
+            type: "babata.chat.snapshot_error",
+            storage_key: key,
+            turn_id: turnId,
+            messages: sanitizeMsgsForStorage(messages),
+            streaming: streamingSnapshot,
+            error: `聊天记录保存失败：${(e as Error)?.message ?? String(e)}。当前内容可能无法在重载后恢复。`,
+          }).catch(() => {});
+        }
       });
     return writeChain;
   };
@@ -716,18 +743,26 @@ async function startChat(req: ChatStartMessage): Promise<void> {
     }
   };
 
-  await writeSavedChatHistory(key, run.messages, true, turnId);
-
   try {
-    const resp = await fetch(serverUrlFromOrigin(activeServerOrigin, "/chat"), {
+    await previous?.finished;
+    if (!isCurrentRun()) throw new Error("chat cancelled before start");
+    await writeSavedChatHistory(key, run.messages, true, turnId);
+    acknowledged = true;
+    acknowledge({ ok: true });
+    if (!isCurrentRun()) return;
+    const routing = await readServerRoutingFromSw();
+    if (!isCurrentRun()) return;
+    const resp = await fetch(serverUrlFromOrigin(routing.origin, "/chat"), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-babata-client-id": routing.clientId },
       body: JSON.stringify({
         message: req.message,
         messages: msgsForModelWire(run.messages),
         page_context: req.page_context ?? undefined,
         attachments: req.attachments && req.attachments.length > 0 ? req.attachments : undefined,
         debug_prompt: req.debug_prompt === true,
+        cpu: req.cpu,
+        conversation_id: key,
       }),
       signal: run.controller.signal,
     });
@@ -759,6 +794,7 @@ async function startChat(req: ChatStartMessage): Promise<void> {
         } catch {
           continue;
         }
+        if (!ev || typeof ev !== "object") continue;
         if (ev.type === "text_delta" && typeof ev.text === "string") {
           run.messages = appendAssistant(run.messages, ev.text);
           flush();
@@ -782,9 +818,12 @@ async function startChat(req: ChatStartMessage): Promise<void> {
     if (sawDone) {
       streaming = false;
       await flush(true);
+    } else {
+      throw new Error("chat stream ended before completion");
     }
   } catch (e) {
     const m = e as { name?: string; message?: string };
+    if (!acknowledged) acknowledge({ ok: false, error: m?.message ?? String(e) });
     if (m?.name !== "AbortError" && isCurrentRun()) {
       run.messages = appendAssistant(run.messages, `\n\n[network] ${m?.message ?? String(e)}`);
     }
@@ -795,9 +834,20 @@ async function startChat(req: ChatStartMessage): Promise<void> {
     }
     if (isCurrentRun()) {
       streaming = false;
+      run.messages = updateLastAssistant(run.messages, (last) => ({
+        ...last,
+        tools: last.tools?.map((tool) => tool.status === "running"
+          ? { ...tool, status: "error", is_error: true, result: "操作已中止" }
+          : tool),
+        parts: last.parts?.map((part) => part.type === "page_read" && part.status === "running"
+          ? { ...part, status: "error", is_error: true }
+          : part),
+      }));
       await enqueueWrite();
-      activeChatRuns.delete(key);
+      if (isCurrentRun()) activeChatRuns.delete(key);
     }
+    await writeChain;
+    finishRun();
   }
 }
 
@@ -814,51 +864,65 @@ function scheduleReconnect() {
   }, delay);
 }
 
-async function readServerOriginFromSw(): Promise<string> {
-  try {
-    const resp = await chrome.runtime.sendMessage({ type: "babata.server_origin.get" }) as
-      | { ok?: boolean; origin?: string }
-      | undefined;
-    return normalizeServerOrigin(resp?.origin);
-  } catch {
-    return DEFAULT_SERVER_ORIGIN;
-  }
+async function readServerRoutingFromSw(): Promise<{ origin: string; clientId: string }> {
+  const resp = await chrome.runtime.sendMessage({ type: "babata.server_origin.get" }) as
+    | { ok?: boolean; origin?: string; client_id?: string }
+    | undefined;
+  if (!resp?.ok || !resp.client_id) throw new Error("companion routing unavailable");
+  return { origin: normalizeServerOrigin(resp.origin), clientId: resp.client_id };
 }
 
 function connect() {
+  if (connecting) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
+  const generation = connectionGeneration;
   void (async () => {
-    activeServerOrigin = await readServerOriginFromSw();
-    const socket = new WebSocket(wsUrlFromOrigin(activeServerOrigin));
+    connecting = true;
+    const routing = await readServerRoutingFromSw();
+    if (generation !== connectionGeneration) return;
+    activeServerOrigin = routing.origin;
+    browserClientId = routing.clientId;
+    const url = new URL(wsUrlFromOrigin(activeServerOrigin));
+    url.searchParams.set("client_id", browserClientId);
+    const socket = new WebSocket(url);
     ws = socket;
     attachWsHandlers(socket);
-  })().catch(() => scheduleReconnect());
+  })().catch(() => {
+    if (generation === connectionGeneration) scheduleReconnect();
+  }).finally(() => {
+    connecting = false;
+    if (generation !== connectionGeneration) connect();
+  });
 }
 
 function attachWsHandlers(socket: WebSocket) {
+  const connectionId = crypto.randomUUID();
+  bridgeConnectionId = connectionId;
   socket.addEventListener("open", () => {
     reconnectAttempt = 0;
     console.log("[babata-offscreen] ws connected");
   });
   socket.addEventListener("close", () => {
     console.log("[babata-offscreen] ws closed");
-    if (ws === socket) ws = null;
-    scheduleReconnect();
+    if (ws === socket) { ws = null; scheduleReconnect(); }
   });
   socket.addEventListener("error", () => {
     /* close handler 触发 reconnect */
   });
   socket.addEventListener("message", (ev) => {
+    if (ws !== socket) return;
     // forward 到 SW. SW cold-start 时 sendMessage reject (no receiver), 100ms
     // 后重试一次 — 不重试就 server 等 30s timeout, request 白丢.
     const payload = typeof ev.data === "string" ? ev.data : "";
-    const send = () =>
-      chrome.runtime.sendMessage({
+    const send = () => ws === socket
+      ? chrome.runtime.sendMessage({
         type: "babata.ws.inbound",
         payload,
-      });
+        connection_id: connectionId,
+      })
+      : Promise.resolve();
     send().catch(() => {
       window.setTimeout(() => {
         send().catch((e) => {
@@ -873,7 +937,14 @@ function attachWsHandlers(socket: WebSocket) {
 }
 
 function reconnectToServerOrigin(origin: string) {
-  activeServerOrigin = normalizeServerOrigin(origin);
+  const normalized = normalizeServerOrigin(origin);
+  connectionGeneration += 1;
+  if (normalized !== activeServerOrigin) {
+    for (const run of activeChatRuns.values()) run.controller.abort();
+    abortTranslationRequests();
+  }
+  bridgeConnectionId = "";
+  activeServerOrigin = normalized;
   reconnectAttempt = 0;
   if (reconnectTimer !== null) {
     window.clearTimeout(reconnectTimer);
@@ -891,15 +962,22 @@ function reconnectToServerOrigin(origin: string) {
 
 // SW 想发消息出去, 通过 chrome.runtime.sendMessage with type babata.ws.outbound
 // 转给我 — 我 ws.send. SW 没 ws 引用, 必须经我.
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== "object") return;
-  const m = msg as { type?: string; payload?: string; origin?: string };
+  if (sender.id !== chrome.runtime.id || sender.tab) return;
+  const translation = handleOffscreenTranslation(msg as Record<string, unknown>);
+  if (translation) {
+    void translation.then(sendResponse, (error) => sendResponse?.({ ok: false, results: [], retryable: true, error: String(error?.message ?? error) }));
+    return true;
+  }
+  const m = msg as { type?: string; payload?: string; origin?: string; connection_id?: string };
   if (m.type === "babata.server_origin.changed") {
     reconnectToServerOrigin(m.origin ?? DEFAULT_SERVER_ORIGIN);
     sendResponse?.({ ok: true });
     return false;
   }
   if (m.type === "babata.ws.outbound" && typeof m.payload === "string") {
+    if (m.connection_id !== bridgeConnectionId) return false;
     if (ws && ws.readyState === WebSocket.OPEN) {
       try {
         ws.send(m.payload);
@@ -918,11 +996,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse?.({ ok: false, error: "invalid chat start" });
       return false;
     }
-    void startChat(req)
+    void startChat(req, (result) => sendResponse?.(result))
       .catch((e) => {
         console.warn("[babata-offscreen] chat start failed", e);
+        sendResponse?.({ ok: false, error: (e as Error).message });
       });
-    sendResponse?.({ ok: true });
+    return true;
+  }
+
+  if (m.type === "babata.offscreen.chat.status") {
+    const key = storageKeyFromMessage(msg);
+    const run = key ? activeChatRuns.get(key) : undefined;
+    sendResponse?.({ ok: true, streaming: !!run && !run.controller.signal.aborted, turn_id: run?.turnId });
     return false;
   }
 

@@ -1,6 +1,5 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss" source("./");
+@config "../tailwind.config.js";
 
 /* Warm neutral theme. CSS variables keep future light/dark changes local. */
 :root {
@@ -150,8 +149,7 @@ html, body, #app {
 }
 
 .bbt-cpu-switch {
-  display: inline-grid;
-  grid-template-columns: repeat(2, minmax(2.05rem, auto));
+  display: inline-flex;
   align-items: center;
   height: 1.5rem;
   padding: 0.12rem;

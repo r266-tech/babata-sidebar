@@ -2,6 +2,7 @@ import { render } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
+import { boundDebugPromptHistory } from "./chat-debug-history";
 import {
   DEFAULT_SERVER_ORIGIN,
   STORAGE_SERVER_ORIGIN,
@@ -81,10 +82,11 @@ type LightContext = {
   selection?: string;
 };
 
-type CpuName = "claude" | "codex";
+type CpuName = string;
 type CpuChoice = {
   name: CpuName;
   label: string;
+  short_label?: string;
   current?: boolean;
   available?: boolean;
 };
@@ -101,7 +103,6 @@ type PinnedTarget = { tab_id?: number; window_id?: number };
 
 const SIDEPANEL_PORT = "babata-sidepanel";
 const CHAT_HISTORY_KEY_PREFIX = "babata.chat.history.v1";
-const CHAT_HISTORY_LATEST_KEY = `${CHAT_HISTORY_KEY_PREFIX}:latest`;
 const CHAT_HISTORY_MAX_MESSAGES = 200;
 const CHAT_TEXT_MAX_CHARS = 120_000;
 const CHAT_TOOL_TEXT_MAX_CHARS = 12_000;
@@ -169,7 +170,7 @@ function isPageReadTool(name: string, input?: unknown): boolean {
 }
 
 function isCpuName(value: unknown): value is CpuName {
-  return value === "claude" || value === "codex";
+  return typeof value === "string" && /^[a-z0-9][a-z0-9_-]{0,31}$/i.test(value);
 }
 
 function normalizeCpuStatus(raw: unknown): CpuStatus | null {
@@ -183,6 +184,7 @@ function normalizeCpuStatus(raw: unknown): CpuStatus | null {
     .map((item) => ({
       name: item.name as CpuName,
       label: typeof item.label === "string" ? item.label : String(item.name),
+      short_label: typeof item.short_label === "string" ? item.short_label : undefined,
       current: Boolean(item.current),
       available: item.available !== false,
     }));
@@ -194,13 +196,17 @@ function normalizeCpuStatus(raw: unknown): CpuStatus | null {
     choices: choices.length > 0 ? choices : [
       { name: "codex", label: "Codex", current: obj.cpu === "codex", available: true },
       { name: "claude", label: "Claude Code", current: obj.cpu === "claude", available: true },
+      { name: "grok", label: "Grok", current: obj.cpu === "grok", available: true },
     ],
     message: typeof obj.message === "string" ? obj.message : undefined,
   };
 }
 
 function cpuShortLabel(choice: CpuChoice): string {
-  return choice.name === "claude" ? "CC" : "Codex";
+  if (choice.short_label) return choice.short_label;
+  if (choice.name === "claude") return "CC";
+  if (choice.name === "codex") return "Codex";
+  return choice.label || choice.name;
 }
 
 function renderMarkdown(text: string): string {
@@ -287,8 +293,8 @@ function toolStatus(t: ToolTrace): ToolTraceStatus {
 
 function pinnedTargetFromLocation(): PinnedTarget | null {
   const params = new URLSearchParams(window.location.search);
-  const tab = Number(params.get("tab_id") ?? "");
-  const win = Number(params.get("window_id") ?? "");
+  const tab = params.has("tab_id") ? Number(params.get("tab_id")) : NaN;
+  const win = params.has("window_id") ? Number(params.get("window_id")) : NaN;
   const target: PinnedTarget = {};
   if (Number.isInteger(tab) && tab > 0) target.tab_id = tab;
   if (Number.isInteger(win) && win >= 0) target.window_id = win;
@@ -298,8 +304,8 @@ function pinnedTargetFromLocation(): PinnedTarget | null {
 function pinnedTargetFromUnknown(raw: unknown): PinnedTarget | null {
   if (!raw || typeof raw !== "object") return null;
   const record = raw as Record<string, unknown>;
-  const tab = Number(record.tab_id ?? record.tabId ?? "");
-  const win = Number(record.window_id ?? record.windowId ?? "");
+  const tab = Number(record.tab_id ?? record.tabId ?? NaN);
+  const win = Number(record.window_id ?? record.windowId ?? NaN);
   const target: PinnedTarget = {};
   if (Number.isInteger(tab) && tab > 0) target.tab_id = tab;
   if (Number.isInteger(win) && win >= 0) target.window_id = win;
@@ -317,12 +323,12 @@ function isPageUrl(url?: string): boolean {
   );
 }
 
-async function activePageContextFromSw(): Promise<PinnedTarget | null> {
+async function activePageContextFromSw(windowId?: number): Promise<PinnedTarget | null> {
   try {
-    const resp = await chrome.runtime.sendMessage({ type: "babata.active_page_context" }) as
+    const resp = await chrome.runtime.sendMessage({ type: "babata.active_page_context", window_id: windowId }) as
       | { ok?: boolean; tab_id?: number; window_id?: number }
       | undefined;
-    if (!resp?.ok || typeof resp.tab_id !== "number") return null;
+    if (!resp?.ok || typeof resp.tab_id !== "number" || (windowId !== undefined && resp.window_id !== windowId)) return null;
     return {
       tab_id: resp.tab_id,
       window_id: typeof resp.window_id === "number" ? resp.window_id : undefined,
@@ -461,7 +467,7 @@ function sanitizeDebugPromptsForStorage(raw: unknown): DebugPromptTrace[] {
 }
 
 function sanitizeMsgsForStorage(messages: Msg[]): Msg[] {
-  return messages.slice(-CHAT_HISTORY_MAX_MESSAGES).map((msg) => {
+  return boundDebugPromptHistory(messages.slice(-CHAT_HISTORY_MAX_MESSAGES).map((msg) => {
     const out: Msg = {
       role: msg.role,
       text: truncateText(msg.text, CHAT_TEXT_MAX_CHARS),
@@ -479,12 +485,13 @@ function sanitizeMsgsForStorage(messages: Msg[]): Msg[] {
     if (typeof msg.clean_read_id === "string") out.clean_read_id = msg.clean_read_id;
     if (msg.pending) out.pending = true;
     return out;
-  });
+  }));
 }
 
 function normalizeStoredMsgs(raw: unknown): Msg[] {
   if (!Array.isArray(raw)) return [];
-  return raw
+  return boundDebugPromptHistory(raw
+    .slice(-CHAT_HISTORY_MAX_MESSAGES)
     .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
     .filter((item) => item.role === "user" || item.role === "assistant")
     .map((item) => {
@@ -524,7 +531,7 @@ function normalizeStoredMsgs(raw: unknown): Msg[] {
       if (typeof item.clean_read_id === "string") msg.clean_read_id = item.clean_read_id;
       if (item.pending === true) msg.pending = true;
       return msg;
-    });
+    }));
 }
 
 function normalizeSavedChatHistory(raw: unknown): SavedChatHistory | null {
@@ -544,7 +551,21 @@ function normalizeSavedChatHistory(raw: unknown): SavedChatHistory | null {
 async function readSavedChatHistory(key: string): Promise<SavedChatHistory | null> {
   try {
     const got = await chrome.storage.local.get([key]);
-    return normalizeSavedChatHistory(got[key]);
+    const saved = normalizeSavedChatHistory(got[key]);
+    if (saved?.streaming) {
+      const status = await chrome.runtime.sendMessage({ type: "babata.chat.status", storage_key: key });
+      if (status?.ok && !status.streaming) {
+        await chrome.runtime.sendMessage({
+          type: "babata.chat.snapshot_mark_stopped",
+          storage_key: key,
+          expected_updated_at: saved.updated_at,
+          expected_turn_id: saved.active_turn_id ?? null,
+        });
+        const refreshed = await chrome.storage.local.get([key]);
+        return normalizeSavedChatHistory(refreshed[key]);
+      }
+    }
+    return saved;
   } catch {
     return null;
   }
@@ -555,7 +576,8 @@ async function writeSavedChatHistory(
   messages: Msg[],
   streaming = false,
   activeTurnId?: string,
-): Promise<void> {
+  expected?: SavedChatHistory | null,
+): Promise<{ changed: boolean; record: SavedChatHistory }> {
   const record: SavedChatHistory = {
     version: 1,
     updated_at: Date.now(),
@@ -563,15 +585,15 @@ async function writeSavedChatHistory(
     streaming,
     active_turn_id: activeTurnId,
   };
-  await chrome.storage.local.set({
-    [key]: record,
-    [CHAT_HISTORY_LATEST_KEY]: record,
+  const response = await chrome.runtime.sendMessage({
+    type: "babata.chat.snapshot_write",
+    storage_key: key,
+    record,
+    expected_updated_at: expected?.updated_at ?? null,
+    expected_turn_id: expected?.active_turn_id ?? null,
   });
-}
-
-async function clearSavedChatHistory(key: string | null): Promise<void> {
-  const keys = key ? [key, CHAT_HISTORY_LATEST_KEY] : [CHAT_HISTORY_LATEST_KEY];
-  await chrome.storage.local.remove(keys);
+  if (!response?.ok) throw new Error(response?.error || "保存聊天记录失败");
+  return { changed: response.changed !== false, record: normalizeSavedChatHistory(response.record) ?? record };
 }
 
 function chatStateSignature(messages: Msg[], streaming: boolean): string {
@@ -649,7 +671,8 @@ async function clearSavedChatScrollState(historyKey: string | null): Promise<voi
 
 async function tabForTarget(target?: PinnedTarget | null): Promise<chrome.tabs.Tab | null> {
   if (target?.tab_id !== undefined) {
-    return await chrome.tabs.get(target.tab_id);
+    const tab = await chrome.tabs.get(target.tab_id).catch(() => null);
+    return tab && (target.window_id === undefined || tab.windowId === target.window_id) ? tab : null;
   }
   const queries: chrome.tabs.QueryInfo[] = target?.window_id !== undefined
     ? [{ active: true, windowId: target.window_id }]
@@ -667,9 +690,10 @@ async function tabForTarget(target?: PinnedTarget | null): Promise<chrome.tabs.T
       /* try next query */
     }
   }
-  const remembered = await activePageContextFromSw();
+  const remembered = await activePageContextFromSw(target?.window_id);
   if (remembered?.tab_id !== undefined) {
-    return await chrome.tabs.get(remembered.tab_id);
+    const tab = await chrome.tabs.get(remembered.tab_id).catch(() => null);
+    return tab && (target?.window_id === undefined || tab.windowId === target.window_id) ? tab : null;
   }
   return null;
 }
@@ -832,20 +856,6 @@ function classifyAttachment(file: File): Attachment["kind"] {
   return "file";
 }
 
-function readAsBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(reader.error ?? new Error("read failed"));
-    reader.onload = () => {
-      const result = reader.result;
-      if (typeof result !== "string") return reject(new Error("not data URL"));
-      const idx = result.indexOf(",");
-      resolve(idx === -1 ? "" : result.slice(idx + 1));
-    };
-    reader.readAsDataURL(file);
-  });
-}
-
 function createImageThumbnail(file: File): Promise<string | undefined> {
   return new Promise((resolve) => {
     if (!file.type.startsWith("image/")) {
@@ -926,13 +936,6 @@ async function captureLightContext(
   }
 }
 
-function contextNeedsFullPage(meta: LightContext | null, lastUrl: string, lastTitle: string): boolean {
-  if (!meta?.url) return false;
-  if (!lastUrl) return true;
-  if (meta.url !== lastUrl) return true;
-  return (meta.title ?? "") !== lastTitle;
-}
-
 function contextForTurn(
   meta: LightContext | null,
   selection: string,
@@ -941,14 +944,7 @@ function contextForTurn(
 ): LightContext | undefined {
   if (!meta) return undefined;
   const selected = selection.trim();
-  const base = contextNeedsFullPage(meta, lastUrl, lastTitle)
-    ? meta
-    : {
-        same_page: true,
-        url_changed: false,
-        tab_id: meta.tab_id,
-        window_id: meta.window_id,
-      };
+  const base = { ...meta, same_page: meta.url === lastUrl && meta.title === lastTitle };
   return selected ? { ...base, selection: selected } : base;
 }
 
@@ -979,6 +975,7 @@ function App() {
   const [cpuStatus, setCpuStatus] = useState<CpuStatus | null>(null);
   const [cpuSwitching, setCpuSwitching] = useState<CpuName | null>(null);
   const [cpuError, setCpuError] = useState("");
+  const [historyError, setHistoryError] = useState("");
   const [pageMeta, setPageMeta] = useState<LightContext | null>(null);
   const [selection, setSelection] = useState<string>("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -988,6 +985,12 @@ function App() {
   const lastSentUrl = useRef<string>("");
   const lastSentTitle = useRef<string>("");
   const pinnedTarget = useRef<PinnedTarget | null>(pinnedTargetFromLocation());
+  // A panel belongs to its original browser window even while other windows
+  // broadcast target changes. Popup URLs carry that original window explicitly.
+  const panelWindowIdRef = useRef<number | null>(pinnedTarget.current?.window_id ?? null);
+  const panelWindowPromiseRef = useRef<Promise<number | null> | null>(null);
+  const historyLoadSequenceRef = useRef(0);
+  const observedHistoryRef = useRef<SavedChatHistory | null>(null);
   const msgsRef = useRef<Msg[]>([]);
   const streamingRef = useRef(false);
   const historyStorageKeyRef = useRef<string | null>(null);
@@ -1000,6 +1003,37 @@ function App() {
   const [historyStorageKey, setHistoryStorageKey] = useState<string | null>(null);
   const [localHistoryLoaded, setLocalHistoryLoaded] = useState(false);
   const [debugPromptEnabled, setDebugPromptEnabled] = useState(false);
+  const sendPendingRef = useRef(false);
+  const hasLocalHistoryRef = useRef(false);
+  const previewUrls = useRef(new Set<string>());
+  const pendingNotificationsRef = useRef<unknown[]>([]);
+  const notificationHandlerRef = useRef<((message: unknown) => void) | null>(null);
+
+  function drainPendingNotifications() {
+    if (streamingRef.current || sendPendingRef.current) return;
+    const pending = pendingNotificationsRef.current.splice(0);
+    for (const message of pending) notificationHandlerRef.current?.(message);
+  }
+
+  function resolvePanelWindowId(): Promise<number | null> {
+    if (panelWindowIdRef.current !== null) return Promise.resolve(panelWindowIdRef.current);
+    return panelWindowPromiseRef.current ??= (async () => {
+      let windowId: number | undefined;
+      if (pinnedTarget.current?.tab_id !== undefined) {
+        const tab = await chrome.tabs.get(pinnedTarget.current.tab_id).catch(() => null);
+        windowId = tab?.windowId;
+      }
+      if (windowId === undefined) windowId = (await chrome.windows.getCurrent()).id;
+      if (typeof windowId !== "number" || windowId < 0) return null;
+      panelWindowIdRef.current = windowId;
+      pinnedTarget.current = { ...pinnedTarget.current, window_id: windowId };
+      return windowId;
+    })().catch(() => null);
+  }
+  useEffect(() => () => {
+    previewUrls.current.forEach((url) => URL.revokeObjectURL(url));
+    previewUrls.current.clear();
+  }, []);
 
   useEffect(() => {
     msgsRef.current = msgs;
@@ -1007,6 +1041,7 @@ function App() {
 
   useEffect(() => {
     streamingRef.current = streaming;
+    if (!streaming) drainPendingNotifications();
   }, [streaming]);
 
   useEffect(() => {
@@ -1117,7 +1152,7 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    serverFetchFromOrigin(serverOrigin, "/health")
+    serverFetchFromOrigin(serverOrigin, "/health", { signal: AbortSignal.timeout(5000) })
       .then(async (r) => {
         if (!cancelled) setServerOk(r.ok);
         if (!r.ok) return;
@@ -1142,7 +1177,7 @@ function App() {
     let timer: number | null = null;
     const poll = () => {
       timer = null;
-      serverFetchFromOrigin(serverOrigin, "/health")
+      serverFetchFromOrigin(serverOrigin, "/health", { signal: AbortSignal.timeout(5000) })
         .then(async (r) => {
           if (cancelled) return;
           setServerOk(r.ok);
@@ -1175,12 +1210,17 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     void (async () => {
+      const sequence = ++historyLoadSequenceRef.current;
+      await resolvePanelWindowId();
       const key = await resolveChatHistoryStorageKey(pinnedTarget.current);
       const [saved, savedScroll] = await Promise.all([
         readSavedChatHistory(key),
         readSavedChatScrollState(key),
       ]);
-      if (cancelled) return;
+      if (cancelled || sequence !== historyLoadSequenceRef.current) return;
+      observedHistoryRef.current = saved;
+      hasLocalHistoryRef.current = saved !== null;
+      historyStorageKeyRef.current = key;
       setHistoryStorageKey(key);
       pendingScrollRestoreRef.current = savedScroll;
       scrollRestoreDoneRef.current = false;
@@ -1201,11 +1241,34 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!historyStorageKey || !localHistoryLoaded) return;
+    if (!historyStorageKey || !localHistoryLoaded || streaming) return;
     const sig = chatStateSignature(msgs, streaming);
     if (sig === lastStorageSignatureRef.current || sig === lastWrittenSignatureRef.current) return;
     lastWrittenSignatureRef.current = sig;
-    writeSavedChatHistory(historyStorageKey, msgs, streaming).catch(() => {});
+    void writeSavedChatHistory(historyStorageKey, msgs, streaming, undefined, observedHistoryRef.current)
+      .then(async (result) => {
+        if (historyStorageKeyRef.current !== historyStorageKey) return;
+        if (result.changed) {
+          setHistoryError("");
+          if (!observedHistoryRef.current || observedHistoryRef.current.updated_at <= result.record.updated_at) {
+            observedHistoryRef.current = result.record;
+          }
+          return;
+        }
+        // Another surface or offscreen run won the write. Adopt that newer
+        // record instead of replaying our stale copy over it.
+        const got = await chrome.storage.local.get([historyStorageKey]);
+        if (historyStorageKeyRef.current !== historyStorageKey) return;
+        const current = normalizeSavedChatHistory(got[historyStorageKey]);
+        if (!current) return;
+        observedHistoryRef.current = current;
+        lastStorageSignatureRef.current = chatStateSignature(current.messages, current.streaming === true);
+        setMsgs(current.messages);
+        setStreaming(current.streaming === true);
+      })
+      .catch((error) => {
+        if (historyStorageKeyRef.current === historyStorageKey) setHistoryError((error as Error).message);
+      });
   }, [historyStorageKey, localHistoryLoaded, msgs, streaming]);
 
   useEffect(() => {
@@ -1213,7 +1276,9 @@ function App() {
     const applyRecord = (raw: unknown) => {
       const record = normalizeSavedChatHistory(raw);
       if (!record) return;
+      observedHistoryRef.current = record;
       const sig = chatStateSignature(record.messages, record.streaming === true);
+      setHistoryError("");
       if (sig === chatStateSignature(msgsRef.current, streamingRef.current)) return;
       lastStorageSignatureRef.current = sig;
       setMsgs(record.messages);
@@ -1237,13 +1302,9 @@ function App() {
   // Restore chat history on mount/refresh so side panel and popup surfaces stay
   // in sync.
   useEffect(() => {
-    if (!localHistoryLoaded) return;
+    if (!localHistoryLoaded || hasLocalHistoryRef.current || !historyStorageKey) return;
     let cancelled = false;
-    serverFetchFromOrigin(serverOrigin, "/history?limit=200", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: "{}",
-    })
+    serverFetchFromOrigin(serverOrigin, `/history?limit=200&conversation_id=${encodeURIComponent(historyStorageKey)}`, { signal: AbortSignal.timeout(5000) })
       .then((r) => r.json())
       .then((data: {
         ok?: boolean;
@@ -1264,11 +1325,12 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [localHistoryLoaded, serverOrigin]);
+  }, [localHistoryLoaded, serverOrigin, historyStorageKey]);
 
   useEffect(() => {
     let alive = true;
     const refresh = async () => {
+      await resolvePanelWindowId();
       const [ctx, sel] = await Promise.all([
         captureLightContext(lastSentUrl.current, pinnedTarget.current),
         captureCurrentSelection(pinnedTarget.current),
@@ -1297,7 +1359,16 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const listener = (msg: unknown) => {
+    const listener = (msg: unknown, sender: chrome.runtime.MessageSender) => {
+      if (sender.id !== chrome.runtime.id || sender.tab) return;
+      const failure = msg as { type?: string; storage_key?: string; turn_id?: string; messages?: unknown; streaming?: boolean; error?: string } | undefined;
+      if (failure?.type === "babata.chat.snapshot_error" && failure.storage_key === historyStorageKeyRef.current) {
+        if (!failure.turn_id || failure.turn_id !== observedHistoryRef.current?.active_turn_id) return;
+        setMsgs(normalizeStoredMsgs(failure.messages));
+        setStreaming(failure.streaming === true);
+        setHistoryError(failure.error || "聊天记录保存失败，当前内容可能无法在重载后恢复。");
+        return;
+      }
       const m = msg as
         | { type?: string; action?: string; args?: Record<string, unknown>; tab_id?: number; window_id?: number }
         | undefined;
@@ -1305,13 +1376,21 @@ function App() {
         void (async () => {
           const target = pinnedTargetFromUnknown(m);
           if (!target) return;
+          const panelWindowId = await resolvePanelWindowId();
+          if (panelWindowId === null || target.window_id !== panelWindowId) return;
+          const sequence = ++historyLoadSequenceRef.current;
           const key = await resolveChatHistoryStorageKey(target);
+          pinnedTarget.current = target;
           if (key === historyStorageKeyRef.current) return;
           const [saved, savedScroll] = await Promise.all([
             readSavedChatHistory(key),
             readSavedChatScrollState(key),
           ]);
-          pinnedTarget.current = target;
+          if (sequence !== historyLoadSequenceRef.current) return;
+          observedHistoryRef.current = saved;
+          hasLocalHistoryRef.current = saved !== null;
+          historyStorageKeyRef.current = key;
+          lastWrittenSignatureRef.current = "";
           setHistoryStorageKey(key);
           pendingScrollRestoreRef.current = savedScroll;
           scrollRestoreDoneRef.current = false;
@@ -1333,6 +1412,12 @@ function App() {
         return;
       }
       if (m?.type !== "babata.notification") return;
+      const notificationWindow = m.args?.window_id;
+      if (typeof notificationWindow === "number" && historyStorageKeyRef.current !== chatHistoryStorageKey(notificationWindow)) return;
+      if (m.action?.startsWith("clean_read_") && (streamingRef.current || sendPendingRef.current)) {
+        pendingNotificationsRef.current.push(msg);
+        return;
+      }
       const argText = (key: string) =>
         typeof m.args?.[key] === "string" ? (m.args[key] as string) : "";
       if (m.action === "suggest_prompts") {
@@ -1391,8 +1476,10 @@ function App() {
         });
       }
     };
+    notificationHandlerRef.current = (message) => listener(message, { id: chrome.runtime.id });
     chrome.runtime.onMessage.addListener(listener);
     return () => {
+      notificationHandlerRef.current = null;
       chrome.runtime.onMessage.removeListener(listener);
     };
   }, []);
@@ -1440,20 +1527,18 @@ function App() {
     }
     try {
       const kind = classifyAttachment(file);
-      const [data_base64, thumbnail_data_url] = await Promise.all([
-        readAsBase64(file),
-        kind === "image" ? createImageThumbnail(file) : Promise.resolve(undefined),
-      ]);
+      const thumbnail_data_url = kind === "image" ? await createImageThumbnail(file) : undefined;
+      const previewUrl = kind === "image" || kind === "video" ? URL.createObjectURL(file) : undefined;
+      if (previewUrl) previewUrls.current.add(previewUrl);
       const att: Attachment = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         kind,
         name: file.name || "untitled",
         mime: file.type || "application/octet-stream",
         size: file.size,
-        data_base64,
+        data_base64: "",
         thumbnail_data_url,
-        preview_url:
-          kind === "image" || kind === "video" ? URL.createObjectURL(file) : undefined,
+        preview_url: previewUrl,
       };
       setAttachments((prev) => [...prev, att]);
     } catch (e) {
@@ -1471,7 +1556,7 @@ function App() {
   function removeAttachment(id: string) {
     setAttachments((prev) => {
       const found = prev.find((a) => a.id === id);
-      if (found?.preview_url) URL.revokeObjectURL(found.preview_url);
+      if (found?.preview_url) { URL.revokeObjectURL(found.preview_url); previewUrls.current.delete(found.preview_url); }
       return prev.filter((a) => a.id !== id);
     });
   }
@@ -1530,37 +1615,38 @@ function App() {
     void chrome.storage.local.set({ [STORAGE_DEBUG_PROMPT_ENABLED]: next }).catch(() => {});
   }
 
-  function newSession() {
-    if (historyStorageKey) {
-      void chrome.runtime
-        .sendMessage({ type: "babata.chat.clear", storage_key: historyStorageKey })
-        .catch(() => {});
+  async function newSession() {
+    if (!localHistoryLoaded || sendPendingRef.current) return;
+    sendPendingRef.current = true;
+    hasLocalHistoryRef.current = true;
+    try {
+      if (historyStorageKey) {
+        const response = await chrome.runtime.sendMessage({ type: "babata.chat.clear", storage_key: historyStorageKey });
+        if (!response?.ok) throw new Error(response?.error || "清空失败，请重试");
+      }
+    } catch (error) {
+      setCpuError((error as Error).message);
+      sendPendingRef.current = false;
+      return;
     }
     setMsgs([]);
+    pendingNotificationsRef.current = [];
+    setHistoryError("");
     setSuggestions([]);
     setInput("");
     setCpuError("");
     setStreaming(false);
     lastSentUrl.current = "";
     lastSentTitle.current = "";
-    setAttachments((prev) => {
-      prev.forEach((a) => {
-        if (a.preview_url) URL.revokeObjectURL(a.preview_url);
-      });
-      return [];
-    });
-    void clearSavedChatHistory(historyStorageKey).catch(() => {});
+    previewUrls.current.forEach((url) => URL.revokeObjectURL(url));
+    previewUrls.current.clear();
+    setAttachments([]);
     void clearSavedChatScrollState(historyStorageKey).catch(() => {});
-    // 让 server 起新 session: 发 /new 给 cc.py (复用 cc 的 /new 命令路径).
-    void serverFetchFromOrigin(serverOrigin, "/chat", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ message: "/new" }),
-    }).catch(() => {});
+    sendPendingRef.current = false;
   }
 
   async function switchCpu(cpu: CpuName) {
-    if (cpuSwitching) return;
+    if (cpuSwitching || sendPendingRef.current) return;
     if (streaming || cpuStatus?.busy) {
       setCpuError("当前还有 sidebar turn 在跑，等结束后再切 CPU");
       return;
@@ -1576,6 +1662,7 @@ function App() {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ cpu }),
+        signal: AbortSignal.timeout(10_000),
       });
       const data = await resp.json().catch(() => null);
       const status = normalizeCpuStatus(data);
@@ -1598,40 +1685,45 @@ function App() {
 
   async function send(textOverride?: string) {
     const text = (textOverride ?? input).trim();
-    if ((!text && attachments.length === 0) || streaming) return;
-
-    const sentAttachments = attachments;
-    const key = historyStorageKey ?? await resolveChatHistoryStorageKey(pinnedTarget.current);
-    if (!historyStorageKey) setHistoryStorageKey(key);
-    const userMsg: Msg = { role: "user", text, attachments: sentAttachments };
-    const assistantMsg: Msg = { role: "assistant", text: "" };
-    const nextMsgs = [...msgsRef.current, userMsg, assistantMsg];
-    const pageContext = contextForTurn(
-      pageMeta,
-      selection,
-      lastSentUrl.current,
-      lastSentTitle.current,
-    );
-    if (pageMeta?.url) {
-      lastSentUrl.current = pageMeta.url;
-      lastSentTitle.current = pageMeta.title ?? "";
-    }
-    const wireAttachments = sentAttachments.map((a) => ({
-      kind: a.kind,
-      name: a.name,
-      mime: a.mime,
-      size: a.size,
-      data_base64: a.data_base64,
-    }));
-
-    setInput("");
-    setAttachments([]);
-    setSuggestions([]);
-    setMsgs(nextMsgs);
-    setCpuError("");
-    setStreaming(true);
+    if (!localHistoryLoaded || (!text && attachments.length === 0) || streaming || sendPendingRef.current || cpuSwitching) return;
+    sendPendingRef.current = true;
 
     try {
+      await resolvePanelWindowId();
+      const sentAttachments = attachments;
+      const key = historyStorageKey ?? await resolveChatHistoryStorageKey(pinnedTarget.current);
+      if (!historyStorageKey) setHistoryStorageKey(key);
+      const userMsg: Msg = { role: "user", text, attachments: sentAttachments };
+      const assistantMsg: Msg = { role: "assistant", text: "" };
+      const nextMsgs = [...msgsRef.current, userMsg, assistantMsg];
+      const [currentPage, currentSelection] = await Promise.all([
+        captureLightContext(lastSentUrl.current, pinnedTarget.current),
+        captureCurrentSelection(pinnedTarget.current),
+      ]);
+      const pageContext = contextForTurn(
+        currentPage,
+        currentSelection,
+        lastSentUrl.current,
+        lastSentTitle.current,
+      );
+      if (currentPage?.url) {
+        lastSentUrl.current = currentPage.url;
+        lastSentTitle.current = currentPage.title ?? "";
+      }
+      const wireAttachments = sentAttachments.map((a) => ({
+        kind: a.kind,
+        name: a.name,
+        mime: a.mime,
+        size: a.size,
+      }));
+
+      setInput("");
+      setAttachments([]);
+      setSuggestions([]);
+      setMsgs(nextMsgs);
+      setCpuError("");
+      setStreaming(true);
+
       const resp = await chrome.runtime.sendMessage({
         type: "babata.chat.start",
         storage_key: key,
@@ -1641,6 +1733,7 @@ function App() {
         page_context: pageContext ?? undefined,
         attachments: wireAttachments.length > 0 ? wireAttachments : undefined,
         debug_prompt: debugPromptEnabled,
+        cpu: cpuStatus?.cpu,
       }) as { ok?: boolean; error?: string } | undefined;
       if (!resp?.ok) {
         throw new Error(resp?.error || "chat start failed");
@@ -1664,17 +1757,23 @@ function App() {
         ];
       });
       setStreaming(false);
+    } finally {
+      sendPendingRef.current = false;
+      drainPendingNotifications();
     }
   }
 
-  function abort() {
-    if (historyStorageKey) {
-      void chrome.runtime
-        .sendMessage({ type: "babata.chat.abort", storage_key: historyStorageKey })
-        .catch(() => {});
+  async function abort() {
+    try {
+      if (historyStorageKey) {
+        const response = await chrome.runtime.sendMessage({ type: "babata.chat.abort", storage_key: historyStorageKey });
+        if (!response?.ok) throw new Error(response?.error || "停止失败，请重试");
+      }
+      setCpuError("");
+      setStreaming(false);
+    } catch (error) {
+      setCpuError((error as Error).message);
     }
-    setCpuError("");
-    setStreaming(false);
   }
 
   function copyMessage(text: string) {
@@ -1693,6 +1792,7 @@ function App() {
   const cpuChoices = cpuStatus?.choices ?? [
     { name: "codex" as const, label: "Codex", current: false, available: true },
     { name: "claude" as const, label: "Claude Code", current: false, available: true },
+    { name: "grok" as const, label: "Grok", current: false, available: true },
   ];
   const cpuBusy = cpuStatus?.busy === true;
   const cpuSwitchTitle = cpuError || (
@@ -1769,6 +1869,7 @@ function App() {
           class="btn-icon w-6 h-6 rounded-md flex items-center justify-center shrink-0"
           title="新对话"
           onClick={newSession}
+          disabled={!localHistoryLoaded}
         >
           <svg width="14" height="14" viewBox="0 0 15 15" fill="none">
             <path d="M7.5 3v9M3 7.5h9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
@@ -1786,6 +1887,11 @@ function App() {
       {cpuError && (
         <div class="px-3 pb-1 text-[11px] text-[#9a3f2c] truncate" title={cpuError}>
           CPU: {cpuError}
+        </div>
+      )}
+      {historyError && (
+        <div class="px-3 pb-1 text-[11px] text-[#9a3f2c]" role="alert">
+          {historyError}
         </div>
       )}
 
@@ -1929,9 +2035,10 @@ function App() {
           </div>
         )}
 
+        {attachments.length > 0 && <p class="text-[11px] text-bbt-muted mb-2">附件仅发送名称、类型和大小，暂不读取文件内容。</p>}
         <div class="bg-bbt-input border border-bbt rounded-2xl flex flex-col shadow-[0_1px_8px_rgba(0,0,0,0.03)]">
           <textarea
-            class="resize-none bg-transparent outline-none px-3.5 pt-3 pb-1 text-[14px] leading-6 placeholder:text-bbt-subtle"
+            class="resize-none bg-transparent outline-hidden px-3.5 pt-3 pb-1 text-[14px] leading-6 placeholder:text-bbt-subtle"
             rows={1}
             placeholder="问 babata..."
             value={input}
@@ -1948,7 +2055,7 @@ function App() {
             <span class="flex-1" />
             <button
               class="btn-icon w-7 h-7 rounded-md flex items-center justify-center"
-              title="附加文件"
+              title="附加文件（仅发送文件信息）"
               onClick={() => fileInputRef.current?.click()}
             >
               <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
@@ -1973,7 +2080,7 @@ function App() {
                   : "bg-bbt-bubble text-bbt-subtle"
               }`}
               onClick={streaming ? abort : () => send()}
-              disabled={!streaming && !input.trim() && attachments.length === 0}
+              disabled={!localHistoryLoaded || (!streaming && !input.trim() && attachments.length === 0)}
               title={streaming ? "停止" : "发送"}
             >
               {streaming ? (

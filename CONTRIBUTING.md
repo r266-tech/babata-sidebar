@@ -5,7 +5,7 @@ Thanks for improving babata-sidebar.
 ## Setup
 
 ```bash
-npm install
+npm ci
 npm run build
 npm run companion
 ```
@@ -21,7 +21,18 @@ Run these before opening a pull request:
 npm run typecheck
 npm run build
 npm run smoke:companion
+npm test
+npx playwright install chromium
+npm run test:browser
 ```
+
+The automated regressions use temporary configuration and browser profiles with
+fake local CLIs/providers. The older `smoke:sidebar`, `smoke:rich-card`, and other
+CDP smoke scripts target a running developer browser and are optional manual
+checks; they are not prerequisites for the isolated test suite.
+Set `BABATA_EXTENSION_ID` to the ID shown in your browser's extension manager
+before running those manual scripts. They can reload that extension and briefly
+change translation settings; `smoke:llm` also calls your configured models.
 
 ## Guidelines
 

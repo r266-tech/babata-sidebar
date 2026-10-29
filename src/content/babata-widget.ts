@@ -5,14 +5,16 @@ import {
   STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
   STORAGE_ALWAYS_TRANSLATE_HOSTS,
   STORAGE_SELECTION_TRANSLATION,
+  STORAGE_VIDEO_TRANSLATION,
+  DEFAULT_VIDEO_TRANSLATION_ENABLED,
   STORAGE_TRANSLATION_MODE as STORAGE_MODE,
   effectiveTranslationModeForHost,
   isAlwaysTranslateHost,
+  isVideoTranslationEnabled,
   normalizeHostList,
   normalizeHostname,
   normalizeTranslationRenderMode as normalizeMode,
   type TranslationRenderMode,
-  updateAlwaysTranslateHostState,
 } from "../translation-settings";
 
 // babata 桌宠 floating widget — 可拖拽圆形按钮 + 设置弹窗 + 主动 bubble.
@@ -35,6 +37,7 @@ type PageTargetContext = { tab_id?: number; window_id?: number };
 
 const HOST_ID = "__babata_widget_host__";
 const TEARDOWN_EVENT = "babata:widget-teardown";
+const widgetWindow = window as Window & { __babataWidgetBooted?: boolean; __babataWidgetRecoveryWaiting?: boolean };
 const STORAGE_POS = "babata.widget.pos";
 const CLEAN_READ_STYLE_ID = "__babata_clean_read_style__";
 const CLEAN_READ_ROOT_ID = "__babata_clean_read_root__";
@@ -57,7 +60,7 @@ type ChatPopupElement = HTMLDivElement & { cleanup?: () => void };
 type CleanReadOverlayElement = HTMLDivElement & { cleanup?: () => void };
 type CleanReadBlockKind = "heading" | "paragraph" | "quote" | "code";
 type CleanReadBlock = { kind: CleanReadBlockKind; text: string };
-type CleanReadSnapshot = { el: HTMLElement; html: string; style: string | null };
+type CleanReadSnapshot = { el: HTMLElement; nodes: Node[]; style: string | null };
 
 const DEFAULT_POS: WidgetPos = { right: 18, top: 0.5 }; // top 比例 (0-1)
 
@@ -71,6 +74,7 @@ let widgetState: {
   openChatPopup: ((opts?: OpenChatPopupOptions) => void) | null;
   mode: TranslationRenderMode;
   selectionTranslationEnabled: boolean;
+  videoTranslationEnabled: boolean;
   alwaysTranslateHosts: string[];
   alwaysTranslateDisabledHosts: string[];
   currentHost: string;
@@ -113,8 +117,10 @@ function safeChromeCall<T>(fn: () => T): T | undefined {
 }
 
 function applyPos(root: HTMLElement, pos: WidgetPos) {
-  root.style.right = `${pos.right}px`;
-  root.style.top = `${pos.top * window.innerHeight}px`;
+  const right = Number.isFinite(pos.right) ? pos.right : DEFAULT_POS.right;
+  const top = Number.isFinite(pos.top) ? pos.top : DEFAULT_POS.top;
+  root.style.right = `${Math.max(8, Math.min(Math.max(8, window.innerWidth - 60), right))}px`;
+  root.style.top = `${Math.max(8, Math.min(Math.max(8, window.innerHeight - 100), top * window.innerHeight))}px`;
 }
 
 function refreshBubbleMetrics() {
@@ -154,6 +160,7 @@ async function currentPageTargetContext(): Promise<PageTargetContext | null> {
 async function loadPersisted(): Promise<{
   mode: TranslationRenderMode;
   selectionTranslationEnabled: boolean;
+  videoTranslationEnabled: boolean;
   alwaysTranslateHosts: string[];
   alwaysTranslateDisabledHosts: string[];
   currentHost: string;
@@ -164,6 +171,7 @@ async function loadPersisted(): Promise<{
     chrome.storage.local.get([
       STORAGE_MODE,
       STORAGE_SELECTION_TRANSLATION,
+      STORAGE_VIDEO_TRANSLATION,
       STORAGE_ALWAYS_TRANSLATE_HOSTS,
       STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS,
       STORAGE_POS,
@@ -173,6 +181,7 @@ async function loadPersisted(): Promise<{
     return {
       mode: DEFAULT_MODE,
       selectionTranslationEnabled: DEFAULT_SELECTION_TRANSLATION_ENABLED,
+      videoTranslationEnabled: DEFAULT_VIDEO_TRANSLATION_ENABLED,
       alwaysTranslateHosts: [],
       alwaysTranslateDisabledHosts: [],
       currentHost,
@@ -182,6 +191,7 @@ async function loadPersisted(): Promise<{
   return {
     mode: normalizeMode(got[STORAGE_MODE]),
     selectionTranslationEnabled: got[STORAGE_SELECTION_TRANSLATION] === true,
+    videoTranslationEnabled: isVideoTranslationEnabled(got[STORAGE_VIDEO_TRANSLATION]),
     alwaysTranslateHosts: normalizeHostList(got[STORAGE_ALWAYS_TRANSLATE_HOSTS]),
     alwaysTranslateDisabledHosts: normalizeHostList(got[STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS]),
     currentHost,
@@ -221,6 +231,28 @@ function createWidget() {
   // 当前 frame 是顶 frame 才注入 (避免 iframe 内重复 widget).
   if (window.top !== window.self) return;
   if (!document.documentElement) return;
+  if (widgetWindow.__babataWidgetBooted || widgetWindow.__babataWidgetRecoveryWaiting) return;
+
+  const previousHost = document.getElementById(HOST_ID);
+  if (previousHost) {
+    let previousShadow: ShadowRoot | null = previousHost.shadowRoot;
+    try { previousShadow = chrome.dom?.openOrClosedShadowRoot(previousHost) ?? previousShadow; } catch { /* Preserve an unreadable existing popup. */ }
+    if (!previousShadow || previousShadow.querySelector(".chat-popup")) {
+      // Replacing a widget with an open page chat would detach its iframe and
+      // discard the draft. Upgrade after that popup closes, without touching it.
+      widgetWindow.__babataWidgetRecoveryWaiting = true;
+      const observer = new MutationObserver(() => {
+        if (previousHost.isConnected && (!previousShadow || previousShadow.querySelector(".chat-popup"))) return;
+        observer.disconnect();
+        widgetWindow.__babataWidgetRecoveryWaiting = false;
+        createWidget();
+      });
+      if (previousShadow) observer.observe(previousShadow, { childList: true });
+      observer.observe(document.documentElement, { childList: true });
+      return;
+    }
+  }
+  widgetWindow.__babataWidgetBooted = true;
 
   document.dispatchEvent(new CustomEvent(TEARDOWN_EVENT));
   document.getElementById(HOST_ID)?.remove();
@@ -385,12 +417,16 @@ function createWidget() {
     }
 
     .popover {
+      position: fixed;
       background: #fff;
       border-radius: 14px;
       box-shadow: 0 8px 28px rgba(0,0,0,.16);
       border: 1px solid rgba(0,0,0,.06);
       padding: 14px 16px;
-      min-width: 220px;
+      box-sizing: border-box;
+      width: min(254px, calc(100vw - 24px));
+      max-height: calc(100vh - 24px);
+      overflow-y: auto;
     }
     .popover h4 { margin: 0 0 10px; font-size: 13px; font-weight: 600; color: #1c1c1c; }
     .popover label {
@@ -400,6 +436,7 @@ function createWidget() {
     .popover input[type=radio],
     .popover input[type=checkbox] { margin: 4px 0 0 0; accent-color: #c66a4a; }
     .popover .divider { height: 1px; background: rgba(0,0,0,.08); margin: 8px 0; }
+    .popover .setting-hint { color: #666; font-size: 11px; margin-top: 3px; line-height: 1.4; }
 
     .stack {
       display: flex;
@@ -592,6 +629,7 @@ function createWidget() {
   let cleanReadOverlay: CleanReadOverlayElement | null = null;
   let popover: HTMLDivElement | null = null;
   let cleanedUp = false;
+  let settingsRevision = 0;
 
   const cleanupWidget = () => {
     if (cleanedUp) return;
@@ -666,15 +704,55 @@ function createWidget() {
     openChatPopup: null,
     mode: DEFAULT_MODE,
     selectionTranslationEnabled: DEFAULT_SELECTION_TRANSLATION_ENABLED,
+    videoTranslationEnabled: DEFAULT_VIDEO_TRANSLATION_ENABLED,
     alwaysTranslateHosts: [],
     alwaysTranslateDisabledHosts: [],
     currentHost: normalizeHostname(location.hostname),
     pos: DEFAULT_POS,
   };
   applyPos(root, DEFAULT_POS);
-  const onResize = () => refreshBubbleMetrics();
+  const onResize = () => {
+    if (widgetState) applyPos(widgetState.root, widgetState.pos);
+    refreshBubbleMetrics();
+    positionPopover();
+  };
   window.addEventListener("resize", onResize);
   cleanupFns.push(() => window.removeEventListener("resize", onResize));
+
+  const syncPopover = () => {
+    if (!popover || !widgetState) return;
+    for (const radio of popover.querySelectorAll<HTMLInputElement>('input[name="babata-mode"]')) {
+      radio.checked = radio.value === widgetState.mode;
+    }
+    const always = popover.querySelector<HTMLInputElement>('[data-setting="always"]');
+    if (always) always.checked = isAlwaysTranslateHost(
+      widgetState.alwaysTranslateHosts, widgetState.currentHost, widgetState.alwaysTranslateDisabledHosts,
+    );
+    const selection = popover.querySelector<HTMLInputElement>('[data-setting="selection"]');
+    if (selection) selection.checked = widgetState.selectionTranslationEnabled;
+    const video = popover.querySelector<HTMLInputElement>('[data-setting="video"]');
+    if (video) video.checked = widgetState.videoTranslationEnabled;
+  };
+  const onSettingsChanged = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
+    if (area !== "local" || !widgetState || cleanedUp) return;
+    if ([STORAGE_MODE, STORAGE_ALWAYS_TRANSLATE_HOSTS, STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS, STORAGE_SELECTION_TRANSLATION, STORAGE_VIDEO_TRANSLATION].some((key) => changes[key])) settingsRevision += 1;
+    if (changes[STORAGE_MODE]) widgetState.mode = normalizeMode(changes[STORAGE_MODE].newValue);
+    if (changes[STORAGE_ALWAYS_TRANSLATE_HOSTS]) {
+      widgetState.alwaysTranslateHosts = normalizeHostList(changes[STORAGE_ALWAYS_TRANSLATE_HOSTS].newValue);
+    }
+    if (changes[STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS]) {
+      widgetState.alwaysTranslateDisabledHosts = normalizeHostList(changes[STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS].newValue);
+    }
+    if (changes[STORAGE_SELECTION_TRANSLATION]) {
+      widgetState.selectionTranslationEnabled = changes[STORAGE_SELECTION_TRANSLATION].newValue === true;
+    }
+    if (changes[STORAGE_VIDEO_TRANSLATION]) {
+      widgetState.videoTranslationEnabled = isVideoTranslationEnabled(changes[STORAGE_VIDEO_TRANSLATION].newValue);
+    }
+    syncPopover();
+  };
+  safeChromeCall(() => chrome.storage.onChanged.addListener(onSettingsChanged));
+  cleanupFns.push(() => { safeChromeCall(() => chrome.storage.onChanged.removeListener(onSettingsChanged)); });
 
   const onRuntimeMessage = (
     msg: unknown,
@@ -898,6 +976,8 @@ function createWidget() {
     if (["SCRIPT", "STYLE", "LINK", "NOSCRIPT", "IFRAME", "SVG", "IMG", "VIDEO", "CANVAS"].includes(el.tagName)) {
       return false;
     }
+    if (el.closest('form, input, textarea, select, button, [contenteditable]:not([contenteditable="false"])')) return false;
+    if (el.querySelector("img,picture,video,audio,canvas,iframe,svg,input,textarea,select,button")) return false;
     const textLen = cleanReadTextLen(el);
     if (textLen < 2) return false;
     const tag = el.tagName.toLowerCase();
@@ -913,17 +993,16 @@ function createWidget() {
   }
 
   function collectCleanReadSlots(articleRoot: HTMLElement): HTMLElement[] {
-    const direct = Array.from(articleRoot.children).filter(
-      (child): child is HTMLElement => child instanceof HTMLElement && isCleanReadTextBlock(child),
-    );
-    if (direct.length >= 3) return direct;
-    return Array.from(
-      articleRoot.querySelectorAll<HTMLElement>("h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,section,div"),
-    ).filter((el) => {
-      if (!isCleanReadTextBlock(el)) return false;
-      const parentBlock = el.parentElement?.closest("h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,section,div");
-      return !parentBlock || parentBlock === articleRoot;
-    });
+    const slots: HTMLElement[] = [];
+    function visit(parent: HTMLElement) {
+      for (const child of Array.from(parent.children)) {
+        if (!(child instanceof HTMLElement)) continue;
+        if (isCleanReadTextBlock(child)) slots.push(child);
+        else visit(child);
+      }
+    }
+    visit(articleRoot);
+    return slots;
   }
 
   function cleanReadBlockText(blocks: CleanReadBlock[], index: number, maxSlots: number): string {
@@ -942,11 +1021,11 @@ function createWidget() {
   ) {
     if (seen.has(el)) return;
     seen.add(el);
-    snapshots.push({ el, html: el.innerHTML, style: el.getAttribute("style") });
+    snapshots.push({ el, nodes: Array.from(el.childNodes), style: el.getAttribute("style") });
   }
 
   function restoreCleanReadSnapshot(snapshot: CleanReadSnapshot) {
-    snapshot.el.innerHTML = snapshot.html;
+    snapshot.el.replaceChildren(...snapshot.nodes);
     if (snapshot.style === null) snapshot.el.removeAttribute("style");
     else snapshot.el.setAttribute("style", snapshot.style);
     snapshot.el.classList.remove("bbt-clean-read-hidden");
@@ -972,16 +1051,21 @@ function createWidget() {
     ensureCleanReadPageStyle();
 
     const articleRoot = findCleanReadRoot();
+    const previousCleanReadState = articleRoot.getAttribute("data-bbt-clean-read-active");
+    articleRoot.setAttribute("data-bbt-clean-read-active", "1");
+    // Work from the original article and pause translation in this subtree.
+    // Otherwise its generated siblings become extra clean-read slots and
+    // pending translation results can overwrite the reading draft.
+    articleRoot.querySelectorAll(".bbt-tr").forEach((node) => node.remove());
     const slots = collectCleanReadSlots(articleRoot);
     const blocks = parseCleanReadMarkdown(markdown);
     const marker = document.createElement("div") as CleanReadOverlayElement;
     marker.id = CLEAN_READ_ROOT_ID;
     marker.title = meta.title || meta.url || "净化阅读";
-    const firstSlot = slots[0] ?? articleRoot.firstChild;
     const snapshots: CleanReadSnapshot[] = [];
     const seen = new WeakSet<HTMLElement>();
 
-    articleRoot.insertBefore(marker, firstSlot);
+    articleRoot.insertBefore(marker, articleRoot.firstChild);
     if (slots.length === 0) {
       const fallback = document.createElement("p");
       fallback.dataset.bbtCleanReadInserted = "1";
@@ -1013,6 +1097,8 @@ function createWidget() {
       document.removeEventListener("keydown", onKey);
       document.querySelectorAll<HTMLElement>("[data-bbt-clean-read-inserted='1']").forEach((el) => el.remove());
       snapshots.forEach(restoreCleanReadSnapshot);
+      if (previousCleanReadState === null) articleRoot.removeAttribute("data-bbt-clean-read-active");
+      else articleRoot.setAttribute("data-bbt-clean-read-active", previousCleanReadState);
     };
     cleanReadOverlay = marker;
     (slots[0] ?? articleRoot).scrollIntoView({ block: "start", behavior: "smooth" });
@@ -1029,6 +1115,7 @@ function createWidget() {
   const settingsBtn = document.createElement("button");
   settingsBtn.className = "btn btn-secondary btn-collapsible";
   settingsBtn.title = "翻译设置";
+  settingsBtn.setAttribute("aria-expanded", "false");
   settingsBtn.appendChild(svg("M3 8h10 M3 4h10 M3 12h10", { size: 14, stroke: 1.4 }));
   btnStack.appendChild(settingsBtn);
 
@@ -1090,9 +1177,11 @@ function createWidget() {
       dismissible: false,
       interactive: false,
     });
-    window.setTimeout(() => {
+    const timer = window.setTimeout(() => {
+      if (cleanedUp) return;
       void safeChromePromise(() => chrome.runtime.sendMessage({ type: "babata.clean_read" }));
     }, 180);
+    cleanupFns.push(() => window.clearTimeout(timer));
   };
 
   // ── interactions ─────────────────────────────────────────────────
@@ -1134,6 +1223,7 @@ function createWidget() {
     widgetState.pos = { right, top: top / window.innerHeight };
     applyPos(widgetState.root, widgetState.pos);
     refreshBubbleMetrics();
+    positionPopover();
   };
   document.addEventListener("mousemove", onDragMove);
   cleanupFns.push(() => document.removeEventListener("mousemove", onDragMove));
@@ -1173,11 +1263,23 @@ function createWidget() {
   });
 
   // settings popover toggle
+  function positionPopover() {
+    if (!popover) return;
+    const anchor = settingsBtn.getBoundingClientRect();
+    const panel = popover.getBoundingClientRect();
+    const left = Math.max(12, Math.min(window.innerWidth - panel.width - 12, anchor.right - panel.width));
+    const below = anchor.bottom + 8;
+    const top = below + panel.height <= window.innerHeight - 12
+      ? below : Math.max(12, Math.min(window.innerHeight - panel.height - 12, anchor.top - panel.height - 8));
+    popover.style.left = `${left}px`;
+    popover.style.top = `${top}px`;
+  }
   const closePopover = () => {
     if (!popover) return;
     popover.remove();
     popover = null;
     root.classList.remove("expanded");
+    settingsBtn.setAttribute("aria-expanded", "false");
   };
   settingsBtn.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -1189,6 +1291,8 @@ function createWidget() {
     btnStack.insertBefore(popover, settingsBtn);
     // popover 打开时强制保持展开 — 鼠标移开 widget 也别 collapse 否则 popover 漂浮无依托.
     root.classList.add("expanded");
+    settingsBtn.setAttribute("aria-expanded", "true");
+    positionPopover();
   });
 
   const onDocumentClick = (e: MouseEvent) => {
@@ -1206,23 +1310,30 @@ function createWidget() {
 
   // ── async load ─────────────────────────────────────────────────────
   void (async () => {
+    const revision = settingsRevision;
     const {
       mode,
       selectionTranslationEnabled,
+      videoTranslationEnabled,
       alwaysTranslateHosts,
       alwaysTranslateDisabledHosts,
       currentHost,
       pos,
     } = await loadPersisted();
-    if (!widgetState) return;
-    widgetState.mode = mode;
-    widgetState.selectionTranslationEnabled = selectionTranslationEnabled;
-    widgetState.alwaysTranslateHosts = alwaysTranslateHosts;
-    widgetState.alwaysTranslateDisabledHosts = alwaysTranslateDisabledHosts;
+    if (!widgetState || cleanedUp) return;
+    if (revision === settingsRevision) {
+      widgetState.mode = mode;
+      widgetState.selectionTranslationEnabled = selectionTranslationEnabled;
+      widgetState.videoTranslationEnabled = videoTranslationEnabled;
+      widgetState.alwaysTranslateHosts = alwaysTranslateHosts;
+      widgetState.alwaysTranslateDisabledHosts = alwaysTranslateDisabledHosts;
+    }
     widgetState.currentHost = currentHost;
     widgetState.pos = pos;
     applyPos(widgetState.root, pos);
     refreshBubbleMetrics();
+    syncPopover();
+    positionPopover();
   })();
 }
 
@@ -1418,28 +1529,29 @@ function renderPopover(): HTMLDivElement {
   const alwaysCheckbox = document.createElement("input");
   const currentHost = widgetState?.currentHost ?? normalizeHostname(location.hostname);
   alwaysCheckbox.type = "checkbox";
+  alwaysCheckbox.dataset.setting = "always";
   alwaysCheckbox.checked = isAlwaysTranslateHost(
     widgetState?.alwaysTranslateHosts ?? [],
     currentHost,
     widgetState?.alwaysTranslateDisabledHosts ?? [],
   );
   alwaysCheckbox.disabled = !currentHost;
-  alwaysCheckbox.addEventListener("change", () => {
+  alwaysCheckbox.addEventListener("change", async () => {
     if (!widgetState) return;
-    const nextState = updateAlwaysTranslateHostState(
-      widgetState.alwaysTranslateHosts,
-      widgetState.alwaysTranslateDisabledHosts,
-      widgetState.currentHost,
-      alwaysCheckbox.checked,
-    );
-    widgetState.alwaysTranslateHosts = nextState.hosts;
-    widgetState.alwaysTranslateDisabledHosts = nextState.disabledHosts;
-    void safeChromePromise(() =>
-      chrome.storage.local.set({
-        [STORAGE_ALWAYS_TRANSLATE_HOSTS]: nextState.hosts,
-        [STORAGE_ALWAYS_TRANSLATE_DISABLED_HOSTS]: nextState.disabledHosts,
-      })
-    );
+    const state = widgetState;
+    alwaysCheckbox.disabled = true;
+    const result = await safeChromePromise(() => chrome.runtime.sendMessage({
+      type: "babata.set_host_translation", enabled: alwaysCheckbox.checked,
+    })) as { ok?: boolean; hosts?: unknown; disabledHosts?: unknown } | undefined;
+    if (widgetState !== state) return;
+    if (result?.ok) {
+      state.alwaysTranslateHosts = normalizeHostList(result.hosts);
+      state.alwaysTranslateDisabledHosts = normalizeHostList(result.disabledHosts);
+    } else {
+      showBubble("翻译设置未保存，请稍后重试。", 5000);
+    }
+    alwaysCheckbox.checked = isAlwaysTranslateHost(state.alwaysTranslateHosts, state.currentHost, state.alwaysTranslateDisabledHosts);
+    alwaysCheckbox.disabled = !state.currentHost;
   });
   alwaysLabel.appendChild(alwaysCheckbox);
   const alwaysBlock = document.createElement("div");
@@ -1452,6 +1564,7 @@ function renderPopover(): HTMLDivElement {
   const selectionLabel = document.createElement("label");
   const selectionCheckbox = document.createElement("input");
   selectionCheckbox.type = "checkbox";
+  selectionCheckbox.dataset.setting = "selection";
   selectionCheckbox.checked = widgetState?.selectionTranslationEnabled ?? DEFAULT_SELECTION_TRANSLATION_ENABLED;
   selectionCheckbox.addEventListener("change", () => {
     if (!widgetState) return;
@@ -1467,6 +1580,38 @@ function renderPopover(): HTMLDivElement {
   selectionBlock.appendChild(selectionHead);
   selectionLabel.appendChild(selectionBlock);
   pop.appendChild(selectionLabel);
+
+  const videoLabel = document.createElement("label");
+  const videoCheckbox = document.createElement("input");
+  videoCheckbox.type = "checkbox";
+  videoCheckbox.dataset.setting = "video";
+  videoCheckbox.checked = widgetState?.videoTranslationEnabled ?? DEFAULT_VIDEO_TRANSLATION_ENABLED;
+  videoCheckbox.setAttribute("aria-describedby", "babata-video-setting-hint");
+  videoCheckbox.addEventListener("change", async () => {
+    if (!widgetState) return;
+    const state = widgetState;
+    const enabled = videoCheckbox.checked;
+    videoCheckbox.disabled = true;
+    const saved = await safeChromePromise(async () => {
+      await chrome.storage.local.set({ [STORAGE_VIDEO_TRANSLATION]: enabled });
+      return true;
+    });
+    if (widgetState !== state) return;
+    if (!saved) showBubble("视频翻译设置未保存，请稍后重试。", 5000);
+    videoCheckbox.checked = state.videoTranslationEnabled;
+    videoCheckbox.disabled = false;
+  });
+  videoLabel.appendChild(videoCheckbox);
+  const videoBlock = document.createElement("div");
+  const videoHead = document.createElement("div");
+  videoHead.textContent = "视频翻译";
+  const videoHint = document.createElement("div");
+  videoHint.id = "babata-video-setting-hint";
+  videoHint.className = "setting-hint";
+  videoHint.textContent = "全局生效，所有网站和标签页";
+  videoBlock.append(videoHead, videoHint);
+  videoLabel.appendChild(videoBlock);
+  pop.appendChild(videoLabel);
   return pop;
 }
 
