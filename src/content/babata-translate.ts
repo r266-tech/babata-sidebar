@@ -756,6 +756,33 @@ function hasNonInlineElementChild(el: HTMLElement): boolean {
   return false;
 }
 
+// A streaming leaf can later grow paragraphs, lists or tables. Inline wrappers
+// do not make those descendants safe to flatten into one translated text run.
+function hasSourceBlockDescendant(el: HTMLElement): boolean {
+  for (const child of el.children) {
+    if (!(child instanceof HTMLElement) || isTranslationElement(child)
+      || isStayOriginalElement(child) || isIgnoredElement(child)) continue;
+    if (!child.classList.contains(SRC_CLASS) && isHidden(child)) continue;
+    if (!isDisplayContentsElement(child) && !isInlineElement(child)) return true;
+    if (hasSourceBlockDescendant(child)) return true;
+  }
+  return false;
+}
+
+function releaseStructuredCandidate(el: HTMLElement, src: TraceSource): boolean {
+  if (isAtomicBlockElement(el) || !hasSourceBlockDescendant(el)) return false;
+  const hash = el.getAttribute(HASH_ATTR);
+  const pending = hash ? queue.get(hash) : undefined;
+  pending?.elements.delete(el);
+  if (hash && pending && pending.elements.size === 0) releaseQueueItem(hash, pending);
+  clearCandidateState(el);
+  sourceSnapshots.delete(el);
+  // Removing the old sibling makes the source visible again immediately.
+  hiddenCache = new WeakMap<HTMLElement, boolean>();
+  observeNew(el, src);
+  return true;
+}
+
 function hasTranslationChild(el: HTMLElement): boolean {
   for (const child of Array.from(el.children)) {
     if (!(child instanceof HTMLElement)) continue;
@@ -847,6 +874,7 @@ function sourceTextForTranslation(el: HTMLElement): string {
 
 function isLeafTextElement(el: HTMLElement, knownHasRichMedia?: boolean): boolean {
   if (knownHasRichMedia) return false;
+  if (hasSourceBlockDescendant(el)) return false;
   // 直接子节点必须全是 text 或 inline 元素 + 含可视 text.
   let hasMeaningfulText = false;
   const scan = (node: Node): boolean => {
@@ -929,7 +957,10 @@ function* walkTranslatable(root: ParentNode): Generator<HTMLElement | null> {
       stack.push(...Array.from(el.children).reverse());
     };
     // Reject structural containers before any descendant scan or layout read.
-    if (!inline && !atomic && hasNonInlineElementChild(el)) { descend(); continue; }
+    if (!atomic && hasNonInlineElementChild(el)) {
+      if (el.hasAttribute(LEAF_ATTR)) clearCandidateState(el);
+      descend(); continue;
+    }
     const containsTranslation = hasTranslationChild(el);
     const rich = hasRichMediaSurface(el);
     if (!containsTranslation && !rich && atomic && shouldTranslate(sourceText(el), BLOCK_MIN_TEXT_COUNT, el)) {
@@ -1384,6 +1415,9 @@ function hasLayoutDisplay(el: HTMLElement): boolean {
 }
 
 function shouldRenderInPlace(el: HTMLElement, text: string): boolean {
+  // Never insert a translated cell (or a bilingual <font>) alongside the
+  // source cell: doing so changes the table grid and loses row/column spans.
+  if (el.tagName === "TD" || el.tagName === "TH") return true;
   if (mode !== "replace") return false;
   if (shouldPreserveCustomTextShell(el, text)) return true;
   if (text.length > 180) return false;
@@ -1534,6 +1568,7 @@ function copyAnchorPresentation(src: HTMLAnchorElement, dst: HTMLAnchorElement) 
 
 function injectTranslation(el: HTMLElement, raw: string) {
   if (!active || !el.isConnected) return;
+  if (releaseStructuredCandidate(el, "rerun")) return;
   refreshingElements.delete(el);
   clearTranslation(el);
   if (mode === "off" || !raw || isIgnoredElement(el)) return;
@@ -1593,6 +1628,7 @@ function rerenderCachedTranslations() {
 function processCandidate(el: HTMLElement, src: TraceSource = "init") {
   if (!active || mode === "off" || document.visibilityState === "hidden" || !el.isConnected) return;
   el = candidateRoot(el);
+  if (releaseStructuredCandidate(el, src)) return;
   const text = sourceTextForTranslation(el);
   const previous = sourceSnapshots.get(el);
   sourceSnapshots.set(el, text);
@@ -1640,6 +1676,7 @@ function finishQueueItem(hash: string, item: QueueItem): boolean {
 function doProcessCandidate(el: HTMLElement, src: TraceSource) {
   if (!active || mode === "off" || document.visibilityState === "hidden" || !el.isConnected) return;
   if (isIgnoredElement(el)) { clearCandidateState(el); return; }
+  if (releaseStructuredCandidate(el, src)) return;
   const hasInjected = hasInjectedTranslation(el);
   if (!hasInjected && isHidden(el)) return;
   const text = sourceText(el);
