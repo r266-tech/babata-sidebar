@@ -120,6 +120,65 @@ await test('page translation scheduling and source ownership in an isolated brow
     await page.close();
   });
 
+  await t.test('streaming text becomes structured content without flattening tables or lists', async () => {
+    const { page, errors } = await fixture('<div id="answer">An initial streaming answer begins as plain English text.</div>');
+    await expect(page.locator('#answer + .bbt-tr')).toContainText('译文');
+    await page.locator('#answer').evaluate((node) => {
+      node.innerHTML = '<h3>Detailed comparison</h3><p id="intro">Read the <strong>important details</strong> in this comparison.</p><table id="comparison"><thead><tr><th>Model name</th><th>Overall score</th></tr></thead><tbody><tr><td>First model</td><td>65</td></tr><tr><td>Second model</td><td>59</td></tr></tbody></table><ul id="points"><li>First detailed recommendation.</li><li>Second detailed recommendation.</li></ul>';
+    });
+    await expect(page.locator('#answer')).toBeVisible();
+    await expect(page.locator('#answer + .bbt-tr')).toHaveCount(0);
+    await expect(page.locator('#intro + .bbt-tr strong')).toHaveText('important details');
+    await expect(page.locator('#comparison th').first()).toContainText('译文');
+    await expect(page.locator('#points li.bbt-tr')).toHaveCount(2);
+    assert.equal(await page.locator('#answer').getAttribute('data-bbt-leaf'), null);
+    assert.equal(await page.locator('#comparison').evaluate((table) => table.rows.length), 3);
+    const cells = await page.locator('#comparison tbody tr').first().locator('td').evaluateAll((nodes) => nodes.map((node) => { const r = node.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width }; }));
+    assert.equal(cells[0].y, cells[1].y);
+    assert.ok(cells[1].x >= cells[0].x + cells[0].width);
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+
+  await t.test('nested inline wrappers and unclaimed text mutations cannot promote a structured answer', async () => {
+    const { page } = await fixture('<main id="answer"><span><span><div><p id="paragraph">A formatted answer contains a useful paragraph.</p><table id="table"><tbody><tr><td>Model description</td><td>42</td></tr></tbody></table></div></span></span></main>');
+    await expect(page.locator('#paragraph + .bbt-tr')).toContainText('译文');
+    await expect(page.locator('#table')).toBeVisible();
+    await page.locator('#answer').evaluate((node) => {
+      const text = document.createTextNode('Streaming summary');
+      node.prepend(text);
+      text.data = 'An updated streaming summary with further details.';
+    });
+    await page.waitForTimeout(500);
+    await expect(page.locator('#table')).toBeVisible();
+    await expect(page.locator('#answer + .bbt-tr')).toHaveCount(0);
+    assert.equal(await page.locator('#answer').getAttribute('data-bbt-leaf'), null);
+    await page.close();
+  });
+
+  await t.test('late replies and mode changes keep long spanning table cells in their original columns', async () => {
+    const { page } = await fixture('<article><div id="answer">A pending streaming answer will become a table before translation completes.</div></article>', 'replace', 'hold');
+    await expect.poll(() => page.evaluate(() => pendingReplies.length)).toBeGreaterThan(0);
+    await page.locator('#answer').evaluate((node) => {
+      node.innerHTML = '<table id="table"><tbody><tr><th colspan="2">Combined column heading</th></tr><tr><td rowspan="2">' + 'A long description with important details. '.repeat(6) + '</td><td>42</td></tr><tr><td>43</td></tr></tbody></table>';
+      responseMode = 'echo';
+      pendingReplies.splice(0).forEach(({ message, resolve }) => resolve(answer(message)));
+    });
+    await expect(page.locator('#table td .bbt-tr')).toContainText('译文');
+    for (const mode of ['bilingual', 'off', 'replace']) {
+      await page.evaluate((mode) => storageListeners.forEach((fn) => fn({ 'babata.translation_mode': { newValue: mode } }, 'local')), mode);
+      await expect(page.locator('#table')).toBeVisible();
+      await expect(page.locator('#table th')).toHaveCount(1);
+      await expect(page.locator('#table td')).toHaveCount(3);
+      await expect(page.locator('#table th')).toHaveAttribute('colspan', '2');
+      await expect(page.locator('#table td').first()).toHaveAttribute('rowspan', '2');
+      await expect(page.locator('#table tr > .bbt-tr')).toHaveCount(0);
+      if (mode !== 'off') await expect(page.locator('#table td .bbt-tr')).toBeVisible();
+    }
+    await expect(page.locator('#answer + .bbt-tr')).toHaveCount(0);
+    await page.close();
+  });
+
   await t.test('link marker pairs survive provider HTML between their endpoints', async () => {
     const { page } = await fixture('<div id="empty"></div>');
     await page.evaluate(() => {
